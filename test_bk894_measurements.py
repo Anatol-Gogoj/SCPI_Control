@@ -43,8 +43,21 @@ print(f"Mode: {func}, Frequency: {freq} Hz\n")
 print("Measurements:")
 for i in range(10):
     result = bk894.ask(':FETC?')
-    C, D = result.split(',')
-    print(f"  {i+1}: C = {float(C)*1e9:.3f} nF, D = {float(D):.5f}")
+    C, D, status = result.split(',')
+    C_val = float(C)
+    D_val = float(D)
+    
+    # Convert capacitance to appropriate units
+    if abs(C_val) < 1e-9:
+        C_str = f"{C_val*1e12:.3f} pF"
+    elif abs(C_val) < 1e-6:
+        C_str = f"{C_val*1e9:.3f} nF"
+    elif abs(C_val) < 1e-3:
+        C_str = f"{C_val*1e6:.3f} µF"
+    else:
+        C_str = f"{C_val*1e3:.3f} mF"
+    
+    print(f"  {i+1}: C = {C_str:>12s}, D = {D_val:.5f}, Status = {status}")
     time.sleep(0.2)
 
 bk894.close()
