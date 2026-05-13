@@ -134,23 +134,6 @@ class BK894(USBTMC):
         volt = float(self.ask(':VOLT:LEV?'))
         return {'mode': mode, 'frequency': freq, 'voltage': volt}
 
-    def get_error(self):
-        """Pop the next entry from the SCPI error queue.
-
-        Returns (code, message). `code == 0` means the queue was empty
-        ("No error"). Useful for diagnosing why a command was rejected
-        (the BK894 beeps and shows a front-panel indicator but the
-        specifics only live in the error queue).
-        """
-        raw = self.ask(':SYST:ERR?')
-        # Typical reply: '0,"No error"' or '-113,"Undefined header"'
-        code_str, _, msg = raw.partition(',')
-        try:
-            code = int(code_str.strip())
-        except ValueError:
-            return -1, raw
-        return code, msg.strip().strip('"')
-
 
 class BK894Mock:
     """In-memory mock of the BK894 for offline UI / sweep testing.
@@ -198,9 +181,6 @@ class BK894Mock:
 
     def get_config(self):
         return {'mode': self._mode, 'frequency': self._freq, 'voltage': self._volt}
-
-    def get_error(self):
-        return 0, "No error"
 
     def close(self):
         pass

@@ -246,8 +246,6 @@ ANALYSIS:
         self.lcr_status.pack(side=tk.LEFT)
         
         ttk.Button(status_frame, text="Reconnect", command=self.reconnect_lcr).pack(side=tk.RIGHT)
-        ttk.Button(status_frame, text="Check Errors",
-                   command=self.show_lcr_errors).pack(side=tk.RIGHT, padx=(0, 6))
         
         # Configuration
         config_frame = ttk.LabelFrame(lcr_frame, text="Configuration", padding=10)
@@ -541,35 +539,6 @@ ANALYSIS:
             self.lcr_status.config(text=f"Error: {e}", fg="red")
             messagebox.showerror("Connection Error", str(e))
     
-    def show_lcr_errors(self):
-        """Drain the BK894 error queue and show what's in it.
-
-        BK894 doesn't raise a Python-side exception when it rejects a
-        SCPI command — it beeps and lights a front-panel indicator,
-        and the specifics only show up in the error queue
-        (`:SYST:ERR?`). This button is a quick way to see what.
-        """
-        if not self.lcr:
-            messagebox.showerror("Error", "LCR meter not connected")
-            return
-        if not hasattr(self.lcr, 'get_error'):
-            messagebox.showinfo("Errors", "This instrument has no error-queue support")
-            return
-        errors = []
-        for _ in range(20):  # cap so we don't loop forever on a misbehaving device
-            try:
-                code, msg = self.lcr.get_error()
-            except Exception as e:
-                errors.append(f"(failed to read error queue: {e})")
-                break
-            if code == 0:
-                break
-            errors.append(f"{code}: {msg}")
-        if not errors:
-            messagebox.showinfo("LCR Errors", "Error queue empty — no errors.")
-        else:
-            messagebox.showwarning("LCR Errors", "\n".join(errors))
-
     def update_lcr_config(self):
         """Read current config from instrument"""
         if not self.lcr:

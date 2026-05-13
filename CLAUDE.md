@@ -27,6 +27,17 @@ These are enforced inside `BK894`:
 - **Modes:** see `BK894.MODES` (CPD, CPQ, CPG, CPRP, LSRS, LSRD, LPRS, LPRP, RX, ZTD, ZTR).
 - `measure()` returns `(primary, secondary, status)` — `status == 0` means good. Non-zero is an error/warning from the instrument and should be surfaced, not silently swallowed.
 - Every `ask()` call sleeps 100 ms after `write` before reading, so a single `measure()` is roughly 150–200 ms minimum. Budget accordingly when designing sweeps.
+- The unit on this bench enumerates as **`/dev/usbtmc0`** (Tek scope is `/dev/usbtmc2`). Device node ownership is `root:root crw-------`, so the GUI has to run with `sudo` (no udev rule installed).
+
+## BK894 SCPI quirks (verified on hardware, May 2026)
+
+The BK894's command set is mostly E4980A-compatible but has gaps. Things we learned the hard way:
+
+- **AC level command is `:VOLT[:LEV]`, NOT `:LEV:VOLT`.** The reversed form is silently rejected: the front panel beeps and shows "bus error", but the level stays at its previous value and `*ESR` is not flagged. If a voltage change "doesn't take", check this first.
+- **There is no readable error queue.** `:SYST:ERR?`, `:SYST:ERR:NEXT?`, `:SYST:ERR:COUN?`, `:SYST:ERR:ALL?`, `:SYSTem:ERRor?`, `:ERR?` — every variant times out (ETIMEDOUT). The `:SYSTem:ERRor` subsystem isn't implemented.
+- **`*ESR?` does not flag command errors.** Sending a deliberate `:BOGUS:COMMAND`, `*ESR?` still returns `0` — bit 5 (CME) is never set. The front-panel beep is the *only* signal that a command was rejected. There is no way for software to detect bad SCPI on this instrument.
+- **What does work:** `*IDN?`, `*STB?`, `*ESR?` (returns 0), `*OPC?`, `*CLS`, `:FUNC:IMP[?]`, `:FREQ[?]`, `:VOLT:LEV[?]`, `:FETC?`.
+- **Implication for diagnostics:** don't waste time adding "Check Errors" UI or `get_error()` helpers — the instrument has nothing to report. When something behaves oddly, look at the BK894's front panel for the beep/error indicator and check the SCPI command syntax against an E4980A reference.
 
 ## GUI conventions to follow
 
