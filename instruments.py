@@ -107,11 +107,17 @@ class BK894(USBTMC):
         self.write(f':FREQ {freq_hz}')
     
     def set_voltage(self, voltage):
-        """Set AC test voltage (0.01 to 2.0 V)"""
+        """Set AC test voltage (0.01 to 2.0 V).
+
+        BK894 follows the Keysight/Agilent E4980A SCPI set: the AC test
+        level command is `:VOLTage[:LEVel]`, NOT `:LEV:VOLT`. The latter
+        is silently rejected — instrument beeps, shows a syntax error on
+        its front panel, and the level stays at whatever was last set.
+        """
         if not 0.01 <= voltage <= 2.0:
             raise ValueError("Voltage must be 0.01 to 2.0 V")
-        self.write(f':LEV:VOLT {voltage}')
-    
+        self.write(f':VOLT:LEV {voltage}')
+
     def measure(self):
         """
         Take a measurement and return (primary, secondary, status)
@@ -120,12 +126,30 @@ class BK894(USBTMC):
         result = self.ask(':FETC?')
         primary, secondary, status = result.split(',')
         return float(primary), float(secondary), int(status)
-    
+
     def get_config(self):
         """Get current measurement configuration"""
         mode = self.ask(':FUNC:IMP?')
         freq = float(self.ask(':FREQ?'))
-        return {'mode': mode, 'frequency': freq}
+        volt = float(self.ask(':VOLT:LEV?'))
+        return {'mode': mode, 'frequency': freq, 'voltage': volt}
+
+    def get_error(self):
+        """Pop the next entry from the SCPI error queue.
+
+        Returns (code, message). `code == 0` means the queue was empty
+        ("No error"). Useful for diagnosing why a command was rejected
+        (the BK894 beeps and shows a front-panel indicator but the
+        specifics only live in the error queue).
+        """
+        raw = self.ask(':SYST:ERR?')
+        # Typical reply: '0,"No error"' or '-113,"Undefined header"'
+        code_str, _, msg = raw.partition(',')
+        try:
+            code = int(code_str.strip())
+        except ValueError:
+            return -1, raw
+        return code, msg.strip().strip('"')
 
 
 class BK894Mock:
@@ -173,7 +197,10 @@ class BK894Mock:
         return primary, secondary, 0
 
     def get_config(self):
-        return {'mode': self._mode, 'frequency': self._freq}
+        return {'mode': self._mode, 'frequency': self._freq, 'voltage': self._volt}
+
+    def get_error(self):
+        return 0, "No error"
 
     def close(self):
         pass
@@ -332,7 +359,7 @@ if __name__ == "__main__":
     print("="*60)
     
     try:
-        lcr = BK894("/dev/usbtmc1")
+        lcr = BK894("/dev/usbtmc0")
         print(f"Connected: {lcr.idn}")
         
         lcr.set_mode('CPD')

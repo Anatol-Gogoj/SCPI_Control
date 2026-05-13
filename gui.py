@@ -52,7 +52,7 @@ class InstrumentControlGUI:
     def auto_connect(self):
         """Attempt to connect to instruments on startup"""
         try:
-            self.lcr = BK894Mock() if self.use_mock else BK894("/dev/usbtmc1")
+            self.lcr = BK894Mock() if self.use_mock else BK894("/dev/usbtmc0")
             self.lcr_status.config(text=f"Connected: {self.lcr.idn}", fg="green")
             self.update_lcr_config()
         except Exception as e:
@@ -75,7 +75,7 @@ class InstrumentControlGUI:
 
 CONNECTION:
 - Instrument must be powered on before connecting
-- USB connection appears as /dev/usbtmc1
+- USB connection appears as /dev/usbtmc0
 
 CONFIGURATION:
 - Mode: Select measurement type
@@ -196,9 +196,48 @@ ANALYSIS:
     
     def create_lcr_tab(self):
         """Create LCR meter control tab"""
-        lcr_frame = ttk.Frame(self.notebook)
-        self.notebook.add(lcr_frame, text="LCR Meter (BK 894)")
-        
+        tab_frame = ttk.Frame(self.notebook)
+        self.notebook.add(tab_frame, text="LCR Meter (BK 894)")
+
+        # Vertical-scrollable container so the tab content can exceed the
+        # window height. All existing widgets still go into `lcr_frame`
+        # (now the inner Frame inside the canvas).
+        canvas = tk.Canvas(tab_frame, highlightthickness=0)
+        vbar = ttk.Scrollbar(tab_frame, orient='vertical', command=canvas.yview)
+        canvas.configure(yscrollcommand=vbar.set)
+        canvas.pack(side='left', fill='both', expand=True)
+        vbar.pack(side='right', fill='y')
+
+        lcr_frame = ttk.Frame(canvas)
+        window_id = canvas.create_window((0, 0), window=lcr_frame, anchor='nw')
+
+        def _sync_scrollregion(_event=None):
+            canvas.configure(scrollregion=canvas.bbox('all'))
+        lcr_frame.bind('<Configure>', _sync_scrollregion)
+
+        def _resize_inner(event):
+            canvas.itemconfigure(window_id, width=event.width)
+        canvas.bind('<Configure>', _resize_inner)
+
+        # Mouse-wheel scrolling — bind globally but only act when the
+        # cursor is actually over this canvas's screen area, so the wheel
+        # still works over child widgets (entries, buttons) without
+        # affecting other tabs.
+        def _on_mousewheel(event):
+            cx, cy = canvas.winfo_rootx(), canvas.winfo_rooty()
+            cw, ch = canvas.winfo_width(), canvas.winfo_height()
+            if not (cx <= event.x_root < cx + cw and cy <= event.y_root < cy + ch):
+                return
+            if event.num == 4:
+                canvas.yview_scroll(-3, 'units')
+            elif event.num == 5:
+                canvas.yview_scroll(3, 'units')
+            elif event.delta:
+                canvas.yview_scroll(int(-event.delta / 40), 'units')
+        self.root.bind_all('<MouseWheel>', _on_mousewheel, add='+')
+        self.root.bind_all('<Button-4>', _on_mousewheel, add='+')
+        self.root.bind_all('<Button-5>', _on_mousewheel, add='+')
+
         # Connection status
         status_frame = ttk.LabelFrame(lcr_frame, text="Connection", padding=10)
         status_frame.pack(fill='x', padx=10, pady=10)
@@ -207,6 +246,8 @@ ANALYSIS:
         self.lcr_status.pack(side=tk.LEFT)
         
         ttk.Button(status_frame, text="Reconnect", command=self.reconnect_lcr).pack(side=tk.RIGHT)
+        ttk.Button(status_frame, text="Check Errors",
+                   command=self.show_lcr_errors).pack(side=tk.RIGHT, padx=(0, 6))
         
         # Configuration
         config_frame = ttk.LabelFrame(lcr_frame, text="Configuration", padding=10)
@@ -493,13 +534,42 @@ ANALYSIS:
         try:
             if self.lcr:
                 self.lcr.close()
-            self.lcr = BK894Mock() if self.use_mock else BK894("/dev/usbtmc1")
+            self.lcr = BK894Mock() if self.use_mock else BK894("/dev/usbtmc0")
             self.lcr_status.config(text=f"Connected: {self.lcr.idn}", fg="green")
             self.update_lcr_config()
         except Exception as e:
             self.lcr_status.config(text=f"Error: {e}", fg="red")
             messagebox.showerror("Connection Error", str(e))
     
+    def show_lcr_errors(self):
+        """Drain the BK894 error queue and show what's in it.
+
+        BK894 doesn't raise a Python-side exception when it rejects a
+        SCPI command — it beeps and lights a front-panel indicator,
+        and the specifics only show up in the error queue
+        (`:SYST:ERR?`). This button is a quick way to see what.
+        """
+        if not self.lcr:
+            messagebox.showerror("Error", "LCR meter not connected")
+            return
+        if not hasattr(self.lcr, 'get_error'):
+            messagebox.showinfo("Errors", "This instrument has no error-queue support")
+            return
+        errors = []
+        for _ in range(20):  # cap so we don't loop forever on a misbehaving device
+            try:
+                code, msg = self.lcr.get_error()
+            except Exception as e:
+                errors.append(f"(failed to read error queue: {e})")
+                break
+            if code == 0:
+                break
+            errors.append(f"{code}: {msg}")
+        if not errors:
+            messagebox.showinfo("LCR Errors", "Error queue empty — no errors.")
+        else:
+            messagebox.showwarning("LCR Errors", "\n".join(errors))
+
     def update_lcr_config(self):
         """Read current config from instrument"""
         if not self.lcr:
@@ -509,6 +579,9 @@ ANALYSIS:
             self.lcr_mode.set(config['mode'].upper())
             self.lcr_freq.delete(0, tk.END)
             self.lcr_freq.insert(0, str(int(config['frequency'])))
+            if 'voltage' in config:
+                self.lcr_volt.delete(0, tk.END)
+                self.lcr_volt.insert(0, f"{config['voltage']:g}")
         except Exception as e:
             self.status_bar.config(text=f"Error reading config: {e}")
     

@@ -24,14 +24,14 @@ class USBTMC:
         os.close(self.file)
 
 # Connect to BK 894
-bk894 = USBTMC("/dev/usbtmc1")
+bk894 = USBTMC("/dev/usbtmc0")
 print(f"Connected: {bk894.ask('*IDN?')}\n")
 
 # Configure for capacitance measurement at 1 kHz
 print("Configuring: C-D mode, 1 kHz, 1V")
 bk894.write(':FUNC:IMP CPD')   # Capacitance + Dissipation
 bk894.write(':FREQ 1000')       # 1 kHz test frequency
-bk894.write(':LEV:VOLT 1.0')    # 1V AC test signal
+bk894.write(':VOLT:LEV 1.0')    # 1V AC test signal (NOT :LEV:VOLT — that's rejected)
 time.sleep(0.5)
 
 # Verify configuration
