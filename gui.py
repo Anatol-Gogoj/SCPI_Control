@@ -82,12 +82,13 @@ CONFIGURATION:
   - CPD: Capacitance + Dissipation Factor (for capacitors)
   - LSRS: Inductance (series) + Resistance (for inductors)
   - RX: Resistance + Reactance (for general impedance)
-- Frequency: Test frequency (100 Hz to 200 kHz)
+- Frequency: Test frequency (100 Hz to 500 kHz)
   - Use 1 kHz for general capacitor testing
   - Use 100 Hz for electrolytics
   - Use 10 kHz+ for high-frequency components
-- Voltage: AC test signal amplitude (0.01 to 2.0 V)
-  - 1.0V is standard for most measurements
+- Voltage: Test signal level (-5.0 to 5.0 V)
+  - 1.0V is standard for most AC measurements
+  - Note: BK894 may reject negative AC levels at the front panel
 
 MEASUREMENTS:
 - Single Measurement: Take one reading
@@ -840,8 +841,8 @@ ANALYSIS:
         if self.sweeping:
             return
         try:
-            freqs = self._parse_sweep_axis('freq', 100, 200000, 'Frequency')
-            volts = self._parse_sweep_axis('volt', 0.01, 2.0, 'Voltage')
+            freqs = self._parse_sweep_axis('freq', 100, 500000, 'Frequency')
+            volts = self._parse_sweep_axis('volt', -5.0, 5.0, 'Voltage')
             dwell = float(self.sw_dwell.get())
             n_samples = int(self.sw_samples.get())
             isd = float(self.sw_isd.get())

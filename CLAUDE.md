@@ -22,8 +22,8 @@ The GUI auto-connects to `/dev/usbtmc1` (BK894) and `/dev/usbtmc2` (MSO24) on st
 
 These are enforced inside `BK894`:
 
-- **Frequency:** 100 Hz – 200 kHz (`set_frequency` raises outside this range).
-- **Voltage:** 0.01 – 2.0 V AC (`set_voltage` raises outside this range).
+- **Frequency:** 100 Hz – 500 kHz (`set_frequency` raises outside this range).
+- **Voltage:** −5.0 – +5.0 V (`set_voltage` raises outside this range). Note: the BK894's AC level is a magnitude, so negative values may be silently rejected by the instrument even though they pass our validation — see SCPI quirks below.
 - **Modes:** see `BK894.MODES` (CPD, CPQ, CPG, CPRP, LSRS, LSRD, LPRS, LPRP, RX, ZTD, ZTR).
 - `measure()` returns `(primary, secondary, status)` — `status == 0` means good. Non-zero is an error/warning from the instrument and should be surfaced, not silently swallowed.
 - Every `ask()` call sleeps 100 ms after `write` before reading, so a single `measure()` is roughly 150–200 ms minimum. Budget accordingly when designing sweeps.

@@ -101,21 +101,21 @@ class BK894(USBTMC):
         self.write(f':FUNC:IMP {mode.upper()}')
     
     def set_frequency(self, freq_hz):
-        """Set test frequency (100 Hz to 200 kHz)"""
-        if not 100 <= freq_hz <= 200000:
-            raise ValueError("Frequency must be 100 Hz to 200 kHz")
+        """Set test frequency (100 Hz to 500 kHz)"""
+        if not 100 <= freq_hz <= 500000:
+            raise ValueError("Frequency must be 100 Hz to 500 kHz")
         self.write(f':FREQ {freq_hz}')
-    
+
     def set_voltage(self, voltage):
-        """Set AC test voltage (0.01 to 2.0 V).
+        """Set test voltage (-5.0 to 5.0 V).
 
         BK894 follows the Keysight/Agilent E4980A SCPI set: the AC test
         level command is `:VOLTage[:LEVel]`, NOT `:LEV:VOLT`. The latter
         is silently rejected — instrument beeps, shows a syntax error on
         its front panel, and the level stays at whatever was last set.
         """
-        if not 0.01 <= voltage <= 2.0:
-            raise ValueError("Voltage must be 0.01 to 2.0 V")
+        if not -5.0 <= voltage <= 5.0:
+            raise ValueError("Voltage must be -5.0 to 5.0 V")
         self.write(f':VOLT:LEV {voltage}')
 
     def measure(self):
@@ -159,13 +159,13 @@ class BK894Mock:
         self._mode = mode.upper()
 
     def set_frequency(self, freq_hz):
-        if not 100 <= freq_hz <= 200000:
-            raise ValueError("Frequency must be 100 Hz to 200 kHz")
+        if not 100 <= freq_hz <= 500000:
+            raise ValueError("Frequency must be 100 Hz to 500 kHz")
         self._freq = float(freq_hz)
 
     def set_voltage(self, voltage):
-        if not 0.01 <= voltage <= 2.0:
-            raise ValueError("Voltage must be 0.01 to 2.0 V")
+        if not -5.0 <= voltage <= 5.0:
+            raise ValueError("Voltage must be -5.0 to 5.0 V")
         self._volt = float(voltage)
 
     def measure(self):
