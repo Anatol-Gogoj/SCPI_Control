@@ -6,6 +6,8 @@ import os
 import time
 import struct
 import errno
+import math
+import random
 
 class USBTMC:
     """Low-level USB-TMC communication"""
@@ -105,11 +107,17 @@ class BK894(USBTMC):
         self.write(f':FREQ {freq_hz}')
     
     def set_voltage(self, voltage):
-        """Set AC test voltage (0.01 to 2.0 V)"""
+        """Set AC test voltage (0.01 to 2.0 V).
+
+        BK894 follows the Keysight/Agilent E4980A SCPI set: the AC test
+        level command is `:VOLTage[:LEVel]`, NOT `:LEV:VOLT`. The latter
+        is silently rejected — instrument beeps, shows a syntax error on
+        its front panel, and the level stays at whatever was last set.
+        """
         if not 0.01 <= voltage <= 2.0:
             raise ValueError("Voltage must be 0.01 to 2.0 V")
-        self.write(f':LEV:VOLT {voltage}')
-    
+        self.write(f':VOLT:LEV {voltage}')
+
     def measure(self):
         """
         Take a measurement and return (primary, secondary, status)
@@ -118,12 +126,64 @@ class BK894(USBTMC):
         result = self.ask(':FETC?')
         primary, secondary, status = result.split(',')
         return float(primary), float(secondary), int(status)
-    
+
     def get_config(self):
         """Get current measurement configuration"""
         mode = self.ask(':FUNC:IMP?')
         freq = float(self.ask(':FREQ?'))
-        return {'mode': mode, 'frequency': freq}
+        volt = float(self.ask(':VOLT:LEV?'))
+        return {'mode': mode, 'frequency': freq, 'voltage': volt}
+
+
+class BK894Mock:
+    """In-memory mock of the BK894 for offline UI / sweep testing.
+
+    Mirrors the subset of BK894 used by the GUI (idn, set_mode,
+    set_frequency, set_voltage, measure, get_config, close). Returns
+    synthetic readings with mild freq/voltage dependence and a small
+    per-call delay so threading and dwell logic still get exercised.
+    """
+
+    MODES = BK894.MODES
+
+    def __init__(self, device="mock"):
+        self.device = device
+        self._mode = 'CPD'
+        self._freq = 1000.0
+        self._volt = 1.0
+        self.idn = "BK PRECISION,894 MOCK,SN-MOCK,FW-0.0"
+
+    def set_mode(self, mode):
+        if mode.upper() not in self.MODES:
+            raise ValueError(f"Invalid mode. Choose from: {list(self.MODES.keys())}")
+        self._mode = mode.upper()
+
+    def set_frequency(self, freq_hz):
+        if not 100 <= freq_hz <= 200000:
+            raise ValueError("Frequency must be 100 Hz to 200 kHz")
+        self._freq = float(freq_hz)
+
+    def set_voltage(self, voltage):
+        if not 0.01 <= voltage <= 2.0:
+            raise ValueError("Voltage must be 0.01 to 2.0 V")
+        self._volt = float(voltage)
+
+    def measure(self):
+        # Simulate instrument round-trip so dwell/threading still get exercised.
+        time.sleep(0.05)
+        nominal_c = 1e-9
+        freq_drift = 1 + 0.02 * math.log10(self._freq / 1000.0)
+        volt_drift = 1 + 0.01 * (self._volt - 1.0)
+        noise = 1 + 0.005 * (random.random() - 0.5)
+        primary = nominal_c * freq_drift * volt_drift * noise
+        secondary = 0.005 + 0.001 * random.random()
+        return primary, secondary, 0
+
+    def get_config(self):
+        return {'mode': self._mode, 'frequency': self._freq, 'voltage': self._volt}
+
+    def close(self):
+        pass
 
 
 class TekMSO24(USBTMC):
@@ -279,7 +339,7 @@ if __name__ == "__main__":
     print("="*60)
     
     try:
-        lcr = BK894("/dev/usbtmc1")
+        lcr = BK894("/dev/usbtmc0")
         print(f"Connected: {lcr.idn}")
         
         lcr.set_mode('CPD')
