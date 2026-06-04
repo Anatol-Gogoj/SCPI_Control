@@ -42,14 +42,14 @@ class InstrumentControlGUI:
     def auto_connect(self):
         """Attempt to connect to instruments on startup"""
         try:
-            self.lcr = BK894("/dev/usbtmc1")
+            self.lcr = BK894()
             self.lcr_status.config(text=f"Connected: {self.lcr.idn}", fg="green")
             self.update_lcr_config()
         except Exception as e:
             self.lcr_status.config(text=f"Not connected: {e}", fg="red")
         
         try:
-            self.scope = TekMSO24("/dev/usbtmc2")
+            self.scope = TekMSO24()
             self.scope_status.config(text=f"Connected: {self.scope.idn}", fg="green")
         except Exception as e:
             self.scope_status.config(text=f"Not connected: {e}", fg="red")
@@ -60,7 +60,7 @@ class InstrumentControlGUI:
 
 CONNECTION:
 - Instrument must be powered on before connecting
-- USB connection appears as /dev/usbtmc1
+- Auto-detected via PyVISA (USB VID 0x0471, PID 0x2827)
 
 CONFIGURATION:
 - Mode: Select measurement type
@@ -95,7 +95,7 @@ BEST PRACTICES:
 
 CONNECTION:
 - Scope must be powered on before connecting
-- USB connection appears as /dev/usbtmc2
+- Auto-detected via PyVISA (USB VID 0x0699, PID 0x0105)
 
 CHANNEL CONFIGURATION:
 - Enable/Disable: Turn channels on/off for viewing
@@ -475,7 +475,7 @@ ANALYSIS:
         try:
             if self.lcr:
                 self.lcr.close()
-            self.lcr = BK894("/dev/usbtmc1")
+            self.lcr = BK894()
             self.lcr_status.config(text=f"Connected: {self.lcr.idn}", fg="green")
             self.update_lcr_config()
         except Exception as e:
@@ -555,7 +555,7 @@ ANALYSIS:
         try:
             if self.scope:
                 self.scope.close()
-            self.scope = TekMSO24("/dev/usbtmc2")
+            self.scope = TekMSO24()
             self.scope_status.config(text=f"Connected: {self.scope.idn}", fg="green")
         except Exception as e:
             self.scope_status.config(text=f"Error: {e}", fg="red")

@@ -2,7 +2,7 @@
 from instruments import TekMSO24
 import time
 
-scope = TekMSO24("/dev/usbtmc2")
+scope = TekMSO24()
 print(f"Connected: {scope.idn}\n")
 
 # Configure for a typical signal
