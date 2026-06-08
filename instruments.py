@@ -23,6 +23,7 @@ than one unit of the same model is connected):
 The DC power supply behind the CP2102 USB-UART bridge uses serial transport
 via pyserial (NOT USB-TMC); see SerialDCSupply below.
 """
+import re
 import time
 import struct
 import threading
@@ -313,6 +314,25 @@ class BK4055B(VisaInstrument):
 
     WAVEFORMS = ('SINE', 'SQUARE', 'RAMP', 'PULSE', 'NOISE', 'ARB', 'DC')
 
+    # BSWV keys whose values are numeric (carry a unit suffix on read-back).
+    # WVTP and any other key are kept as raw strings by get_basic_wave_dict.
+    _BSWV_NUMERIC = (
+        'FRQ', 'PERI', 'AMP', 'AMPVRMS', 'OFST', 'HLEV', 'LLEV',
+        'PHSE', 'DUTY', 'SYM', 'RISE', 'FALL', 'DLY', 'WIDTH',
+    )
+
+    @staticmethod
+    def _strip_unit(value):
+        """Parse a BSWV/OUTP numeric value, dropping any unit suffix.
+
+        Values come back like '100HZ', '0.01S', '2V', '1.41421Vrms'. Leading
+        sign, digits, decimal point and exponent form the number; everything
+        after is the unit. Returns a float, or the original string if it does
+        not start with a number.
+        """
+        m = re.match(r'[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?', value.strip())
+        return float(m.group()) if m else value
+
     def set_waveform(self, channel, wave):
         if wave.upper() not in self.WAVEFORMS:
             raise ValueError(f"Waveform must be one of {self.WAVEFORMS}")
@@ -327,12 +347,77 @@ class BK4055B(VisaInstrument):
     def set_offset(self, channel, offset_v):
         self.write(f'C{channel}:BSWV OFST,{offset_v}')
 
+    def set_basic_wave(self, channel, **params):
+        """Set several basic-wave parameters in one command.
+
+        Keys are BSWV parameter names (case-insensitive), e.g.
+        set_basic_wave(1, WVTP='SINE', FRQ=1000, AMP=2, OFST=0). Pushing them
+        together is one bus round-trip rather than one per setter.
+        """
+        if not params:
+            return
+        if 'WVTP' in {k.upper() for k in params}:
+            wave = next(v for k, v in params.items() if k.upper() == 'WVTP')
+            if str(wave).upper() not in self.WAVEFORMS:
+                raise ValueError(f"Waveform must be one of {self.WAVEFORMS}")
+        body = ','.join(f'{k.upper()},{v}' for k, v in params.items())
+        self.write(f'C{channel}:BSWV {body}')
+
     def set_output(self, channel, on):
         self.write(f'C{channel}:OUTP {"ON" if on else "OFF"}')
+
+    def set_output_full(self, channel, on, load=None, polarity=None):
+        """Set output state plus optional load and polarity in one command.
+
+        load: a resistance in ohms (e.g. 50) or 'HZ' for high impedance.
+        polarity: 'NOR' (normal) or 'INVT' (inverted).
+        """
+        parts = ['ON' if on else 'OFF']
+        if load is not None:
+            parts.append(f'LOAD,{load}')
+        if polarity is not None:
+            parts.append(f'PLRT,{polarity.upper()}')
+        self.write(f'C{channel}:OUTP {",".join(parts)}')
 
     def get_basic_wave(self, channel):
         """Raw query of the current basic-wave settings on a channel."""
         return self.ask(f'C{channel}:BSWV?')
+
+    def get_basic_wave_dict(self, channel):
+        """Parse the current basic-wave settings into a dict.
+
+        The instrument echoes e.g.
+            C1:BSWV WVTP,SINE,FRQ,100HZ,PERI,0.01S,AMP,2V,OFST,0V,...
+        The leading 'C1:BSWV ' echo is stripped, the remainder split into
+        KEY,VALUE pairs; numeric values (see _BSWV_NUMERIC) are converted to
+        float with their unit suffix removed. WVTP and unknown keys are kept as
+        raw strings. Tolerant of the variable, wave-type-dependent key list.
+        """
+        raw = self.get_basic_wave(channel)
+        body = raw.split(' ', 1)[1] if ' ' in raw else raw
+        tokens = [t for t in body.split(',') if t != '']
+        out = {}
+        for key, value in zip(tokens[0::2], tokens[1::2]):
+            key = key.upper()
+            out[key] = self._strip_unit(value) if key in self._BSWV_NUMERIC else value
+        return out
+
+    def get_output_dict(self, channel):
+        """Parse output state into {'state': bool, 'load': str, 'polarity': str}.
+
+        The instrument echoes e.g. 'C1:OUTP ON,LOAD,HZ,PLRT,NOR'. Load is kept
+        as a string ('HZ' or a numeric ohm value like '50').
+        """
+        raw = self.ask(f'C{channel}:OUTP?')
+        body = raw.split(' ', 1)[1] if ' ' in raw else raw
+        tokens = [t for t in body.split(',') if t != '']
+        state = tokens[0].upper() == 'ON' if tokens else False
+        pairs = dict(zip(tokens[1::2], tokens[2::2]))
+        return {
+            'state': state,
+            'load': pairs.get('LOAD', 'HZ'),
+            'polarity': pairs.get('PLRT', 'NOR'),
+        }
 
 
 # --------------------------------------------------------------------------
@@ -395,6 +480,9 @@ if __name__ == '__main__':
         try:
             inst = cls()
             print(f"  IDN: {inst.idn}")
+            if isinstance(inst, BK4055B):
+                for ch in (1, 2):
+                    print(f"  CH{ch} BSWV: {inst.get_basic_wave_dict(ch)}")
             inst.close()
         except Exception as e:
             print(f"  {type(e).__name__}: {e}")

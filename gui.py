@@ -8,7 +8,8 @@ from tkinter import ttk, filedialog, messagebox
 import csv
 import time
 from datetime import datetime
-from instruments import BK894, TekMSO24
+from instruments import BK894, TekMSO24, BK4055B
+from siggen_presets import SignalGenPresetStore
 import threading
 
 class InstrumentControlGUI:
@@ -20,8 +21,13 @@ class InstrumentControlGUI:
         # Instrument connections
         self.lcr = None
         self.scope = None
+        self.sg = None
         self.recording = False
         self.record_thread = None
+
+        # Signal-generator state
+        self.sg_channel_widgets = {}
+        self.sg_presets = SignalGenPresetStore()
         
         # Create notebook (tabbed interface)
         self.notebook = ttk.Notebook(root)
@@ -30,6 +36,7 @@ class InstrumentControlGUI:
         # Create tabs
         self.create_lcr_tab()
         self.create_scope_tab()
+        self.create_sg_tab()
         self.create_logging_tab()
         
         # Status bar
@@ -53,6 +60,13 @@ class InstrumentControlGUI:
             self.scope_status.config(text=f"Connected: {self.scope.idn}", fg="green")
         except Exception as e:
             self.scope_status.config(text=f"Not connected: {e}", fg="red")
+
+        try:
+            self.sg = BK4055B()
+            self.sg_status.config(text=f"Connected: {self.sg.idn}", fg="green")
+            self.update_sg_config()
+        except Exception as e:
+            self.sg_status.config(text=f"Not connected: {e}", fg="red")
     
     def show_lcr_tips(self):
         """Show LCR meter tips"""
@@ -137,7 +151,54 @@ TIPS:
 - Ground unused channels to reduce noise"""
         
         messagebox.showinfo("Oscilloscope Tips", tips)
-    
+
+    def show_sg_tips(self):
+        """Show signal generator tips"""
+        tips = """B&K Precision 4055B Signal Generator - Usage Tips
+
+CONNECTION:
+- Generator must be powered on before connecting
+- Auto-detected via PyVISA (USB VID 0xf4ec, PID 0xee38)
+- Two independent output channels (CH1, CH2)
+
+WAVEFORMS:
+- SINE: clean tones, frequency response, audio
+- SQUARE: clocks, digital/logic stimulus (duty adjustable on the box)
+- RAMP: sawtooth/triangle, sweeps (symmetry adjustable on the box)
+- PULSE: timing tests (width/rise/fall/delay adjustable on the box)
+- NOISE: broadband stimulus (no frequency/amplitude meaning)
+- DC: fixed level only (uses offset, ignores amplitude/frequency)
+- ARB: arbitrary uploaded waveform (see later GUI versions)
+
+FREQUENCY RANGE:
+- Depends on waveform and model; check the front panel for the unit's
+  rated maxima (sine reaches the highest; square/pulse/ramp are lower)
+- Enter frequency in Hz (e.g. 1000 for 1 kHz, 1e6 for 1 MHz)
+
+AMPLITUDE & OFFSET:
+- Amplitude is peak-to-peak (Vpp); Offset is the DC level (V)
+- LOAD matters: amplitude is calibrated for the selected load
+  - HiZ (high impedance): what you see on a scope's 1 MΩ input
+  - 50: into a 50 Ω matched load; open-circuit voltage is then ~2x
+  - Set LOAD to match how the output is actually terminated
+
+OUTPUT:
+- The Output checkbox toggles the channel on/off immediately
+- All other settings push only when you click "Apply CH<n>"
+
+PRESETS:
+- Save Preset: store both channels' current settings under a name
+- Load Preset: restore settings AND push them to the instrument
+- Delete Preset: remove a saved preset
+- Presets are stored in presets/siggen_presets.json
+
+BEST PRACTICES:
+- Confirm the load setting before trusting the amplitude reading
+- Start with output OFF, configure, then enable
+- Use DC waveform + offset for a steady bias voltage"""
+
+        messagebox.showinfo("Signal Generator Tips", tips)
+
     def show_logging_tips(self):
         """Show data logging tips"""
         tips = """Data Logging - Usage Tips
@@ -401,6 +462,118 @@ ANALYSIS:
         ttk.Button(tips_frame, text="📖 Show Usage Tips", 
                    command=self.show_scope_tips).pack(side=tk.RIGHT)
     
+    def create_sg_tab(self):
+        """Create signal generator control tab"""
+        sg_frame = ttk.Frame(self.notebook)
+        self.notebook.add(sg_frame, text="Signal Gen (BK 4055B)")
+
+        # Connection status
+        status_frame = ttk.LabelFrame(sg_frame, text="Connection", padding=10)
+        status_frame.pack(fill='x', padx=10, pady=10)
+
+        self.sg_status = tk.Label(status_frame, text="Not connected", fg="red")
+        self.sg_status.pack(side=tk.LEFT)
+
+        ttk.Button(status_frame, text="Reconnect", command=self.reconnect_sg).pack(side=tk.RIGHT)
+
+        # Per-channel configuration - one inner tab per output
+        config_notebook = ttk.Notebook(sg_frame)
+        config_notebook.pack(fill='x', padx=10, pady=10)
+
+        self.sg_channel_widgets = {}
+
+        for ch in (1, 2):
+            ch_frame = ttk.Frame(config_notebook)
+            config_notebook.add(ch_frame, text=f"Channel {ch}")
+
+            # Output enable (immediate toggle, like the scope channel enable)
+            output_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(ch_frame, text="Output Enabled",
+                            variable=output_var,
+                            command=lambda c=ch, v=output_var: self.sg_toggle_output(c, v)).grid(
+                                row=0, column=0, columnspan=4, sticky='w', padx=10, pady=10)
+
+            # Waveform
+            ttk.Label(ch_frame, text="Waveform:").grid(row=1, column=0, sticky='w', padx=10, pady=5)
+            waveform = ttk.Combobox(ch_frame, width=12, state='readonly')
+            waveform.grid(row=1, column=1, padx=5, pady=5)
+            waveform['values'] = list(BK4055B.WAVEFORMS)
+            waveform.set('SINE')
+
+            # Frequency
+            ttk.Label(ch_frame, text="Frequency (Hz):").grid(row=1, column=2, sticky='w', padx=(20, 0), pady=5)
+            freq = ttk.Entry(ch_frame, width=14)
+            freq.grid(row=1, column=3, padx=5, pady=5)
+            freq.insert(0, "1000")
+
+            # Amplitude
+            ttk.Label(ch_frame, text="Amplitude (Vpp):").grid(row=2, column=0, sticky='w', padx=10, pady=5)
+            amp = ttk.Entry(ch_frame, width=12)
+            amp.grid(row=2, column=1, padx=5, pady=5)
+            amp.insert(0, "1.0")
+
+            # Offset
+            ttk.Label(ch_frame, text="DC Offset (V):").grid(row=2, column=2, sticky='w', padx=(20, 0), pady=5)
+            offset = ttk.Entry(ch_frame, width=14)
+            offset.grid(row=2, column=3, padx=5, pady=5)
+            offset.insert(0, "0.0")
+
+            # Load
+            ttk.Label(ch_frame, text="Load:").grid(row=3, column=0, sticky='w', padx=10, pady=5)
+            load = ttk.Combobox(ch_frame, width=12, state='readonly')
+            load.grid(row=3, column=1, padx=5, pady=5)
+            load['values'] = ['HZ', '50']
+            load.set('HZ')
+
+            # Polarity
+            ttk.Label(ch_frame, text="Polarity:").grid(row=3, column=2, sticky='w', padx=(20, 0), pady=5)
+            polarity = ttk.Combobox(ch_frame, width=14, state='readonly')
+            polarity.grid(row=3, column=3, padx=5, pady=5)
+            polarity['values'] = ['NOR', 'INVT']
+            polarity.set('NOR')
+
+            # Apply button for this channel
+            ttk.Button(ch_frame, text=f"Apply CH{ch}",
+                       command=lambda c=ch: self.apply_sg_channel(c)).grid(
+                           row=4, column=0, columnspan=4, pady=10)
+
+            self.sg_channel_widgets[ch] = {
+                'output': output_var,
+                'waveform': waveform,
+                'freq': freq,
+                'amp': amp,
+                'offset': offset,
+                'load': load,
+                'polarity': polarity,
+            }
+
+        # Presets
+        preset_frame = ttk.LabelFrame(sg_frame, text="Presets", padding=10)
+        preset_frame.pack(fill='x', padx=10, pady=10)
+
+        ttk.Label(preset_frame, text="Saved presets:").grid(row=0, column=0, sticky='w', pady=5)
+        self.sg_preset_select = ttk.Combobox(preset_frame, width=22, state='readonly')
+        self.sg_preset_select.grid(row=0, column=1, padx=10, pady=5)
+
+        ttk.Button(preset_frame, text="Load Preset",
+                   command=self.sg_load_preset).grid(row=0, column=2, padx=5)
+        ttk.Button(preset_frame, text="Delete Preset",
+                   command=self.sg_delete_preset).grid(row=0, column=3, padx=5)
+
+        ttk.Label(preset_frame, text="Save current as:").grid(row=1, column=0, sticky='w', pady=5)
+        self.sg_preset_name = ttk.Entry(preset_frame, width=24)
+        self.sg_preset_name.grid(row=1, column=1, padx=10, pady=5)
+        ttk.Button(preset_frame, text="Save Preset",
+                   command=self.sg_save_preset).grid(row=1, column=2, padx=5)
+
+        self.sg_refresh_presets()
+
+        # Tips button at bottom
+        tips_frame = ttk.Frame(sg_frame)
+        tips_frame.pack(side=tk.BOTTOM, fill='x', padx=10, pady=5)
+        ttk.Button(tips_frame, text="📖 Show Usage Tips",
+                   command=self.show_sg_tips).pack(side=tk.RIGHT)
+
     def create_logging_tab(self):
         """Create data logging tab"""
         log_frame = ttk.Frame(self.notebook)
@@ -590,7 +763,171 @@ ANALYSIS:
             self.status_bar.config(text=f"CH{channel} configured: {vscale}V/div, {coupling} coupling")
         except Exception as e:
             messagebox.showerror("Configuration Error", str(e))
-    
+
+    # Signal generator methods
+    def reconnect_sg(self):
+        try:
+            if self.sg:
+                self.sg.close()
+            self.sg = BK4055B()
+            self.sg_status.config(text=f"Connected: {self.sg.idn}", fg="green")
+            self.update_sg_config()
+        except Exception as e:
+            self.sg_status.config(text=f"Error: {e}", fg="red")
+            messagebox.showerror("Connection Error", str(e))
+
+    def update_sg_config(self):
+        """Read current config from the generator and populate the widgets."""
+        if not self.sg:
+            return
+        for ch in (1, 2):
+            try:
+                bswv = self.sg.get_basic_wave_dict(ch)
+                widgets = self.sg_channel_widgets[ch]
+                if bswv.get('WVTP') in BK4055B.WAVEFORMS:
+                    widgets['waveform'].set(bswv['WVTP'])
+                self._set_entry(widgets['freq'], bswv.get('FRQ'))
+                self._set_entry(widgets['amp'], bswv.get('AMP'))
+                self._set_entry(widgets['offset'], bswv.get('OFST'))
+
+                outp = self.sg.get_output_dict(ch)
+                widgets['output'].set(outp['state'])
+                if outp['load'] in widgets['load']['values']:
+                    widgets['load'].set(outp['load'])
+                if outp['polarity'] in widgets['polarity']['values']:
+                    widgets['polarity'].set(outp['polarity'])
+            except Exception as e:
+                self.status_bar.config(text=f"Error reading CH{ch} config: {e}")
+
+    @staticmethod
+    def _set_entry(entry, value):
+        """Replace the contents of an Entry, skipping None values."""
+        if value is None:
+            return
+        entry.delete(0, tk.END)
+        entry.insert(0, str(value))
+
+    def apply_sg_channel(self, channel):
+        """Apply waveform/frequency/amplitude/offset settings to one channel."""
+        if not self.sg:
+            messagebox.showerror("Error", "Signal generator not connected")
+            return
+        try:
+            widgets = self.sg_channel_widgets[channel]
+            waveform = widgets['waveform'].get()
+            freq = float(widgets['freq'].get())
+            amp = float(widgets['amp'].get())
+            offset = float(widgets['offset'].get())
+
+            self.sg.set_basic_wave(channel, WVTP=waveform, FRQ=freq, AMP=amp, OFST=offset)
+            self.sg.set_output_full(channel, widgets['output'].get(),
+                                    load=widgets['load'].get(),
+                                    polarity=widgets['polarity'].get())
+
+            self.status_bar.config(
+                text=f"CH{channel} applied: {waveform}, {freq} Hz, {amp} Vpp, {offset} V")
+        except Exception as e:
+            messagebox.showerror("Configuration Error", str(e))
+
+    def sg_toggle_output(self, channel, output_var):
+        """Enable/disable a channel output immediately."""
+        if not self.sg:
+            return
+        try:
+            self.sg.set_output(channel, output_var.get())
+            state = "on" if output_var.get() else "off"
+            self.status_bar.config(text=f"CH{channel} output {state}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def _sg_collect_state(self):
+        """Read both channels' widgets into a {1|2 -> ChannelState} mapping."""
+        channels = {}
+        for ch in (1, 2):
+            widgets = self.sg_channel_widgets[ch]
+            channels[ch] = {
+                'waveform': widgets['waveform'].get(),
+                'freq_hz': float(widgets['freq'].get()),
+                'amp_vpp': float(widgets['amp'].get()),
+                'offset_v': float(widgets['offset'].get()),
+                'output': widgets['output'].get(),
+                'load': widgets['load'].get(),
+                'polarity': widgets['polarity'].get(),
+            }
+        return channels
+
+    def _sg_apply_state(self, channels):
+        """Write a {1|2 -> ChannelState} mapping into the widgets and, if
+        connected, push it to the instrument."""
+        for ch in (1, 2):
+            state = channels.get(str(ch)) or channels.get(ch)
+            if not state:
+                continue
+            widgets = self.sg_channel_widgets[ch]
+            if state.get('waveform') in BK4055B.WAVEFORMS:
+                widgets['waveform'].set(state['waveform'])
+            self._set_entry(widgets['freq'], state.get('freq_hz'))
+            self._set_entry(widgets['amp'], state.get('amp_vpp'))
+            self._set_entry(widgets['offset'], state.get('offset_v'))
+            widgets['output'].set(bool(state.get('output')))
+            if state.get('load') in widgets['load']['values']:
+                widgets['load'].set(state['load'])
+            if state.get('polarity') in widgets['polarity']['values']:
+                widgets['polarity'].set(state['polarity'])
+            if self.sg:
+                self.apply_sg_channel(ch)
+
+    def sg_refresh_presets(self):
+        """Reload the preset list into the combobox."""
+        names = self.sg_presets.names()
+        self.sg_preset_select['values'] = names
+        if names and self.sg_preset_select.get() not in names:
+            self.sg_preset_select.set(names[0])
+        elif not names:
+            self.sg_preset_select.set('')
+
+    def sg_save_preset(self):
+        """Save both channels' current settings under the entered name."""
+        name = self.sg_preset_name.get().strip()
+        if not name:
+            messagebox.showerror("Error", "Enter a preset name first")
+            return
+        try:
+            self.sg_presets.save(name, self._sg_collect_state())
+            self.sg_refresh_presets()
+            self.sg_preset_select.set(name)
+            self.status_bar.config(text=f"Preset saved: {name}")
+        except Exception as e:
+            messagebox.showerror("Save Error", str(e))
+
+    def sg_load_preset(self):
+        """Load the selected preset into the widgets and push to the box."""
+        name = self.sg_preset_select.get()
+        if not name:
+            messagebox.showerror("Error", "Select a preset to load")
+            return
+        try:
+            record = self.sg_presets.get(name)
+            self._sg_apply_state(record['channels'])
+            self.status_bar.config(text=f"Preset loaded: {name}")
+        except Exception as e:
+            messagebox.showerror("Load Error", str(e))
+
+    def sg_delete_preset(self):
+        """Delete the selected preset."""
+        name = self.sg_preset_select.get()
+        if not name:
+            messagebox.showerror("Error", "Select a preset to delete")
+            return
+        if not messagebox.askyesno("Delete Preset", f"Delete preset '{name}'?"):
+            return
+        try:
+            self.sg_presets.delete(name)
+            self.sg_refresh_presets()
+            self.status_bar.config(text=f"Preset deleted: {name}")
+        except Exception as e:
+            messagebox.showerror("Delete Error", str(e))
+
     def apply_all_scope_config(self):
         """Apply all scope settings at once"""
         if not self.scope:
