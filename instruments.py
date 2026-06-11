@@ -310,7 +310,9 @@ class BK4055B(VisaInstrument):
     """
     VID = 0xf4ec
     PID = 0xee38
-    TIMEOUT_MS = 2000
+    # 2 s proved too tight for BSWV? read-back right after a multi-parameter
+    # write (VI_ERROR_TMO seen on the bench, 2026-06-11).
+    TIMEOUT_MS = 5000
 
     WAVEFORMS = ('SINE', 'SQUARE', 'RAMP', 'PULSE', 'NOISE', 'ARB', 'DC')
 
@@ -320,6 +322,20 @@ class BK4055B(VisaInstrument):
         'FRQ', 'PERI', 'AMP', 'AMPVRMS', 'OFST', 'HLEV', 'LLEV',
         'PHSE', 'DUTY', 'SYM', 'RISE', 'FALL', 'DLY', 'WIDTH',
     )
+
+    @staticmethod
+    def _fmt_param(value):
+        """Format a numeric SCPI parameter the firmware parses reliably.
+
+        The 4055B mis-parses some decimal-suffixed values: 'DUTY,50.0' lands
+        as 5% duty (bench-verified 2026-06-11; the box appears to read the
+        digits in 0.01% units). Send plain decimal notation with no trailing
+        '.0' and no scientific exponent: 50.0 -> '50', 1.68e-08 ->
+        '0.0000000168'. Non-floats pass through unchanged.
+        """
+        if isinstance(value, float):
+            return f'{value:.12f}'.rstrip('0').rstrip('.') or '0'
+        return str(value)
 
     @staticmethod
     def _strip_unit(value):
@@ -339,13 +355,13 @@ class BK4055B(VisaInstrument):
         self.write(f'C{channel}:BSWV WVTP,{wave.upper()}')
 
     def set_frequency(self, channel, freq_hz):
-        self.write(f'C{channel}:BSWV FRQ,{freq_hz}')
+        self.write(f'C{channel}:BSWV FRQ,{self._fmt_param(freq_hz)}')
 
     def set_amplitude_vpp(self, channel, amp_vpp):
-        self.write(f'C{channel}:BSWV AMP,{amp_vpp}')
+        self.write(f'C{channel}:BSWV AMP,{self._fmt_param(amp_vpp)}')
 
     def set_offset(self, channel, offset_v):
-        self.write(f'C{channel}:BSWV OFST,{offset_v}')
+        self.write(f'C{channel}:BSWV OFST,{self._fmt_param(offset_v)}')
 
     def set_basic_wave(self, channel, **params):
         """Set several basic-wave parameters in one command.
@@ -360,7 +376,8 @@ class BK4055B(VisaInstrument):
             wave = next(v for k, v in params.items() if k.upper() == 'WVTP')
             if str(wave).upper() not in self.WAVEFORMS:
                 raise ValueError(f"Waveform must be one of {self.WAVEFORMS}")
-        body = ','.join(f'{k.upper()},{v}' for k, v in params.items())
+        body = ','.join(f'{k.upper()},{self._fmt_param(v)}'
+                        for k, v in params.items())
         self.write(f'C{channel}:BSWV {body}')
 
     def set_output(self, channel, on):

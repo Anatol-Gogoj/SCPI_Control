@@ -839,6 +839,8 @@ ANALYSIS:
         btns.pack(fill='x', padx=10, pady=8)
         ttk.Button(btns, text=f"Apply CH{ch} Settings",
                    command=lambda c=ch: self.apply_sg_channel(c)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btns, text="Read Instrument",
+                   command=lambda c=ch: self.sg_read_instrument(c)).pack(side=tk.LEFT, padx=5)
         output_var = tk.BooleanVar(value=False)
         out_btn = tk.Button(btns, text="Output: OFF", width=12,
                             command=lambda c=ch: self.sg_toggle_output(c))
@@ -969,23 +971,40 @@ ANALYSIS:
             return
         for ch in (1, 2):
             try:
-                bswv = self.sg.get_basic_wave_dict(ch)
-                outp = self.sg.get_output_dict(ch)
-                widgets = self.sg_channel_widgets[ch]
-                if bswv.get('WVTP') in BK4055B.WAVEFORMS:
-                    widgets['waveform'].set(bswv['WVTP'])
-                for key, bk in SG_BSWV_KEYS.items():
-                    if bk in bswv:
-                        self._set_entry(widgets[key], bswv[bk])
-                widgets['load'].set(SG_LOAD_HIGHZ if outp['load'] == 'HZ'
-                                    else outp['load'])
-                if outp['polarity'] in widgets['polarity']['values']:
-                    widgets['polarity'].set(outp['polarity'])
-                self._sg_update_visibility(ch)
-                self._sg_redraw_preview(ch)
-                self._sg_refresh_applied(ch, bswv=bswv, outp=outp)
+                self._sg_read_channel(ch)
             except Exception as e:
                 self.status_bar.config(text=f"Error reading CH{ch} config: {e}")
+
+    def _sg_read_channel(self, ch):
+        """Pull one channel's actual state from the instrument into the
+        inputs, applied readouts, and output button."""
+        bswv = self.sg.get_basic_wave_dict(ch)
+        outp = self.sg.get_output_dict(ch)
+        widgets = self.sg_channel_widgets[ch]
+        if bswv.get('WVTP') in BK4055B.WAVEFORMS:
+            widgets['waveform'].set(bswv['WVTP'])
+        for key, bk in SG_BSWV_KEYS.items():
+            if bk in bswv:
+                self._set_entry(widgets[key], bswv[bk])
+        widgets['load'].set(SG_LOAD_HIGHZ if outp['load'] == 'HZ'
+                            else outp['load'])
+        if outp['polarity'] in widgets['polarity']['values']:
+            widgets['polarity'].set(outp['polarity'])
+        self._sg_update_visibility(ch)
+        self._sg_redraw_preview(ch)
+        self._sg_refresh_applied(ch, bswv=bswv, outp=outp)
+
+    def sg_read_instrument(self, ch):
+        """Read Instrument button: sync the GUI to the box's actual state
+        (use after changing settings on the front panel)."""
+        if not self.sg:
+            messagebox.showerror("Error", "Signal generator not connected")
+            return
+        try:
+            self._sg_read_channel(ch)
+            self.status_bar.config(text=f"CH{ch} read from instrument")
+        except Exception as e:
+            messagebox.showerror("Read Error", str(e))
 
     def _sg_refresh_applied(self, ch, bswv=None, outp=None):
         """Update the gray applied-value readouts (and output button) from the
@@ -1042,13 +1061,23 @@ ANALYSIS:
             self.sg.set_load_polarity(channel,
                                       load=self._sg_load_to_wire(channel),
                                       polarity=widgets['polarity'].get())
+        except Exception as e:
+            messagebox.showerror("Configuration Error", str(e))
+            return
+
+        # Read-back is best-effort: the configuration above already landed,
+        # so a slow/timed-out query must not be reported as a config error.
+        try:
+            time.sleep(0.2)  # let the box settle before querying
             self._sg_refresh_applied(channel)
             self.status_bar.config(
                 text=f"CH{channel} configured: {wave} "
                      f"(output {'ON' if widgets['output'].get() else 'OFF'} - "
                      f"use the Output button to switch)")
         except Exception as e:
-            messagebox.showerror("Configuration Error", str(e))
+            self.status_bar.config(
+                text=f"CH{channel} configured, but read-back failed ({e}) - "
+                     f"use Read Instrument to refresh")
 
     def sg_toggle_output(self, channel):
         """Flip the channel output on/off (separate from Apply)."""
