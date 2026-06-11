@@ -2,8 +2,10 @@
 """Headless tests for the BK4055B response parsers (no instrument needed).
 
 Feeds captured BSWV?/OUTP? response strings into the parsers and asserts the
-resulting dicts. Run: .venv/bin/python test_bk4055b_parse.py
+resulting dicts/bytes. Run: .venv/bin/python test_bk4055b_parse.py
 """
+import struct
+
 from instruments import BK4055B
 
 
@@ -13,6 +15,7 @@ class FakeSG(BK4055B):
         self._bswv = bswv
         self._outp = outp
         self.sent = []
+        self.sent_raw = []
 
     def get_basic_wave(self, channel):
         return self._bswv
@@ -22,6 +25,9 @@ class FakeSG(BK4055B):
 
     def write(self, command):
         self.sent.append(command)
+
+    def write_raw(self, data):
+        self.sent_raw.append(data)
 
 
 def test_strip_unit():
@@ -105,6 +111,60 @@ def test_output_dict_minimal():
     assert d['state'] is False
     assert d['load'] == 'HZ'        # default
     assert d['polarity'] == 'NOR'   # default
+
+
+def test_samples_to_int16():
+    data = BK4055B.samples_to_int16([0.0, 1.0, -1.0, 0.5])
+    vals = struct.unpack('<4h', data)
+    assert vals == (0, 32767, -32767, 16384)   # 0.5 * 32767 rounds to 16384
+
+    # |samples| > 1 are normalised to full scale
+    data = BK4055B.samples_to_int16([2.0, -2.0, 1.0])
+    vals = struct.unpack('<3h', data)
+    assert vals == (32767, -32767, 16384)      # 1.0/2.0 -> half scale
+
+    try:
+        BK4055B.samples_to_int16([])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for empty samples")
+
+
+def test_upload_arb_message():
+    sg = FakeSG()
+    clean = sg.upload_arb(1, 'my wave!', [0.0, 1.0, 0.0, -1.0],
+                          freq_hz=2000.0, amp_vpp=2.0, offset_v=0.0)
+    assert clean == 'my_wave_'                 # sanitised name returned
+    assert len(sg.sent_raw) == 1
+    msg = sg.sent_raw[0]
+    header = ('C1:WVDT WVNM,my_wave_,FREQ,2000,AMPL,2,OFST,0,PHASE,0,'
+              'WAVEDATA,').encode('latin1')
+    assert msg.startswith(header)              # _fmt_param: no '.0' suffixes
+    payload = msg[len(header):]
+    assert len(payload) == 8                   # 4 samples x int16
+    assert struct.unpack('<4h', payload) == (0, 32767, 0, -32767)
+
+
+def test_upload_arb_limits():
+    sg = FakeSG()
+    too_many = [0.0] * (BK4055B.ARB_MAX_POINTS + 1)
+    try:
+        sg.upload_arb(1, 'big', too_many, freq_hz=1000)
+    except ValueError as e:
+        assert 'ARB_MAX_POINTS' in str(e)
+    else:
+        raise AssertionError("expected ValueError over ARB_MAX_POINTS")
+
+
+def test_select_arb_and_arwv_parse():
+    sg = FakeSG(outp='C1:ARWV INDEX,2,NAME,wave1')
+    sg.select_arb(1, 'wave1')
+    assert sg.sent == ['C1:BSWV WVTP,ARB', 'C1:ARWV NAME,wave1']
+    assert sg.get_arb_dict(1) == {'index': 2, 'name': 'wave1'}
+
+    sg = FakeSG(outp='C2:ARWV NAME,stairs')    # INDEX missing
+    assert sg.get_arb_dict(2) == {'index': None, 'name': 'stairs'}
 
 
 if __name__ == '__main__':

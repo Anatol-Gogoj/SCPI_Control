@@ -117,6 +117,15 @@ class VisaInstrument:
     def read_raw(self):
         return self.inst.read_raw()
 
+    def write_raw(self, data):
+        """Write raw bytes verbatim (no termination/encoding munging).
+
+        Needed for commands that carry binary payloads, e.g. the 4055B's
+        WVDT arbitrary-waveform upload where sample bytes follow the ASCII
+        header directly.
+        """
+        return self.inst.write_raw(data)
+
     def ask(self, command):
         """Write a command and return its response (newline-stripped)."""
         return self.inst.query(command).strip()
@@ -451,6 +460,82 @@ class BK4055B(VisaInstrument):
             'load': pairs.get('LOAD', 'HZ'),
             'polarity': pairs.get('PLRT', 'NOR'),
         }
+
+    # -- arbitrary waveforms -------------------------------------------------
+
+    ARB_MAX_POINTS = 16384  # conservative DDS-mode default; bench-bisect the
+                            # true 4055B limit before raising (see PR notes)
+
+    @staticmethod
+    def samples_to_int16(samples):
+        """Normalise float samples to full-scale signed 16-bit LE bytes.
+
+        Values are scaled so the largest |sample| maps to full scale when any
+        |sample| exceeds 1.0; otherwise [-1, 1] maps directly. Full scale is
+        +/-32767 (symmetric), little-endian two's complement per the Siglent
+        SDG arb format.
+        """
+        if not samples:
+            raise ValueError("samples must be a non-empty sequence")
+        peak = max(abs(float(s)) for s in samples)
+        scale = 32767.0 / peak if peak > 1.0 else 32767.0
+        out = bytearray()
+        for s in samples:
+            v = int(round(float(s) * scale))
+            v = max(-32768, min(32767, v))
+            out += struct.pack('<h', v)
+        return bytes(out)
+
+    def upload_arb(self, channel, name, samples, freq_hz, amp_vpp=1.0,
+                   offset_v=0.0, phase_deg=0.0):
+        """Upload an arbitrary waveform to the instrument's user memory.
+
+        The WVDT command carries raw int16 LE sample bytes directly after the
+        'WAVEDATA,' token (NOT an IEEE-488.2 #-block), so the whole message is
+        sent via write_raw. Numeric header fields go through _fmt_param (the
+        4055B mis-parses decimal-suffixed values, see README quirks).
+
+        name is sanitised to [A-Za-z0-9_], max 16 chars, since the box stores
+        it as a filename-like identifier.
+        """
+        clean = re.sub(r'[^A-Za-z0-9_]', '_', str(name))[:16]
+        if not clean:
+            raise ValueError(f"unusable arb name {name!r}")
+        if len(samples) > self.ARB_MAX_POINTS:
+            raise ValueError(
+                f"{len(samples)} points exceeds ARB_MAX_POINTS "
+                f"({self.ARB_MAX_POINTS}); decimate the waveform first")
+        data = self.samples_to_int16(samples)
+        header = (f'C{channel}:WVDT WVNM,{clean},'
+                  f'FREQ,{self._fmt_param(float(freq_hz))},'
+                  f'AMPL,{self._fmt_param(float(amp_vpp))},'
+                  f'OFST,{self._fmt_param(float(offset_v))},'
+                  f'PHASE,{self._fmt_param(float(phase_deg))},'
+                  f'WAVEDATA,')
+        self.write_raw(header.encode('latin1') + data)
+        return clean
+
+    def select_arb(self, channel, name):
+        """Put a channel in ARB mode playing the named user waveform."""
+        self.write(f'C{channel}:BSWV WVTP,ARB')
+        self.write(f'C{channel}:ARWV NAME,{name}')
+
+    def get_arb_dict(self, channel):
+        """Parse 'C1:ARWV INDEX,2,NAME,wave1' -> {'index': 2, 'name': 'wave1'}.
+
+        Either key may be missing depending on firmware; absent keys are
+        returned as None.
+        """
+        raw = self.ask(f'C{channel}:ARWV?')
+        body = raw.split(' ', 1)[1] if ' ' in raw else raw
+        tokens = [t for t in body.split(',') if t != '']
+        pairs = {k.upper(): v for k, v in zip(tokens[0::2], tokens[1::2])}
+        index = pairs.get('INDEX')
+        try:
+            index = int(index) if index is not None else None
+        except ValueError:
+            pass
+        return {'index': index, 'name': pairs.get('NAME')}
 
 
 # --------------------------------------------------------------------------

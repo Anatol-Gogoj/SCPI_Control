@@ -20,6 +20,8 @@ and avoids preset-name -> filename sanitisation. The top-level ``version`` field
 leaves room for the sequence/arb formats that later PRs add to this module.
 """
 import os
+import re
+import csv
 import json
 from datetime import datetime, timezone
 
@@ -27,6 +29,69 @@ from instruments import BK4055B
 
 SCHEMA_VERSION = 1
 DEFAULT_PATH = 'presets/siggen_presets.json'
+DEFAULT_ARB_DIR = 'presets/arb'
+
+# --------------------------------------------------------------------------
+# Arbitrary-waveform CSV format
+# --------------------------------------------------------------------------
+# A waveform CSV has a header row and one of two layouts:
+#   value             one column of sample values (one period, in order)
+#   time,value        time column is accepted but ignored; rows are taken
+#                     in file order (export tools often include it)
+# Values are floats; anything in [-1, 1] uploads as-is, larger magnitudes
+# are normalised to full scale at upload. Blank lines are skipped.
+
+ARB_CSV_TEMPLATE_ROWS = 32  # one sine period in the template file
+
+
+def sanitize_arb_name(name):
+    """Instrument-safe arb name: [A-Za-z0-9_], max 16 chars."""
+    clean = re.sub(r'[^A-Za-z0-9_]', '_', str(name).strip())[:16]
+    if not clean:
+        raise ValueError(f"unusable arb name {name!r}")
+    return clean
+
+
+def arb_from_csv(path):
+    """Read waveform samples from a CSV file. Returns a list of floats.
+
+    Accepts a 'value' column alone or 'time,value' (time ignored). Raises
+    ValueError with a row reference on malformed content.
+    """
+    with open(path, newline='') as f:
+        reader = csv.reader(f)
+        try:
+            header = next(reader)
+        except StopIteration:
+            raise ValueError(f"{path}: empty file")
+        cols = [c.strip().lower() for c in header]
+        if 'value' not in cols:
+            raise ValueError(
+                f"{path}: header must contain a 'value' column "
+                f"(got {header!r}); accepted layouts: 'value' or 'time,value'")
+        vcol = cols.index('value')
+        samples = []
+        for lineno, row in enumerate(reader, start=2):
+            if not row or all(not c.strip() for c in row):
+                continue  # skip blank lines
+            try:
+                samples.append(float(row[vcol]))
+            except (IndexError, ValueError):
+                raise ValueError(f"{path}: bad value on line {lineno}: {row!r}")
+    if not samples:
+        raise ValueError(f"{path}: no sample rows")
+    return samples
+
+
+def write_arb_template(path):
+    """Write a template CSV (header + one sine period) a user can edit."""
+    import math
+    n = ARB_CSV_TEMPLATE_ROWS
+    with open(path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['value'])
+        for i in range(n):
+            writer.writerow([f'{math.sin(2 * math.pi * i / n):.6f}'])
 
 # Canonical waveform list lives on the driver; mirror it here so validation has
 # a single source of truth.
@@ -67,6 +132,10 @@ def validate_channel_state(state):
                 out[key] = float(state[key])
             except (TypeError, ValueError):
                 raise ValueError(f"{key} must be a number, got {state[key]!r}")
+
+    # ARB waveform reference (name in the arb library / instrument memory)
+    if state.get('arb_name'):
+        out['arb_name'] = sanitize_arb_name(state['arb_name'])
 
     out['waveform'] = str(out['waveform']).upper()
     if out['waveform'] not in VALID_WAVEFORMS:
@@ -165,5 +234,54 @@ class SignalGenPresetStore:
         if name in self._data['presets']:
             del self._data['presets'][name]
             self._save()
+            return True
+        return False
+
+    # -- arbitrary-waveform library (CSV files under arb_dir) ---------------
+    # The library is just the directory listing: presets/arb/<name>.csv.
+    # No index file to corrupt; the preset JSON references arbs by name.
+
+    @property
+    def arb_dir(self):
+        return getattr(self, '_arb_dir', DEFAULT_ARB_DIR)
+
+    @arb_dir.setter
+    def arb_dir(self, path):
+        self._arb_dir = path
+
+    def _arb_path(self, name):
+        return os.path.join(self.arb_dir, f'{sanitize_arb_name(name)}.csv')
+
+    def arb_names(self):
+        """Sorted names of saved arb waveforms."""
+        if not os.path.isdir(self.arb_dir):
+            return []
+        return sorted(os.path.splitext(f)[0] for f in os.listdir(self.arb_dir)
+                      if f.endswith('.csv'))
+
+    def save_arb(self, name, samples):
+        """Save samples as <arb_dir>/<name>.csv. Returns the sanitised name."""
+        if not samples:
+            raise ValueError("samples must be non-empty")
+        clean = sanitize_arb_name(name)
+        os.makedirs(self.arb_dir, exist_ok=True)
+        tmp = self._arb_path(clean) + '.tmp'
+        with open(tmp, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['value'])
+            for s in samples:
+                writer.writerow([f'{float(s):.6g}'])
+        os.replace(tmp, self._arb_path(clean))
+        return clean
+
+    def load_arb(self, name):
+        """Load samples for a saved arb. Raises FileNotFoundError/ValueError."""
+        return arb_from_csv(self._arb_path(name))
+
+    def delete_arb(self, name):
+        """Delete a saved arb. Returns True if it existed."""
+        path = self._arb_path(name)
+        if os.path.exists(path):
+            os.remove(path)
             return True
         return False

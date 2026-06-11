@@ -8,7 +8,9 @@ import os
 import json
 import tempfile
 
-from siggen_presets import SignalGenPresetStore, validate_channel_state
+from siggen_presets import (SignalGenPresetStore, validate_channel_state,
+                            arb_from_csv, write_arb_template,
+                            sanitize_arb_name)
 
 
 def _state(waveform='SINE', freq=1000.0, amp=1.0, offset=0.0,
@@ -107,6 +109,67 @@ def test_atomic_write_is_valid_json(tmp_path):
     assert data['version'] == 1
     assert 'x' in data['presets']
     assert not os.path.exists(tmp_path + '.tmp')  # temp cleaned up
+
+
+def test_arb_csv_value_only(tmp_path):
+    path = os.path.join(os.path.dirname(tmp_path), 'wave.csv')
+    with open(path, 'w') as f:
+        f.write("value\n0.0\n0.5\n\n-0.5\n")     # incl. a blank line
+    assert arb_from_csv(path) == [0.0, 0.5, -0.5]
+
+
+def test_arb_csv_time_value(tmp_path):
+    path = os.path.join(os.path.dirname(tmp_path), 'wave2.csv')
+    with open(path, 'w') as f:
+        f.write("time,value\n0,0.1\n1e-3,0.2\n2e-3,0.3\n")
+    assert arb_from_csv(path) == [0.1, 0.2, 0.3]
+
+
+def test_arb_csv_rejects_bad(tmp_path):
+    base = os.path.dirname(tmp_path)
+    no_header = os.path.join(base, 'bad1.csv')
+    with open(no_header, 'w') as f:
+        f.write("volts\n1\n2\n")                 # wrong header
+    bad_row = os.path.join(base, 'bad2.csv')
+    with open(bad_row, 'w') as f:
+        f.write("value\n0.1\noops\n")
+    for path, fragment in ((no_header, "'value'"), (bad_row, 'line 3')):
+        try:
+            arb_from_csv(path)
+        except ValueError as e:
+            assert fragment in str(e)
+        else:
+            raise AssertionError(f"expected ValueError for {path}")
+
+
+def test_arb_template_roundtrip(tmp_path):
+    path = os.path.join(os.path.dirname(tmp_path), 'template.csv')
+    write_arb_template(path)
+    samples = arb_from_csv(path)
+    assert len(samples) == 32                    # one sine period
+    assert max(samples) <= 1.0 and min(samples) >= -1.0
+    assert abs(samples[0]) < 1e-6                # sin(0)
+
+
+def test_arb_library_roundtrip(tmp_path):
+    store = SignalGenPresetStore(path=tmp_path)
+    store.arb_dir = os.path.join(os.path.dirname(tmp_path), 'arb')
+    assert store.arb_names() == []
+    clean = store.save_arb('stair case', [0.0, 0.5, 1.0])
+    assert clean == 'stair_case'                 # sanitised
+    assert store.arb_names() == ['stair_case']
+    assert store.load_arb('stair_case') == [0.0, 0.5, 1.0]
+    assert store.delete_arb('stair_case') is True
+    assert store.delete_arb('stair_case') is False
+    assert store.arb_names() == []
+
+
+def test_arb_name_in_channel_state():
+    out = validate_channel_state({'waveform': 'ARB', 'arb_name': 'my wave!'})
+    assert out['arb_name'] == 'my_wave_'         # sanitised
+    out = validate_channel_state({'waveform': 'SINE'})
+    assert 'arb_name' not in out                 # absent when not given
+    assert sanitize_arb_name('x' * 40) == 'x' * 16   # length cap
 
 
 if __name__ == '__main__':

@@ -6,22 +6,25 @@ Multi-instrument control with CSV data logging
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import csv
+import os
 import time
 from datetime import datetime
 from instruments import BK894, TekMSO24, BK4055B
-from siggen_presets import SignalGenPresetStore
+from siggen_presets import (SignalGenPresetStore, arb_from_csv,
+                            write_arb_template, sanitize_arb_name)
 from waveform_render import unit_waveform, scale_waveform
 import threading
 
 # ---- Signal generator field rules -----------------------------------------
 # Which fields exist, what they're called, which waveforms use them, and
 # whether they're hidden behind the Advanced toggle.
-SG_FIELD_ORDER = ('freq', 'amp', 'offset', 'duty', 'sym',
+SG_FIELD_ORDER = ('freq', 'amp', 'offset', 'arb', 'duty', 'sym',
                   'phase', 'rise', 'fall', 'delay', 'load', 'polarity')
 
 SG_FIELD_LABELS = {
     'freq': 'Frequency (Hz):', 'amp': 'Amplitude (Vpp):',
-    'offset': 'DC Offset (V):', 'duty': 'Duty Cycle (%):',
+    'offset': 'DC Offset (V):', 'arb': 'Arb Waveform:',
+    'duty': 'Duty Cycle (%):',
     'sym': 'Symmetry (%):', 'phase': 'Phase (deg):',
     'rise': 'Rise Time (s):', 'fall': 'Fall Time (s):',
     'delay': 'Delay (s):', 'load': 'Load (Ω):', 'polarity': 'Polarity:',
@@ -37,6 +40,7 @@ SG_FIELD_WAVEFORMS = {
     'freq': _PERIODIC,
     'amp': _PERIODIC,
     'offset': _PERIODIC | {'DC'},
+    'arb': {'ARB'},
     'duty': {'SQUARE', 'PULSE'},
     'sym': {'RAMP'},
     'phase': {'SINE', 'SQUARE', 'RAMP', 'ARB'},
@@ -216,7 +220,8 @@ WAVEFORMS (fields adapt to the selected type):
 - PULSE: timing tests; Duty plus Rise/Fall/Delay (Advanced mode)
 - NOISE: broadband stimulus (level set on the front panel for now)
 - DC: fixed level only (set with DC Offset)
-- ARB: arbitrary uploaded waveform (dialog coming in a later version)
+- ARB: arbitrary waveform - select ARB then "Waveform Editor..." to
+  load a CSV, save it to the library, and upload to the instrument
 
 BASIC vs ADVANCED:
 - Advanced mode reveals Phase, pulse edge timing (Rise/Fall/Delay),
@@ -254,6 +259,14 @@ PRESETS:
   instrument (output on/off state is NOT changed by a preset load)
 - Delete Preset: remove a saved preset
 - Presets are stored in presets/siggen_presets.json
+
+ARBITRARY WAVEFORMS:
+- CSV format: header row 'value' (or 'time,value' - time is ignored),
+  then one sample per row; values in [-1, 1], larger is normalised
+- "Save CSV Template..." writes a starter file (one sine period)
+- The library lives in presets/arb/<name>.csv; presets reference arbs
+  by name - upload the arb once, then presets can re-select it
+- Playback rate = the channel's Frequency field (one period per cycle)
 
 BEST PRACTICES:
 - Confirm the load setting before trusting the amplitude reading
@@ -802,23 +815,36 @@ ANALYSIS:
         widgets['applied']['waveform'] = applied_wave
 
         # Parameter rows; visibility managed by _sg_update_visibility
+        widgets['arb_name_var'] = tk.StringVar(value='')
+        widgets['arb_samples'] = None   # staged samples for the preview
+
         for key in SG_FIELD_ORDER:
             row = ttk.Frame(form)
             ttk.Label(row, text=SG_FIELD_LABELS[key], width=16).pack(side=tk.LEFT)
-            if key == 'load':
+            if key == 'arb':
+                # Button opens the waveform editor; label shows chosen arb
+                w = ttk.Button(row, text="Waveform Editor...",
+                               command=lambda c=ch: self.sg_open_arb_dialog(c))
+                name_lbl = tk.Label(row, textvariable=widgets['arb_name_var'],
+                                    width=12, anchor='w')
+                w.pack(side=tk.LEFT, padx=4)
+                name_lbl.pack(side=tk.LEFT)
+            elif key == 'load':
                 # Editable: pick High-Z / common values or type any ohms
                 w = ttk.Combobox(row, width=9)
                 w['values'] = [SG_LOAD_HIGHZ, '50', '75', '600', '10000']
                 w.set(SG_LOAD_HIGHZ)
+                w.pack(side=tk.LEFT, padx=4)
             elif key == 'polarity':
                 w = ttk.Combobox(row, width=9, state='readonly')
                 w['values'] = ['NOR', 'INVT']
                 w.set('NOR')
+                w.pack(side=tk.LEFT, padx=4)
             else:
                 w = ttk.Entry(row, width=11)
                 w.insert(0, SG_FIELD_DEFAULTS[key])
                 w.bind('<KeyRelease>', lambda e, c=ch: self._sg_redraw_preview(c))
-            w.pack(side=tk.LEFT, padx=4)
+                w.pack(side=tk.LEFT, padx=4)
             applied = tk.Label(row, text='--', fg='gray', width=14, anchor='w')
             applied.pack(side=tk.LEFT, padx=4)
             widgets[key] = w
@@ -902,7 +928,8 @@ ANALYSIS:
         unit = unit_waveform(wave, n_periods=3, points_per_period=120,
                              duty_pct=duty, sym_pct=sym,
                              rise_frac=rise_frac, fall_frac=fall_frac,
-                             phase_deg=phase)
+                             phase_deg=phase,
+                             samples=widgets.get('arb_samples'))
         volts = scale_waveform(unit, amp if wave != 'DC' else 0.0, offset)
 
         canvas.delete('all')
@@ -1020,6 +1047,14 @@ ANALYSIS:
         applied['waveform'].config(text=str(bswv.get('WVTP', '--')))
         for key, bk in SG_BSWV_KEYS.items():
             applied[key].config(text=str(bswv[bk]) if bk in bswv else '--')
+        if bswv.get('WVTP') == 'ARB':
+            try:
+                arb = self.sg.get_arb_dict(ch)
+                applied['arb'].config(text=arb['name'] or '--')
+            except Exception:
+                applied['arb'].config(text='--')
+        else:
+            applied['arb'].config(text='--')
         applied['load'].config(text=SG_LOAD_HIGHZ if outp['load'] == 'HZ'
                                else outp['load'])
         applied['polarity'].config(text=outp['polarity'])
@@ -1058,6 +1093,12 @@ ANALYSIS:
                                      f"between 0 and 100, got {value:g}")
                 params[bk] = value
             self.sg.set_basic_wave(channel, **params)
+            if wave == 'ARB':
+                arb = widgets['arb_name_var'].get().strip()
+                if arb:
+                    # Select by name; the waveform must already be in the
+                    # instrument's user memory (Waveform Editor uploads it)
+                    self.sg.select_arb(channel, arb)
             self.sg.set_load_polarity(channel,
                                       load=self._sg_load_to_wire(channel),
                                       polarity=widgets['polarity'].get())
@@ -1117,6 +1158,10 @@ ANALYSIS:
                 if waves is None or wave in waves:
                     state[skey] = self._sg_get_float(
                         ch, key, float(SG_FIELD_DEFAULTS[key]))
+            if wave == 'ARB':
+                arb = widgets['arb_name_var'].get().strip()
+                if arb:
+                    state['arb_name'] = arb
             channels[ch] = state
         return channels
 
@@ -1138,10 +1183,24 @@ ANALYSIS:
                                     else state['load'])
             if state.get('polarity') in widgets['polarity']['values']:
                 widgets['polarity'].set(state['polarity'])
+            if state.get('arb_name'):
+                widgets['arb_name_var'].set(state['arb_name'])
+                # Stage library samples for the preview (best-effort); the
+                # instrument-side select happens in apply_sg_channel and
+                # assumes the arb is already in instrument memory
+                try:
+                    widgets['arb_samples'] = self.sg_presets.load_arb(
+                        state['arb_name'])
+                except Exception:
+                    widgets['arb_samples'] = None
             self._sg_update_visibility(ch)
             self._sg_redraw_preview(ch)
             if self.sg:
                 self.apply_sg_channel(ch)
+
+    def sg_open_arb_dialog(self, ch):
+        """Open the arbitrary-waveform editor for a channel."""
+        ArbWaveformDialog(self, ch)
 
     def sg_refresh_presets(self):
         """Reload the preset list into the combobox."""
@@ -1452,6 +1511,228 @@ ANALYSIS:
             self.log_text.config(state='disabled')
         
         self.root.after(0, update)
+
+
+class ArbWaveformDialog(tk.Toplevel):
+    """Arbitrary-waveform editor for one sig gen channel.
+
+    Load samples from a CSV (header 'value', or 'time,value' with time
+    ignored), preview them, keep them in the on-disk library
+    (presets/arb/<name>.csv), and upload to the instrument's user memory
+    (WVDT) + select on the channel (ARWV). Playback frequency/amplitude/
+    offset come from the channel's input fields.
+    """
+
+    def __init__(self, app, channel):
+        super().__init__(app.root)
+        self.app = app
+        self.channel = channel
+        self.samples = list(app.sg_channel_widgets[channel].get('arb_samples')
+                            or [])
+        self.title(f"Arbitrary Waveform - CH{channel}")
+        self.transient(app.root)
+
+        # Source: CSV file in / template out
+        src = ttk.LabelFrame(self, text="CSV File", padding=10)
+        src.pack(fill='x', padx=10, pady=(10, 5))
+        ttk.Button(src, text="Load CSV...",
+                   command=self.load_csv).pack(side=tk.LEFT, padx=5)
+        ttk.Button(src, text="Save CSV Template...",
+                   command=self.save_template).pack(side=tk.LEFT, padx=5)
+        self.info_lbl = tk.Label(src, text=self._info_text(), anchor='w')
+        self.info_lbl.pack(side=tk.LEFT, padx=15)
+
+        # Library: saved arbs under presets/arb/
+        lib = ttk.LabelFrame(self, text="Waveform Library", padding=10)
+        lib.pack(fill='x', padx=10, pady=5)
+        self.lib_select = ttk.Combobox(lib, width=18, state='readonly')
+        self.lib_select.pack(side=tk.LEFT, padx=5)
+        ttk.Button(lib, text="Load",
+                   command=self.lib_load).pack(side=tk.LEFT, padx=5)
+        ttk.Button(lib, text="Save Current",
+                   command=self.lib_save).pack(side=tk.LEFT, padx=5)
+        ttk.Button(lib, text="Delete",
+                   command=self.lib_delete).pack(side=tk.LEFT, padx=5)
+        self._lib_refresh()
+
+        # Preview
+        prev = ttk.LabelFrame(self, text="Preview (one period)", padding=10)
+        prev.pack(fill='x', padx=10, pady=5)
+        self.canvas = tk.Canvas(prev, width=420, height=150, bg='white',
+                                highlightthickness=1,
+                                highlightbackground='#999')
+        self.canvas.pack()
+
+        # Name + upload
+        bottom = ttk.Frame(self, padding=10)
+        bottom.pack(fill='x')
+        ttk.Label(bottom, text="Name:").pack(side=tk.LEFT)
+        self.name_entry = ttk.Entry(bottom, width=18)
+        self.name_entry.pack(side=tk.LEFT, padx=5)
+        self.name_entry.insert(
+            0, app.sg_channel_widgets[channel]['arb_name_var'].get())
+        ttk.Button(bottom, text=f"Upload && Select on CH{channel}",
+                   command=self.upload).pack(side=tk.LEFT, padx=15)
+        ttk.Button(bottom, text="Close",
+                   command=self.destroy).pack(side=tk.RIGHT)
+
+        tk.Label(self, fg='gray', anchor='w', justify=tk.LEFT,
+                 text=("Playback rate/level use the channel's Frequency, "
+                       "Amplitude and Offset fields.\n"
+                       "CSV format: header 'value' (or 'time,value'); values "
+                       "in [-1, 1], larger is normalised.")).pack(
+                           fill='x', padx=12, pady=(0, 8))
+
+        self._redraw()
+
+    # -- helpers -------------------------------------------------------------
+    def _info_text(self):
+        return (f"{len(self.samples)} points loaded" if self.samples
+                else "no waveform loaded")
+
+    def _lib_refresh(self):
+        names = self.app.sg_presets.arb_names()
+        self.lib_select['values'] = names
+        if names and self.lib_select.get() not in names:
+            self.lib_select.set(names[0])
+        elif not names:
+            self.lib_select.set('')
+
+    def _redraw(self):
+        c = self.canvas
+        c.delete('all')
+        w, h = int(c['width']), int(c['height'])
+        pad = 8
+        if not self.samples:
+            c.create_text(w // 2, h // 2, text="Load a CSV or library waveform",
+                          fill='#999')
+            return
+        peak = max(abs(s) for s in self.samples) or 1.0
+        c.create_line(0, h / 2, w, h / 2, fill='#bbb', dash=(3, 3))
+        pts = []
+        n = len(self.samples)
+        for i, s in enumerate(self.samples):
+            x = pad + i * (w - 2 * pad) / max(n - 1, 1)
+            y = h / 2.0 - (s / peak) * (h / 2.0 - pad)
+            pts.extend((x, y))
+        if len(pts) >= 4:
+            c.create_line(*pts, fill='#1565c0', width=2)
+        c.create_text(6, h - 6, anchor='sw', fill='#666', font=('Arial', 8),
+                      text=f"{n} pts, peak |{peak:g}|")
+
+    def _set_samples(self, samples, name=None):
+        self.samples = list(samples)
+        self.info_lbl.config(text=self._info_text())
+        if name:
+            self.name_entry.delete(0, tk.END)
+            self.name_entry.insert(0, sanitize_arb_name(name))
+        self._redraw()
+
+    # -- actions -------------------------------------------------------------
+    def load_csv(self):
+        path = filedialog.askopenfilename(
+            parent=self, title="Load waveform CSV",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            samples = arb_from_csv(path)
+        except Exception as e:
+            messagebox.showerror("CSV Error", str(e), parent=self)
+            return
+        stem = os.path.splitext(os.path.basename(path))[0]
+        self._set_samples(samples, name=stem)
+
+    def save_template(self):
+        path = filedialog.asksaveasfilename(
+            parent=self, title="Save CSV template",
+            defaultextension=".csv", initialfile="arb_template.csv",
+            filetypes=[("CSV files", "*.csv")])
+        if not path:
+            return
+        try:
+            write_arb_template(path)
+            self.app.status_bar.config(text=f"Template written: {path}")
+        except Exception as e:
+            messagebox.showerror("Template Error", str(e), parent=self)
+
+    def lib_load(self):
+        name = self.lib_select.get()
+        if not name:
+            messagebox.showerror("Error", "No library waveform selected",
+                                 parent=self)
+            return
+        try:
+            self._set_samples(self.app.sg_presets.load_arb(name), name=name)
+        except Exception as e:
+            messagebox.showerror("Library Error", str(e), parent=self)
+
+    def lib_save(self):
+        if not self.samples:
+            messagebox.showerror("Error", "Load a waveform first", parent=self)
+            return
+        name = self.name_entry.get().strip()
+        if not name:
+            messagebox.showerror("Error", "Enter a name first", parent=self)
+            return
+        try:
+            clean = self.app.sg_presets.save_arb(name, self.samples)
+            self._lib_refresh()
+            self.lib_select.set(clean)
+            self.app.status_bar.config(text=f"Arb saved to library: {clean}")
+        except Exception as e:
+            messagebox.showerror("Library Error", str(e), parent=self)
+
+    def lib_delete(self):
+        name = self.lib_select.get()
+        if not name:
+            return
+        if not messagebox.askyesno("Delete", f"Delete library waveform "
+                                   f"'{name}'?", parent=self):
+            return
+        self.app.sg_presets.delete_arb(name)
+        self._lib_refresh()
+
+    def upload(self):
+        app, ch = self.app, self.channel
+        if not app.sg:
+            messagebox.showerror("Error", "Signal generator not connected",
+                                 parent=self)
+            return
+        if not self.samples:
+            messagebox.showerror("Error", "Load a waveform first", parent=self)
+            return
+        name = self.name_entry.get().strip()
+        if not name:
+            messagebox.showerror("Error", "Enter a name first", parent=self)
+            return
+        try:
+            freq = app._sg_get_float(ch, 'freq', 1000.0)
+            amp = app._sg_get_float(ch, 'amp', 1.0)
+            offset = app._sg_get_float(ch, 'offset', 0.0)
+            clean = app.sg.upload_arb(ch, name, self.samples,
+                                      freq_hz=freq, amp_vpp=amp,
+                                      offset_v=offset)
+            app.sg.select_arb(ch, clean)
+        except Exception as e:
+            messagebox.showerror("Upload Error", str(e), parent=self)
+            return
+
+        # Reflect the new state in the channel panel (read-back best-effort)
+        widgets = app.sg_channel_widgets[ch]
+        widgets['arb_name_var'].set(clean)
+        widgets['arb_samples'] = list(self.samples)
+        widgets['waveform'].set('ARB')
+        app._sg_update_visibility(ch)
+        app._sg_redraw_preview(ch)
+        try:
+            time.sleep(0.2)
+            app._sg_refresh_applied(ch)
+        except Exception:
+            pass
+        app.status_bar.config(
+            text=f"CH{ch}: uploaded '{clean}' ({len(self.samples)} pts) "
+                 f"@ {freq:g} Hz, {amp:g} Vpp")
 
 
 if __name__ == "__main__":
