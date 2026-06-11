@@ -379,6 +379,22 @@ class BK4055B(VisaInstrument):
             parts.append(f'PLRT,{polarity.upper()}')
         self.write(f'C{channel}:OUTP {",".join(parts)}')
 
+    def set_load_polarity(self, channel, load=None, polarity=None):
+        """Set output load and/or polarity WITHOUT changing the on/off state.
+
+        The SDG dialect accepts OUTP with only LOAD/PLRT arguments, leaving the
+        output state untouched (e.g. 'C1:OUTP LOAD,50'). Used by the GUI so
+        Apply can configure the channel while a separate button gates the
+        output.
+        """
+        parts = []
+        if load is not None:
+            parts.append(f'LOAD,{load}')
+        if polarity is not None:
+            parts.append(f'PLRT,{polarity.upper()}')
+        if parts:
+            self.write(f'C{channel}:OUTP {",".join(parts)}')
+
     def get_basic_wave(self, channel):
         """Raw query of the current basic-wave settings on a channel."""
         return self.ask(f'C{channel}:BSWV?')

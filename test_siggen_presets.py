@@ -28,6 +28,25 @@ def test_validate_normalises():
     assert out['offset_v'] == 0.0  # default filled in
 
 
+def test_validate_optional_keys():
+    # Waveform-specific keys are kept (coerced to float) when present...
+    out = validate_channel_state({'waveform': 'SQUARE', 'duty_pct': '30'})
+    assert out['duty_pct'] == 30.0
+    out = validate_channel_state({'waveform': 'PULSE', 'rise_s': 1e-6,
+                                  'fall_s': 2e-6, 'delay_s': 0})
+    assert out['rise_s'] == 1e-6 and out['fall_s'] == 2e-6
+    # ...absent when not given (old presets stay loadable)
+    out = validate_channel_state({'waveform': 'SINE'})
+    assert 'duty_pct' not in out and 'sym_pct' not in out
+    # ...and rejected when non-numeric
+    try:
+        validate_channel_state({'waveform': 'RAMP', 'sym_pct': 'half'})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for sym_pct='half'")
+
+
 def test_validate_rejects_bad():
     for bad in ({'waveform': 'TRIANGLE'}, {'amp_vpp': 'abc'},
                 {'polarity': 'SIDEWAYS'}):

@@ -10,7 +10,54 @@ import time
 from datetime import datetime
 from instruments import BK894, TekMSO24, BK4055B
 from siggen_presets import SignalGenPresetStore
+from waveform_render import unit_waveform, scale_waveform
 import threading
+
+# ---- Signal generator field rules -----------------------------------------
+# Which fields exist, what they're called, which waveforms use them, and
+# whether they're hidden behind the Advanced toggle.
+SG_FIELD_ORDER = ('freq', 'amp', 'offset', 'duty', 'sym',
+                  'phase', 'rise', 'fall', 'delay', 'load', 'polarity')
+
+SG_FIELD_LABELS = {
+    'freq': 'Frequency (Hz):', 'amp': 'Amplitude (Vpp):',
+    'offset': 'DC Offset (V):', 'duty': 'Duty Cycle (%):',
+    'sym': 'Symmetry (%):', 'phase': 'Phase (deg):',
+    'rise': 'Rise Time (s):', 'fall': 'Fall Time (s):',
+    'delay': 'Delay (s):', 'load': 'Load (Ω):', 'polarity': 'Polarity:',
+}
+
+SG_FIELD_DEFAULTS = {
+    'freq': '1000', 'amp': '1.0', 'offset': '0.0', 'duty': '50',
+    'sym': '50', 'phase': '0', 'rise': '1e-6', 'fall': '1e-6', 'delay': '0',
+}
+
+_PERIODIC = {'SINE', 'SQUARE', 'RAMP', 'PULSE', 'ARB'}
+SG_FIELD_WAVEFORMS = {
+    'freq': _PERIODIC,
+    'amp': _PERIODIC,
+    'offset': _PERIODIC | {'DC'},
+    'duty': {'SQUARE', 'PULSE'},
+    'sym': {'RAMP'},
+    'phase': {'SINE', 'SQUARE', 'RAMP', 'ARB'},
+    'rise': {'PULSE'}, 'fall': {'PULSE'}, 'delay': {'PULSE'},
+    'load': None,      # None = all waveforms
+    'polarity': None,
+}
+
+SG_ADVANCED_FIELDS = {'phase', 'rise', 'fall', 'delay', 'load', 'polarity'}
+
+# field key -> BSWV SCPI parameter
+SG_BSWV_KEYS = {'freq': 'FRQ', 'amp': 'AMP', 'offset': 'OFST',
+                'duty': 'DUTY', 'sym': 'SYM', 'phase': 'PHSE',
+                'rise': 'RISE', 'fall': 'FALL', 'delay': 'DLY'}
+
+# field key -> preset ChannelState key
+SG_STATE_KEYS = {'freq': 'freq_hz', 'amp': 'amp_vpp', 'offset': 'offset_v',
+                 'duty': 'duty_pct', 'sym': 'sym_pct', 'phase': 'phase_deg',
+                 'rise': 'rise_s', 'fall': 'fall_s', 'delay': 'delay_s'}
+
+SG_LOAD_HIGHZ = 'High-Z'   # UI label for the SCPI 'HZ' (high impedance) token
 
 class InstrumentControlGUI:
     def __init__(self, root):
@@ -161,40 +208,56 @@ CONNECTION:
 - Auto-detected via PyVISA (USB VID 0xf4ec, PID 0xee38)
 - Two independent output channels (CH1, CH2)
 
-WAVEFORMS:
+WAVEFORMS (fields adapt to the selected type):
 - SINE: clean tones, frequency response, audio
-- SQUARE: clocks, digital/logic stimulus (duty adjustable on the box)
-- RAMP: sawtooth/triangle, sweeps (symmetry adjustable on the box)
-- PULSE: timing tests (width/rise/fall/delay adjustable on the box)
-- NOISE: broadband stimulus (no frequency/amplitude meaning)
-- DC: fixed level only (uses offset, ignores amplitude/frequency)
-- ARB: arbitrary uploaded waveform (see later GUI versions)
+- SQUARE: clocks, digital/logic stimulus; set Duty Cycle (%)
+- RAMP: sawtooth/triangle, sweeps; set Symmetry (%)
+  (50% = triangle, 100% = rising sawtooth, 0% = falling)
+- PULSE: timing tests; Duty plus Rise/Fall/Delay (Advanced mode)
+- NOISE: broadband stimulus (level set on the front panel for now)
+- DC: fixed level only (set with DC Offset)
+- ARB: arbitrary uploaded waveform (dialog coming in a later version)
+
+BASIC vs ADVANCED:
+- Advanced mode reveals Phase, pulse edge timing (Rise/Fall/Delay),
+  Load and Polarity
+- Apply always pushes the full configuration for the selected
+  waveform, whether or not Advanced mode is showing the fields
+
+APPLY vs OUTPUT:
+- "Apply CH<n> Settings" pushes the configuration ONLY
+- The Output button turns the physical output on/off (green = ON)
+- Workflow: configure -> Apply -> check preview/applied -> Output ON
+
+APPLIED READOUTS & PREVIEW:
+- Gray values beside each field show what the instrument actually
+  accepted (refreshed on connect and after Apply) - if they differ
+  from your input, the box clamped or coerced your value
+- The preview renders ~3 periods of the configured waveform; it is
+  a drawing of your inputs, not measured data
 
 FREQUENCY RANGE:
 - Depends on waveform and model; check the front panel for the unit's
   rated maxima (sine reaches the highest; square/pulse/ramp are lower)
 - Enter frequency in Hz (e.g. 1000 for 1 kHz, 1e6 for 1 MHz)
 
-AMPLITUDE & OFFSET:
+AMPLITUDE, OFFSET & LOAD:
 - Amplitude is peak-to-peak (Vpp); Offset is the DC level (V)
-- LOAD matters: amplitude is calibrated for the selected load
-  - HiZ (high impedance): what you see on a scope's 1 MΩ input
-  - 50: into a 50 Ω matched load; open-circuit voltage is then ~2x
+- LOAD (Advanced) matters: amplitude is calibrated for the selected load
+  - High-Z: what you see on a scope's 1 MOhm input
+  - 50 (or any ohms): into a matched load; open-circuit V is then ~2x
   - Set LOAD to match how the output is actually terminated
-
-OUTPUT:
-- The Output checkbox toggles the channel on/off immediately
-- All other settings push only when you click "Apply CH<n>"
 
 PRESETS:
 - Save Preset: store both channels' current settings under a name
-- Load Preset: restore settings AND push them to the instrument
+- Load Preset: restore settings and push the CONFIGURATION to the
+  instrument (output on/off state is NOT changed by a preset load)
 - Delete Preset: remove a saved preset
 - Presets are stored in presets/siggen_presets.json
 
 BEST PRACTICES:
 - Confirm the load setting before trusting the amplitude reading
-- Start with output OFF, configure, then enable
+- Configure and Apply with output OFF, then switch Output ON
 - Use DC waveform + offset for a steady bias voltage"""
 
         messagebox.showinfo("Signal Generator Tips", tips)
@@ -476,6 +539,13 @@ ANALYSIS:
 
         ttk.Button(status_frame, text="Reconnect", command=self.reconnect_sg).pack(side=tk.RIGHT)
 
+        # Basic/Advanced toggle: advanced reveals load/polarity/phase and the
+        # pulse edge-timing fields; basic keeps the form to the essentials.
+        self.sg_advanced = tk.BooleanVar(value=False)
+        ttk.Checkbutton(status_frame, text="Advanced mode",
+                        variable=self.sg_advanced,
+                        command=self._sg_advanced_toggled).pack(side=tk.RIGHT, padx=10)
+
         # Per-channel configuration - one inner tab per output
         config_notebook = ttk.Notebook(sg_frame)
         config_notebook.pack(fill='x', padx=10, pady=10)
@@ -485,67 +555,7 @@ ANALYSIS:
         for ch in (1, 2):
             ch_frame = ttk.Frame(config_notebook)
             config_notebook.add(ch_frame, text=f"Channel {ch}")
-
-            # Output enable (immediate toggle, like the scope channel enable)
-            output_var = tk.BooleanVar(value=False)
-            ttk.Checkbutton(ch_frame, text="Output Enabled",
-                            variable=output_var,
-                            command=lambda c=ch, v=output_var: self.sg_toggle_output(c, v)).grid(
-                                row=0, column=0, columnspan=4, sticky='w', padx=10, pady=10)
-
-            # Waveform
-            ttk.Label(ch_frame, text="Waveform:").grid(row=1, column=0, sticky='w', padx=10, pady=5)
-            waveform = ttk.Combobox(ch_frame, width=12, state='readonly')
-            waveform.grid(row=1, column=1, padx=5, pady=5)
-            waveform['values'] = list(BK4055B.WAVEFORMS)
-            waveform.set('SINE')
-
-            # Frequency
-            ttk.Label(ch_frame, text="Frequency (Hz):").grid(row=1, column=2, sticky='w', padx=(20, 0), pady=5)
-            freq = ttk.Entry(ch_frame, width=14)
-            freq.grid(row=1, column=3, padx=5, pady=5)
-            freq.insert(0, "1000")
-
-            # Amplitude
-            ttk.Label(ch_frame, text="Amplitude (Vpp):").grid(row=2, column=0, sticky='w', padx=10, pady=5)
-            amp = ttk.Entry(ch_frame, width=12)
-            amp.grid(row=2, column=1, padx=5, pady=5)
-            amp.insert(0, "1.0")
-
-            # Offset
-            ttk.Label(ch_frame, text="DC Offset (V):").grid(row=2, column=2, sticky='w', padx=(20, 0), pady=5)
-            offset = ttk.Entry(ch_frame, width=14)
-            offset.grid(row=2, column=3, padx=5, pady=5)
-            offset.insert(0, "0.0")
-
-            # Load
-            ttk.Label(ch_frame, text="Load:").grid(row=3, column=0, sticky='w', padx=10, pady=5)
-            load = ttk.Combobox(ch_frame, width=12, state='readonly')
-            load.grid(row=3, column=1, padx=5, pady=5)
-            load['values'] = ['HZ', '50']
-            load.set('HZ')
-
-            # Polarity
-            ttk.Label(ch_frame, text="Polarity:").grid(row=3, column=2, sticky='w', padx=(20, 0), pady=5)
-            polarity = ttk.Combobox(ch_frame, width=14, state='readonly')
-            polarity.grid(row=3, column=3, padx=5, pady=5)
-            polarity['values'] = ['NOR', 'INVT']
-            polarity.set('NOR')
-
-            # Apply button for this channel
-            ttk.Button(ch_frame, text=f"Apply CH{ch}",
-                       command=lambda c=ch: self.apply_sg_channel(c)).grid(
-                           row=4, column=0, columnspan=4, pady=10)
-
-            self.sg_channel_widgets[ch] = {
-                'output': output_var,
-                'waveform': waveform,
-                'freq': freq,
-                'amp': amp,
-                'offset': offset,
-                'load': load,
-                'polarity': polarity,
-            }
+            self._sg_build_channel_panel(ch_frame, ch)
 
         # Presets
         preset_frame = ttk.LabelFrame(sg_frame, text="Presets", padding=10)
@@ -765,6 +775,182 @@ ANALYSIS:
             messagebox.showerror("Configuration Error", str(e))
 
     # Signal generator methods
+    def _sg_build_channel_panel(self, parent, ch):
+        """Build one channel's form (left), preview canvas (right), and the
+        Apply / Output buttons. Field rows show/hide per waveform + mode."""
+        container = ttk.Frame(parent)
+        container.pack(fill='x', padx=10, pady=5)
+
+        form = ttk.Frame(container)
+        form.grid(row=0, column=0, sticky='nw')
+
+        widgets = {'rows': {}, 'applied': {}}
+
+        # Waveform selector (always visible), with its applied readout
+        wrow = ttk.Frame(form)
+        wrow.pack(fill='x', pady=2)
+        ttk.Label(wrow, text="Waveform:", width=16).pack(side=tk.LEFT)
+        waveform = ttk.Combobox(wrow, width=10, state='readonly')
+        waveform['values'] = list(BK4055B.WAVEFORMS)
+        waveform.set('SINE')
+        waveform.pack(side=tk.LEFT, padx=4)
+        waveform.bind('<<ComboboxSelected>>',
+                      lambda e, c=ch: self._sg_waveform_changed(c))
+        applied_wave = tk.Label(wrow, text='--', fg='gray', width=14, anchor='w')
+        applied_wave.pack(side=tk.LEFT, padx=4)
+        widgets['waveform'] = waveform
+        widgets['applied']['waveform'] = applied_wave
+
+        # Parameter rows; visibility managed by _sg_update_visibility
+        for key in SG_FIELD_ORDER:
+            row = ttk.Frame(form)
+            ttk.Label(row, text=SG_FIELD_LABELS[key], width=16).pack(side=tk.LEFT)
+            if key == 'load':
+                # Editable: pick High-Z / common values or type any ohms
+                w = ttk.Combobox(row, width=9)
+                w['values'] = [SG_LOAD_HIGHZ, '50', '75', '600', '10000']
+                w.set(SG_LOAD_HIGHZ)
+            elif key == 'polarity':
+                w = ttk.Combobox(row, width=9, state='readonly')
+                w['values'] = ['NOR', 'INVT']
+                w.set('NOR')
+            else:
+                w = ttk.Entry(row, width=11)
+                w.insert(0, SG_FIELD_DEFAULTS[key])
+                w.bind('<KeyRelease>', lambda e, c=ch: self._sg_redraw_preview(c))
+            w.pack(side=tk.LEFT, padx=4)
+            applied = tk.Label(row, text='--', fg='gray', width=14, anchor='w')
+            applied.pack(side=tk.LEFT, padx=4)
+            widgets[key] = w
+            widgets['rows'][key] = row
+            widgets['applied'][key] = applied
+
+        # Waveform preview
+        right = ttk.Frame(container)
+        right.grid(row=0, column=1, sticky='ne', padx=(25, 0))
+        ttk.Label(right, text="Preview (~3 periods)").pack(anchor='w')
+        canvas = tk.Canvas(right, width=330, height=170, bg='white',
+                           highlightthickness=1, highlightbackground='#999')
+        canvas.pack()
+        widgets['canvas'] = canvas
+
+        # Apply pushes configuration only; Output gates the physical output
+        btns = ttk.Frame(parent)
+        btns.pack(fill='x', padx=10, pady=8)
+        ttk.Button(btns, text=f"Apply CH{ch} Settings",
+                   command=lambda c=ch: self.apply_sg_channel(c)).pack(side=tk.LEFT, padx=5)
+        output_var = tk.BooleanVar(value=False)
+        out_btn = tk.Button(btns, text="Output: OFF", width=12,
+                            command=lambda c=ch: self.sg_toggle_output(c))
+        out_btn.pack(side=tk.LEFT, padx=15)
+        widgets['output'] = output_var
+        widgets['out_btn'] = out_btn
+        widgets['out_btn_bg'] = out_btn.cget('bg')
+
+        self.sg_channel_widgets[ch] = widgets
+        self._sg_update_visibility(ch)
+        self._sg_redraw_preview(ch)
+
+    def _sg_waveform_changed(self, ch):
+        self._sg_update_visibility(ch)
+        self._sg_redraw_preview(ch)
+
+    def _sg_advanced_toggled(self):
+        for ch in (1, 2):
+            self._sg_update_visibility(ch)
+
+    def _sg_update_visibility(self, ch):
+        """Show only the fields relevant to the selected waveform and mode."""
+        widgets = self.sg_channel_widgets[ch]
+        wave = widgets['waveform'].get()
+        advanced = self.sg_advanced.get()
+        for key in SG_FIELD_ORDER:
+            widgets['rows'][key].pack_forget()
+        for key in SG_FIELD_ORDER:
+            waves = SG_FIELD_WAVEFORMS[key]
+            if waves is not None and wave not in waves:
+                continue
+            if key in SG_ADVANCED_FIELDS and not advanced:
+                continue
+            widgets['rows'][key].pack(fill='x', pady=2)
+
+    def _sg_get_float(self, ch, key, default):
+        """Float value of a channel entry, or default if unparsable."""
+        try:
+            return float(self.sg_channel_widgets[ch][key].get())
+        except (TypeError, ValueError):
+            return default
+
+    def _sg_redraw_preview(self, ch):
+        """Redraw the waveform preview canvas from the current inputs."""
+        widgets = self.sg_channel_widgets[ch]
+        canvas = widgets['canvas']
+        wave = widgets['waveform'].get()
+        freq = self._sg_get_float(ch, 'freq', 1000.0)
+        amp = self._sg_get_float(ch, 'amp', 1.0)
+        offset = self._sg_get_float(ch, 'offset', 0.0)
+        duty = self._sg_get_float(ch, 'duty', 50.0)
+        sym = self._sg_get_float(ch, 'sym', 50.0)
+        phase = self._sg_get_float(ch, 'phase', 0.0)
+        rise = self._sg_get_float(ch, 'rise', 0.0)
+        fall = self._sg_get_float(ch, 'fall', 0.0)
+
+        rise_frac = rise * freq if freq > 0 else 0.0
+        fall_frac = fall * freq if freq > 0 else 0.0
+        unit = unit_waveform(wave, n_periods=3, points_per_period=120,
+                             duty_pct=duty, sym_pct=sym,
+                             rise_frac=rise_frac, fall_frac=fall_frac,
+                             phase_deg=phase)
+        volts = scale_waveform(unit, amp if wave != 'DC' else 0.0, offset)
+
+        canvas.delete('all')
+        w = int(canvas['width'])
+        h = int(canvas['height'])
+        pad = 8
+        vmax = max(max(abs(v) for v in volts), 1e-9) * 1.15
+
+        def ty(v):
+            return h / 2.0 - (v / vmax) * (h / 2.0 - pad)
+
+        canvas.create_line(0, ty(0), w, ty(0), fill='#bbb', dash=(3, 3))
+        pts = []
+        n = len(volts)
+        for i, v in enumerate(volts):
+            x = pad + i * (w - 2 * pad) / (n - 1)
+            pts.extend((x, ty(v)))
+        canvas.create_line(*pts, fill='#1565c0', width=2)
+
+        if wave == 'DC':
+            caption = f"DC  {offset:+g} V"
+        elif wave == 'NOISE':
+            caption = "NOISE (preview approximation)"
+        else:
+            caption = f"{wave}  {freq:g} Hz  {amp:g} Vpp  {offset:+g} V"
+        canvas.create_text(6, h - 6, anchor='sw', text=caption,
+                           fill='#666', font=('Arial', 8))
+
+    @staticmethod
+    def _set_entry(entry, value):
+        """Replace the contents of an Entry, skipping None values."""
+        if value is None:
+            return
+        entry.delete(0, tk.END)
+        entry.insert(0, str(value))
+
+    def _sg_load_to_wire(self, ch):
+        """UI load value -> SCPI token ('HZ' or ohms). Raises on bad input."""
+        ui = self.sg_channel_widgets[ch]['load'].get().strip()
+        if ui.upper() in (SG_LOAD_HIGHZ.upper(), 'HZ', 'HIZ', 'HIGHZ'):
+            return 'HZ'
+        try:
+            ohms = float(ui)
+        except ValueError:
+            raise ValueError(f"Load must be {SG_LOAD_HIGHZ} or a resistance "
+                             f"in ohms, got {ui!r}")
+        if ohms <= 0:
+            raise ValueError("Load resistance must be positive")
+        return f'{ohms:g}'
+
     def reconnect_sg(self):
         try:
             if self.sg:
@@ -777,66 +963,106 @@ ANALYSIS:
             messagebox.showerror("Connection Error", str(e))
 
     def update_sg_config(self):
-        """Read current config from the generator and populate the widgets."""
+        """Read current config from the generator: populate the inputs, the
+        applied readouts, and the output button."""
         if not self.sg:
             return
         for ch in (1, 2):
             try:
                 bswv = self.sg.get_basic_wave_dict(ch)
+                outp = self.sg.get_output_dict(ch)
                 widgets = self.sg_channel_widgets[ch]
                 if bswv.get('WVTP') in BK4055B.WAVEFORMS:
                     widgets['waveform'].set(bswv['WVTP'])
-                self._set_entry(widgets['freq'], bswv.get('FRQ'))
-                self._set_entry(widgets['amp'], bswv.get('AMP'))
-                self._set_entry(widgets['offset'], bswv.get('OFST'))
-
-                outp = self.sg.get_output_dict(ch)
-                widgets['output'].set(outp['state'])
-                if outp['load'] in widgets['load']['values']:
-                    widgets['load'].set(outp['load'])
+                for key, bk in SG_BSWV_KEYS.items():
+                    if bk in bswv:
+                        self._set_entry(widgets[key], bswv[bk])
+                widgets['load'].set(SG_LOAD_HIGHZ if outp['load'] == 'HZ'
+                                    else outp['load'])
                 if outp['polarity'] in widgets['polarity']['values']:
                     widgets['polarity'].set(outp['polarity'])
+                self._sg_update_visibility(ch)
+                self._sg_redraw_preview(ch)
+                self._sg_refresh_applied(ch, bswv=bswv, outp=outp)
             except Exception as e:
                 self.status_bar.config(text=f"Error reading CH{ch} config: {e}")
 
-    @staticmethod
-    def _set_entry(entry, value):
-        """Replace the contents of an Entry, skipping None values."""
-        if value is None:
+    def _sg_refresh_applied(self, ch, bswv=None, outp=None):
+        """Update the gray applied-value readouts (and output button) from the
+        instrument's actual state."""
+        if not self.sg:
             return
-        entry.delete(0, tk.END)
-        entry.insert(0, str(value))
+        if bswv is None:
+            bswv = self.sg.get_basic_wave_dict(ch)
+        if outp is None:
+            outp = self.sg.get_output_dict(ch)
+        widgets = self.sg_channel_widgets[ch]
+        applied = widgets['applied']
+        applied['waveform'].config(text=str(bswv.get('WVTP', '--')))
+        for key, bk in SG_BSWV_KEYS.items():
+            applied[key].config(text=str(bswv[bk]) if bk in bswv else '--')
+        applied['load'].config(text=SG_LOAD_HIGHZ if outp['load'] == 'HZ'
+                               else outp['load'])
+        applied['polarity'].config(text=outp['polarity'])
+        widgets['output'].set(outp['state'])
+        self._sg_set_output_button(ch, outp['state'])
+
+    def _sg_set_output_button(self, ch, on):
+        widgets = self.sg_channel_widgets[ch]
+        if on:
+            widgets['out_btn'].config(text="Output: ON", bg='#2e7d32',
+                                      fg='white', activebackground='#1b5e20',
+                                      activeforeground='white')
+        else:
+            widgets['out_btn'].config(text="Output: OFF",
+                                      bg=widgets['out_btn_bg'], fg='black',
+                                      activebackground=widgets['out_btn_bg'],
+                                      activeforeground='black')
 
     def apply_sg_channel(self, channel):
-        """Apply waveform/frequency/amplitude/offset settings to one channel."""
+        """Push the channel CONFIGURATION (waveform parameters + load/polarity)
+        to the instrument. Does NOT touch the output on/off state."""
         if not self.sg:
             messagebox.showerror("Error", "Signal generator not connected")
             return
         try:
             widgets = self.sg_channel_widgets[channel]
-            waveform = widgets['waveform'].get()
-            freq = float(widgets['freq'].get())
-            amp = float(widgets['amp'].get())
-            offset = float(widgets['offset'].get())
-
-            self.sg.set_basic_wave(channel, WVTP=waveform, FRQ=freq, AMP=amp, OFST=offset)
-            self.sg.set_output_full(channel, widgets['output'].get(),
-                                    load=widgets['load'].get(),
-                                    polarity=widgets['polarity'].get())
-
+            wave = widgets['waveform'].get()
+            params = {'WVTP': wave}
+            for key, bk in SG_BSWV_KEYS.items():
+                waves = SG_FIELD_WAVEFORMS[key]
+                if waves is not None and wave not in waves:
+                    continue
+                value = float(widgets[key].get())
+                if key in ('duty', 'sym') and not (0.0 <= value <= 100.0):
+                    raise ValueError(f"{SG_FIELD_LABELS[key][:-1]} must be "
+                                     f"between 0 and 100, got {value:g}")
+                params[bk] = value
+            self.sg.set_basic_wave(channel, **params)
+            self.sg.set_load_polarity(channel,
+                                      load=self._sg_load_to_wire(channel),
+                                      polarity=widgets['polarity'].get())
+            self._sg_refresh_applied(channel)
             self.status_bar.config(
-                text=f"CH{channel} applied: {waveform}, {freq} Hz, {amp} Vpp, {offset} V")
+                text=f"CH{channel} configured: {wave} "
+                     f"(output {'ON' if widgets['output'].get() else 'OFF'} - "
+                     f"use the Output button to switch)")
         except Exception as e:
             messagebox.showerror("Configuration Error", str(e))
 
-    def sg_toggle_output(self, channel, output_var):
-        """Enable/disable a channel output immediately."""
+    def sg_toggle_output(self, channel):
+        """Flip the channel output on/off (separate from Apply)."""
         if not self.sg:
+            messagebox.showerror("Error", "Signal generator not connected")
             return
         try:
-            self.sg.set_output(channel, output_var.get())
-            state = "on" if output_var.get() else "off"
-            self.status_bar.config(text=f"CH{channel} output {state}")
+            widgets = self.sg_channel_widgets[channel]
+            new_state = not widgets['output'].get()
+            self.sg.set_output(channel, new_state)
+            widgets['output'].set(new_state)
+            self._sg_set_output_button(channel, new_state)
+            self.status_bar.config(
+                text=f"CH{channel} output {'ON' if new_state else 'OFF'}")
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
@@ -845,20 +1071,29 @@ ANALYSIS:
         channels = {}
         for ch in (1, 2):
             widgets = self.sg_channel_widgets[ch]
-            channels[ch] = {
-                'waveform': widgets['waveform'].get(),
-                'freq_hz': float(widgets['freq'].get()),
-                'amp_vpp': float(widgets['amp'].get()),
-                'offset_v': float(widgets['offset'].get()),
+            wave = widgets['waveform'].get()
+            state = {
+                'waveform': wave,
+                'freq_hz': self._sg_get_float(ch, 'freq', 1000.0),
+                'amp_vpp': self._sg_get_float(ch, 'amp', 1.0),
+                'offset_v': self._sg_get_float(ch, 'offset', 0.0),
                 'output': widgets['output'].get(),
-                'load': widgets['load'].get(),
+                'load': self._sg_load_to_wire(ch),
                 'polarity': widgets['polarity'].get(),
             }
+            for key, skey in SG_STATE_KEYS.items():
+                if skey in ('freq_hz', 'amp_vpp', 'offset_v'):
+                    continue  # already collected above
+                waves = SG_FIELD_WAVEFORMS[key]
+                if waves is None or wave in waves:
+                    state[skey] = self._sg_get_float(
+                        ch, key, float(SG_FIELD_DEFAULTS[key]))
+            channels[ch] = state
         return channels
 
     def _sg_apply_state(self, channels):
         """Write a {1|2 -> ChannelState} mapping into the widgets and, if
-        connected, push it to the instrument."""
+        connected, push the CONFIGURATION (not the output state)."""
         for ch in (1, 2):
             state = channels.get(str(ch)) or channels.get(ch)
             if not state:
@@ -866,14 +1101,16 @@ ANALYSIS:
             widgets = self.sg_channel_widgets[ch]
             if state.get('waveform') in BK4055B.WAVEFORMS:
                 widgets['waveform'].set(state['waveform'])
-            self._set_entry(widgets['freq'], state.get('freq_hz'))
-            self._set_entry(widgets['amp'], state.get('amp_vpp'))
-            self._set_entry(widgets['offset'], state.get('offset_v'))
-            widgets['output'].set(bool(state.get('output')))
-            if state.get('load') in widgets['load']['values']:
-                widgets['load'].set(state['load'])
+            for key, skey in SG_STATE_KEYS.items():
+                if skey in state:
+                    self._set_entry(widgets[key], state[skey])
+            if state.get('load'):
+                widgets['load'].set(SG_LOAD_HIGHZ if state['load'] == 'HZ'
+                                    else state['load'])
             if state.get('polarity') in widgets['polarity']['values']:
                 widgets['polarity'].set(state['polarity'])
+            self._sg_update_visibility(ch)
+            self._sg_redraw_preview(ch)
             if self.sg:
                 self.apply_sg_channel(ch)
 

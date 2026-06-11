@@ -42,17 +42,31 @@ _CHANNEL_DEFAULTS = {
     'polarity': 'NOR',
 }
 
+# Waveform-specific parameters; stored only when present (no defaults).
+# duty_pct: SQUARE/PULSE; sym_pct: RAMP; phase_deg: SINE/SQUARE/RAMP/ARB;
+# rise_s/fall_s/delay_s: PULSE.
+_OPTIONAL_NUMERIC = ('duty_pct', 'sym_pct', 'phase_deg',
+                     'rise_s', 'fall_s', 'delay_s')
+
 
 def validate_channel_state(state):
     """Return a normalised copy of a ChannelState, or raise ValueError.
 
     Missing keys fall back to defaults; numerics are coerced to float; the
     waveform must be one of VALID_WAVEFORMS and polarity one of NOR/INVT.
+    Waveform-specific keys (_OPTIONAL_NUMERIC) are kept only when present.
     """
     if not isinstance(state, dict):
         raise ValueError(f"channel state must be a dict, got {type(state).__name__}")
     out = dict(_CHANNEL_DEFAULTS)
     out.update({k: state[k] for k in _CHANNEL_DEFAULTS if k in state})
+
+    for key in _OPTIONAL_NUMERIC:
+        if key in state and state[key] is not None:
+            try:
+                out[key] = float(state[key])
+            except (TypeError, ValueError):
+                raise ValueError(f"{key} must be a number, got {state[key]!r}")
 
     out['waveform'] = str(out['waveform']).upper()
     if out['waveform'] not in VALID_WAVEFORMS:
