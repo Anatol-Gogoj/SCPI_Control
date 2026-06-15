@@ -49,11 +49,15 @@ class ArbWaveformEditor(tk.Toplevel):
         self.y_scale = 10.0            # full-scale +/- volts (4055B max 20 Vpp HiZ)
         self._drag_idx = None          # breakpoint being dragged
         self._sel = None               # selected breakpoint index
+        self._dirty = False            # unsaved edits since last save/upload
 
         self._build_ui()
         self.bind('<Control-z>', lambda e: self.undo())
         self.bind('<Control-y>', lambda e: self.redo())
         self.bind('<Control-Z>', lambda e: self.redo())   # ctrl-shift-z
+        self.tree.bind('<Delete>', self._delete_selected)
+        self.canvas.bind('<Delete>', self._delete_selected)
+        self.protocol('WM_DELETE_WINDOW', self._on_close)
         self.after(50, self._fit_all)     # fit once geometry is realised
 
     # -- initial state -----------------------------------------------------
@@ -85,7 +89,7 @@ class ArbWaveformEditor(tk.Toplevel):
         pe.pack(side=tk.LEFT, padx=4)
         pe.bind('<Return>', lambda e: self._apply_points())
         ttk.Button(header, text="Set", command=self._apply_points).pack(side=tk.LEFT)
-        ttk.Label(header, text=f"(max {BK4055B.ARB_MAX_POINTS})").pack(side=tk.LEFT, padx=6)
+        ttk.Label(header, text=f"samples (max {BK4055B.ARB_MAX_POINTS})").pack(side=tk.LEFT, padx=6)
         ttk.Label(header, text="Full-scale ±V:").pack(side=tk.LEFT, padx=(12, 0))
         self.yscale_var = tk.StringVar(value=f'{self.y_scale:g}')
         ye = ttk.Entry(header, width=6, textvariable=self.yscale_var)
@@ -182,8 +186,13 @@ class ArbWaveformEditor(tk.Toplevel):
         ttk.Button(lib, text="Import CSV...", command=self.import_csv).grid(row=1, column=0, columnspan=2, pady=6, sticky='w')
         ttk.Button(lib, text="Export CSV...", command=self.export_csv).grid(row=1, column=2, pady=6)
         ttk.Button(lib, text="Save Template...", command=self.save_template).grid(row=1, column=3, pady=6)
-        ttk.Button(lib, text=f"Upload && Select on CH{self.channel}",
-                   command=self.upload).grid(row=1, column=4, columnspan=2, pady=6, padx=4)
+        ttk.Label(lib, text="Send to CH:").grid(row=2, column=0, sticky='e', pady=6)
+        self.target_var = tk.StringVar(value=str(self.channel))
+        ttk.Combobox(lib, width=4, state='readonly', textvariable=self.target_var,
+                     values=['1', '2']).grid(row=2, column=1, sticky='w', pady=6)
+        ttk.Button(lib, text="Upload && Select",
+                   command=self.upload).grid(row=2, column=2, columnspan=2,
+                                             pady=6, padx=4, sticky='w')
 
         hint = ("Click canvas to add a point - drag a dot to move it - right-click a dot to delete. "
                 "Edit exact X/Y in the table (double-click a cell). Ctrl+Z / Ctrl+Y to undo/redo.")
@@ -200,6 +209,7 @@ class ArbWaveformEditor(tk.Toplevel):
         if len(self._undo) > _UNDO_DEPTH:
             self._undo.pop(0)
         self._redo.clear()
+        self._dirty = True
         self._apply(new_recipe)
 
     def _apply(self, recipe):
@@ -215,11 +225,13 @@ class ArbWaveformEditor(tk.Toplevel):
     def undo(self):
         if self._undo:
             self._redo.append(ab._copy(self.recipe))
+            self._dirty = True
             self._apply(self._undo.pop())
 
     def redo(self):
         if self._redo:
             self._undo.append(ab._copy(self.recipe))
+            self._dirty = True
             self._apply(self._redo.pop())
 
     # -- sidebar -----------------------------------------------------------
@@ -231,7 +243,7 @@ class ArbWaveformEditor(tk.Toplevel):
         for i, (x, y) in enumerate(bps):
             seg = segs[i]['type'] if i < len(segs) else '-'
             self.tree.insert('', 'end', iid=str(i),
-                             values=(f'{x:g}', f'{y * self.y_scale:g}', seg))
+                             values=(f'{x:.3f}', f'{y * self.y_scale:.3f}', seg))
         if sel and sel[0] in self.tree.get_children():
             self.tree.selection_set(sel[0])
         self._update_dt_label()
@@ -331,13 +343,26 @@ class ArbWaveformEditor(tk.Toplevel):
             messagebox.showerror("Add point", str(e), parent=self)
 
     def _del_point_btn(self):
+        self._delete_selected()
+
+    def _delete_selected(self, _evt=None):
+        """Delete the highlighted breakpoint (Del key or the Del button)."""
         if self._sel is None:
-            return
+            return None
         try:
             self._commit(ab.delete_point(self.recipe, self._sel))
             self._sel = None
         except ValueError as e:
             messagebox.showerror("Delete point", str(e), parent=self)
+        return 'break'
+
+    def _on_close(self):
+        if self._dirty and not messagebox.askyesno(
+                "Discard changes?",
+                "Discard unsaved changes and close the waveform editor?",
+                parent=self):
+            return
+        self.destroy()
 
     # -- points / view -----------------------------------------------------
     def _apply_points(self):
@@ -375,8 +400,14 @@ class ArbWaveformEditor(tk.Toplevel):
 
     def _update_dt_label(self):
         freq = self.app._sg_get_float(self.channel, 'freq', 1000.0)
+        n = self.recipe['total_points']
         if freq > 0:
-            self.dt_label.config(text=f"Period @ {freq:g} Hz = {1000.0 / freq:g} ms")
+            # Points = total samples (resolution). The arb plays as ONE period
+            # at the channel frequency, so duration = 1/freq regardless of N;
+            # the effective sample rate is N*freq.
+            self.dt_label.config(
+                text=f"{n} samples  ·  1 period @ {freq:g} Hz = {1000.0 / freq:.3f} ms"
+                     f"  ·  {n * freq / 1e6:.3g} MSa/s")
 
     def _fit_all(self):
         w = self._cw()
@@ -518,6 +549,7 @@ class ArbWaveformEditor(tk.Toplevel):
         return None
 
     def _on_canvas_press(self, evt):
+        self.canvas.focus_set()        # so the Delete key targets a point here
         i = self._hit_breakpoint(evt.x, evt.y)
         if i is not None:
             self._drag_idx = i
@@ -544,7 +576,9 @@ class ArbWaveformEditor(tk.Toplevel):
         # move without pushing another undo entry (snapshot taken on press)
         self.recipe = ab.move_point(self.recipe, self._drag_idx, x_coord, y)
         self.samples = ab.render_recipe(self.recipe)
-        self.readout.config(text=f"point {self._drag_idx}: x={x_coord:.3g} y={y:.3g}")
+        self._dirty = True
+        self.readout.config(
+            text=f"point {self._drag_idx}:  x={x_coord:.3f}   y={y * self.y_scale:.3f} V")
         self._refresh_tree()
         self.tree.selection_set(str(self._drag_idx))
         self._redraw()
@@ -578,6 +612,7 @@ class ArbWaveformEditor(tk.Toplevel):
             clean = self.app.sg_presets.save_arb(name, self.samples, recipe=self.recipe)
             self._lib_refresh()
             self.lib_select.set(clean)
+            self._dirty = False
             self.app.status_bar.config(text=f"Arb saved to library: {clean}")
         except Exception as e:
             messagebox.showerror("Save error", str(e), parent=self)
@@ -600,6 +635,7 @@ class ArbWaveformEditor(tk.Toplevel):
         self.points_var.set(str(recipe['total_points']))
         self._commit(recipe)
         self._fit_all()
+        self._dirty = False        # just loaded from the library = saved state
 
     def delete_from_library(self):
         name = self.lib_select.get()
@@ -673,7 +709,8 @@ class ArbWaveformEditor(tk.Toplevel):
             pass
 
     def upload(self):
-        app, ch = self.app, self.channel
+        app = self.app
+        ch = int(self.target_var.get())
         if not app.sg:
             messagebox.showerror("Upload", "Signal generator not connected", parent=self)
             return
@@ -715,3 +752,4 @@ class ArbWaveformEditor(tk.Toplevel):
         app.status_bar.config(
             text=f"CH{ch}: uploaded '{clean}' ({len(self.samples)} pts) @ {freq:g} Hz")
         self._lib_refresh()
+        self._dirty = False

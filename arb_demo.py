@@ -47,7 +47,7 @@ class _DemoApp:
         self.sg_presets.arb_dir = os.path.join(tmp, 'arb')
 
         self.sg_channel_widgets = {
-            1: {
+            ch: {
                 'arb_name_var': tk.StringVar(value=''),
                 'arb_samples': None,
                 'waveform': tk.StringVar(value='ARB'),
@@ -55,6 +55,7 @@ class _DemoApp:
                 'amp': tk.StringVar(value='1.0'),
                 'offset': tk.StringVar(value='0.0'),
             }
+            for ch in (1, 2)
         }
         # status_bar just needs .config(text=...)
         self.status_bar = _StatusProxy(status_var)
