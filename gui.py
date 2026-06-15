@@ -9,6 +9,7 @@ import csv
 import time
 from datetime import datetime
 from instruments import BK894, TekMSO24
+from version import version_string
 import threading
 
 class InstrumentControlGUI:
@@ -32,9 +33,14 @@ class InstrumentControlGUI:
         self.create_scope_tab()
         self.create_logging_tab()
         
-        # Status bar
-        self.status_bar = tk.Label(root, text="Ready", bd=1, relief=tk.SUNKEN, anchor=tk.W)
-        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        # Footer: status bar (left, stretches) + version readout (right)
+        footer = tk.Frame(root)
+        footer.pack(side=tk.BOTTOM, fill=tk.X)
+        self.status_bar = tk.Label(footer, text="Ready", bd=1, relief=tk.SUNKEN, anchor=tk.W)
+        self.status_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        version_label = tk.Label(footer, text=version_string(), bd=1,
+                                 relief=tk.SUNKEN, anchor=tk.E, padx=8)
+        version_label.pack(side=tk.RIGHT)
         
         # Auto-connect on startup
         self.root.after(100, self.auto_connect)
