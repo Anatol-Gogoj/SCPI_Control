@@ -54,6 +54,36 @@ def test_sine_segment_returns_to_baseline():
     assert abs(min(s) + 0.8) < 0.02
 
 
+def test_segment_offset_keeps_ramp_positive():
+    # Advanced 'offset' lifts a fundamental off its baseline so it stays
+    # Y-positive instead of straddling zero.
+    centered = {'version': 1, 'total_points': 200,
+                'breakpoints': [[0, 0.0], [1, 0.0]],
+                'segments': [{'type': 'RAMP', 'params': {'amp': 0.5}}]}
+    s = ab.render_recipe(centered)
+    assert min(s) < 0.0                         # straddles zero by default
+    lifted = {'version': 1, 'total_points': 200,
+              'breakpoints': [[0, 0.0], [1, 0.0]],
+              'segments': [{'type': 'RAMP',
+                            'params': {'amp': 0.5, 'offset': 0.5}}]}
+    s2 = ab.render_recipe(lifted)
+    assert min(s2) >= -1e-9                      # now stays Y-positive
+
+
+def test_segment_shares_waveform_backend():
+    # A SINE segment must equal baseline + amp*unit_sample(same params), i.e.
+    # the editor and the channel menu use one shape generator.
+    from waveform_render import unit_sample
+    recipe = {'version': 1, 'total_points': 100,
+              'breakpoints': [[0, 0.0], [1, 0.0]],
+              'segments': [{'type': 'SINE', 'params': {'cycles': 1, 'amp': 0.7}}]}
+    s = ab.render_recipe(recipe)
+    n = 100
+    for k in (0, 17, 50, 83):
+        t = (1.0 * (k / n)) % 1.0
+        assert abs(s[k] - 0.7 * unit_sample('SINE', t)) < 1e-9
+
+
 def test_clamp_to_unit():
     recipe = {
         'version': 1, 'total_points': 100,

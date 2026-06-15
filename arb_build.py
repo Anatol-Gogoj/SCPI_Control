@@ -21,7 +21,7 @@ total_points, ready for BK4055B.upload_arb. All edit helpers return a NEW recipe
 import math
 import json
 
-from waveform_render import _pulse_sample
+from waveform_render import unit_sample
 
 SCHEMA_VERSION = 1
 DEFAULT_POINTS = 4096
@@ -29,19 +29,26 @@ DEFAULT_POINTS = 4096
 # Ordered for the editor's type dropdown.
 SEGMENT_TYPES = ('LINE', 'HOLD', 'SINE', 'SQUARE', 'RAMP', 'PULSE', 'EXP')
 
-# Per-type editable params: (key, label, default). Empty = no params.
+# Per-type editable params: (key, label, default, advanced).
+# Labels mirror the channel waveform menu so options match across the tool.
+# advanced=True params are only shown when the editor's Advanced toggle is on.
+# 'offset' is the vertical shift that lets a fundamental ride Y-positive
+# instead of straddling its baseline.
 SEGMENT_PARAMS = {
     'LINE': [],
     'HOLD': [],
-    'SINE': [('cycles', 'Cycles', 1.0), ('amp', 'Amplitude', 1.0),
-             ('phase', 'Phase (deg)', 0.0)],
-    'SQUARE': [('cycles', 'Cycles', 1.0), ('amp', 'Amplitude', 1.0),
-               ('duty', 'Duty %', 50.0)],
-    'RAMP': [('cycles', 'Cycles', 1.0), ('amp', 'Amplitude', 1.0),
-             ('sym', 'Symmetry %', 50.0)],
-    'PULSE': [('amp', 'Amplitude', 1.0), ('rise', 'Rise frac', 0.1),
-              ('fall', 'Fall frac', 0.1), ('duty', 'Duty %', 50.0)],
-    'EXP': [('tau', 'Tau', 0.3)],
+    'SINE': [('cycles', 'Cycles', 1.0, False), ('amp', 'Amplitude', 1.0, False),
+             ('offset', 'Offset', 0.0, True), ('phase', 'Phase (deg)', 0.0, True)],
+    'SQUARE': [('cycles', 'Cycles', 1.0, False), ('amp', 'Amplitude', 1.0, False),
+               ('duty', 'Duty Cycle (%)', 50.0, False),
+               ('offset', 'Offset', 0.0, True), ('phase', 'Phase (deg)', 0.0, True)],
+    'RAMP': [('cycles', 'Cycles', 1.0, False), ('amp', 'Amplitude', 1.0, False),
+             ('sym', 'Symmetry (%)', 50.0, False),
+             ('offset', 'Offset', 0.0, True), ('phase', 'Phase (deg)', 0.0, True)],
+    'PULSE': [('cycles', 'Cycles', 1.0, False), ('amp', 'Amplitude', 1.0, False),
+              ('duty', 'Duty Cycle (%)', 50.0, False), ('offset', 'Offset', 0.0, True),
+              ('rise', 'Rise (frac)', 0.1, True), ('fall', 'Fall (frac)', 0.1, True)],
+    'EXP': [('tau', 'Tau', 0.3, False)],
 }
 
 
@@ -51,7 +58,7 @@ def _clamp(v, lo=-1.0, hi=1.0):
 
 def _param(params, type_, key):
     """Param value with the type's default fallback."""
-    for k, _label, default in SEGMENT_PARAMS.get(type_, []):
+    for k, _label, default, _adv in SEGMENT_PARAMS.get(type_, []):
         if k == key:
             return float(params.get(key, default))
     return 0.0
@@ -82,45 +89,23 @@ def _render_segment(type_, n, y0, y1, params):
         return base
     if type_ == 'HOLD':
         return [y0] * n
-    if type_ == 'SINE':
-        cyc = _param(params, 'SINE', 'cycles')
-        amp = _param(params, 'SINE', 'amp')
-        ph = math.radians(_param(params, 'SINE', 'phase'))
-        return [base[k] + amp * math.sin(2 * math.pi * cyc * (k / n) + ph)
-                for k in range(n)]
-    if type_ == 'SQUARE':
-        cyc = _param(params, 'SQUARE', 'cycles')
-        amp = _param(params, 'SQUARE', 'amp')
-        duty = min(max(_param(params, 'SQUARE', 'duty'), 0.0), 100.0) / 100.0
+    if type_ in ('SINE', 'SQUARE', 'RAMP', 'PULSE'):
+        cyc = max(_param(params, type_, 'cycles'), 1e-6)
+        amp = _param(params, type_, 'amp')
+        off = _param(params, type_, 'offset')
+        shift = _param(params, type_, 'phase') / 360.0
+        duty = min(max(_param(params, type_, 'duty'), 0.0), 100.0) / 100.0 \
+            if type_ in ('SQUARE', 'PULSE') else 0.5
+        sym = min(max(_param(params, type_, 'sym'), 0.0), 100.0) / 100.0 \
+            if type_ == 'RAMP' else 0.5
+        rise = _param(params, type_, 'rise') if type_ == 'PULSE' else 0.0
+        fall = _param(params, type_, 'fall') if type_ == 'PULSE' else 0.0
         out = []
         for k in range(n):
-            frac = (cyc * (k / n)) % 1.0
-            out.append(base[k] + (amp if frac < duty else -amp))
+            t = (cyc * (k / n) + shift) % 1.0
+            out.append(base[k] + off
+                       + amp * unit_sample(type_, t, duty, sym, rise, fall))
         return out
-    if type_ == 'RAMP':
-        cyc = _param(params, 'RAMP', 'cycles')
-        amp = _param(params, 'RAMP', 'amp')
-        sym = min(max(_param(params, 'RAMP', 'sym'), 0.0), 100.0) / 100.0
-        out = []
-        for k in range(n):
-            frac = (cyc * (k / n)) % 1.0
-            if sym <= 0.0:
-                r = 1.0 - 2.0 * frac
-            elif sym >= 1.0:
-                r = -1.0 + 2.0 * frac
-            elif frac < sym:
-                r = -1.0 + 2.0 * (frac / sym)
-            else:
-                r = 1.0 - 2.0 * ((frac - sym) / (1.0 - sym))
-            out.append(base[k] + amp * r)
-        return out
-    if type_ == 'PULSE':
-        amp = _param(params, 'PULSE', 'amp')
-        rise = _param(params, 'PULSE', 'rise')
-        fall = _param(params, 'PULSE', 'fall')
-        duty = min(max(_param(params, 'PULSE', 'duty'), 0.0), 100.0) / 100.0
-        return [base[k] + amp * _pulse_sample(k / n, duty, rise, fall)
-                for k in range(n)]
     if type_ == 'EXP':
         tau = _param(params, 'EXP', 'tau') or 0.3
         denom = 1.0 - math.exp(-1.0 / tau)

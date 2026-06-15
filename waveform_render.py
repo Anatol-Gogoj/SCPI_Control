@@ -60,26 +60,34 @@ def unit_waveform(waveform, n_periods=3, points_per_period=200,
     out = []
     for i in range(n):
         t = (i / points_per_period + shift) % 1.0  # position within period
-        if waveform == 'SINE':
-            y = math.sin(2.0 * math.pi * t)
-        elif waveform == 'SQUARE':
-            y = 1.0 if t < duty else -1.0
-        elif waveform == 'RAMP':
-            # Rise from -1 to +1 over sym fraction, fall back over the rest.
-            if sym <= 0.0:
-                y = 1.0 - 2.0 * t
-            elif sym >= 1.0:
-                y = -1.0 + 2.0 * t
-            elif t < sym:
-                y = -1.0 + 2.0 * (t / sym)
-            else:
-                y = 1.0 - 2.0 * ((t - sym) / (1.0 - sym))
-        elif waveform == 'PULSE':
-            y = _pulse_sample(t, duty, rise_frac, fall_frac)
-        else:
-            y = 0.0
-        out.append(y)
+        out.append(unit_sample(waveform, t, duty, sym, rise_frac, fall_frac))
     return out
+
+
+def unit_sample(waveform, t, duty=0.5, sym=0.5, rise_frac=0.0, fall_frac=0.0):
+    """One unit-amplitude sample of a base waveform at phase t in [0, 1).
+
+    Shared by unit_waveform() (the channel preview) and the arb editor's
+    segment renderer so both produce identical SINE/SQUARE/RAMP/PULSE shapes.
+    duty/sym are fractions (0..1); returns a value in [-1, 1].
+    """
+    waveform = (waveform or '').upper()
+    if waveform == 'SINE':
+        return math.sin(2.0 * math.pi * t)
+    if waveform == 'SQUARE':
+        return 1.0 if t < duty else -1.0
+    if waveform == 'RAMP':
+        # Rise from -1 to +1 over the sym fraction, fall back over the rest.
+        if sym <= 0.0:
+            return 1.0 - 2.0 * t
+        if sym >= 1.0:
+            return -1.0 + 2.0 * t
+        if t < sym:
+            return -1.0 + 2.0 * (t / sym)
+        return 1.0 - 2.0 * ((t - sym) / (1.0 - sym))
+    if waveform == 'PULSE':
+        return _pulse_sample(t, max(duty, 1e-6), rise_frac, fall_frac)
+    return 0.0
 
 
 def _pulse_sample(t, duty, rise_frac, fall_frac):

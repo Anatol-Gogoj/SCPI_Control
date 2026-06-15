@@ -46,6 +46,7 @@ class ArbWaveformEditor(tk.Toplevel):
         self.samples_per_px = 1.0      # zoom
         self.n_periods = 1
         self.x_axis_time = False
+        self.y_scale = 10.0            # full-scale +/- volts (4055B max 20 Vpp HiZ)
         self._drag_idx = None          # breakpoint being dragged
         self._sel = None               # selected breakpoint index
 
@@ -85,6 +86,12 @@ class ArbWaveformEditor(tk.Toplevel):
         pe.bind('<Return>', lambda e: self._apply_points())
         ttk.Button(header, text="Set", command=self._apply_points).pack(side=tk.LEFT)
         ttk.Label(header, text=f"(max {BK4055B.ARB_MAX_POINTS})").pack(side=tk.LEFT, padx=6)
+        ttk.Label(header, text="Full-scale ±V:").pack(side=tk.LEFT, padx=(12, 0))
+        self.yscale_var = tk.StringVar(value=f'{self.y_scale:g}')
+        ye = ttk.Entry(header, width=6, textvariable=self.yscale_var)
+        ye.pack(side=tk.LEFT, padx=4)
+        ye.bind('<Return>', lambda e: self._apply_yscale())
+        ttk.Button(header, text="Set", command=self._apply_yscale).pack(side=tk.LEFT)
         self.dt_label = ttk.Label(header, text="")
         self.dt_label.pack(side=tk.LEFT, padx=12)
 
@@ -96,7 +103,7 @@ class ArbWaveformEditor(tk.Toplevel):
         side.pack(side=tk.LEFT, fill='y')
         self.tree = ttk.Treeview(side, columns=('x', 'y', 'type'),
                                  show='headings', height=12, selectmode='browse')
-        for col, txt, w in (('x', 'X', 70), ('y', 'Y', 70), ('type', 'To next', 80)):
+        for col, txt, w in (('x', 'X', 70), ('y', 'Y (V)', 70), ('type', 'To next', 80)):
             self.tree.heading(col, text=txt)
             self.tree.column(col, width=w, anchor='center')
         self.tree.pack(fill='y')
@@ -116,8 +123,13 @@ class ArbWaveformEditor(tk.Toplevel):
                                      values=list(ab.SEGMENT_TYPES))
         self.seg_type.grid(row=0, column=1, pady=2)
         self.seg_type.bind('<<ComboboxSelected>>', lambda e: self._on_type_change())
+        self.adv_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(self.seg_frame, text="Advanced (offset, phase, edges)",
+                        variable=self.adv_var,
+                        command=self._load_segment_form).grid(
+                            row=1, column=0, columnspan=2, sticky='w', pady=(4, 0))
         self.seg_param_frame = ttk.Frame(self.seg_frame)
-        self.seg_param_frame.grid(row=1, column=0, columnspan=2, sticky='w')
+        self.seg_param_frame.grid(row=2, column=0, columnspan=2, sticky='w')
         self.seg_param_vars = {}
 
         # Canvas
@@ -219,7 +231,7 @@ class ArbWaveformEditor(tk.Toplevel):
         for i, (x, y) in enumerate(bps):
             seg = segs[i]['type'] if i < len(segs) else '-'
             self.tree.insert('', 'end', iid=str(i),
-                             values=(f'{x:g}', f'{y:g}', seg))
+                             values=(f'{x:g}', f'{y * self.y_scale:g}', seg))
         if sel and sel[0] in self.tree.get_children():
             self.tree.selection_set(sel[0])
         self._update_dt_label()
@@ -244,7 +256,11 @@ class ArbWaveformEditor(tk.Toplevel):
         self.seg_type.config(state='readonly')
         self.seg_type.set(segs[i]['type'])
         params = segs[i].get('params') or {}
-        for row, (key, label, default) in enumerate(ab.SEGMENT_PARAMS.get(segs[i]['type'], [])):
+        adv = self.adv_var.get()
+        row = 0
+        for key, label, default, advanced in ab.SEGMENT_PARAMS.get(segs[i]['type'], []):
+            if advanced and not adv:
+                continue
             ttk.Label(self.seg_param_frame, text=f"{label}:").grid(row=row, column=0, sticky='w')
             var = tk.StringVar(value=str(params.get(key, default)))
             ent = ttk.Entry(self.seg_param_frame, width=8, textvariable=var)
@@ -252,6 +268,7 @@ class ArbWaveformEditor(tk.Toplevel):
             ent.bind('<Return>', lambda e: self._apply_segment_params())
             ent.bind('<FocusOut>', lambda e: self._apply_segment_params())
             self.seg_param_vars[key] = var
+            row += 1
 
     def _on_type_change(self):
         if self._sel is None or self._sel >= len(self.recipe['segments']):
@@ -293,7 +310,8 @@ class ArbWaveformEditor(tk.Toplevel):
                 ent.destroy()
                 return
             bp = self.recipe['breakpoints'][i]
-            nx, ny = (val, bp[1]) if col == '#1' else (bp[0], val)
+            # the Y column is shown/typed in volts; store normalized
+            nx, ny = (val, bp[1]) if col == '#1' else (bp[0], val / self.y_scale)
             ent.destroy()
             self._commit(ab.move_point(self.recipe, i, nx, ny))
         ent.bind('<Return>', commit)
@@ -333,6 +351,24 @@ class ArbWaveformEditor(tk.Toplevel):
             self.points_var.set(str(self.recipe['total_points']))
             return
         self._commit(ab.set_total_points(self.recipe, n))
+
+    def _apply_yscale(self):
+        """Set the full-scale +/- voltage the Y axis represents (max 10 V HiZ)."""
+        try:
+            v = float(self.yscale_var.get())
+        except ValueError:
+            self.yscale_var.set(f'{self.y_scale:g}')
+            return
+        if v <= 0:
+            self.yscale_var.set(f'{self.y_scale:g}')
+            return
+        if v > 10.0:
+            v = 10.0  # 4055B max is 20 Vpp into HiZ (+/-10 V)
+            self.app.status_bar.config(text="Full-scale capped at 10 V (4055B max)")
+        self.y_scale = v
+        self.yscale_var.set(f'{v:g}')
+        self._refresh_tree()
+        self._redraw()
 
     def _x_max(self):
         return self.recipe['breakpoints'][-1][0]
@@ -444,12 +480,19 @@ class ArbWaveformEditor(tk.Toplevel):
             c.create_oval(px - _DOT_R, py - _DOT_R, px + _DOT_R, py + _DOT_R,
                           fill=color, outline='white')
 
-        # axis labels
+        # Y axis labels (volts at full scale)
+        c.create_text(_PAD + 2, _PAD, anchor='nw', fill='#999',
+                      font=('Arial', 8), text=f'+{self.y_scale:g} V')
+        c.create_text(_PAD + 2, _PAD + h, anchor='sw', fill='#999',
+                      font=('Arial', 8), text=f'-{self.y_scale:g} V')
+
+        # X axis labels, anchored to the bottom edge so they aren't clipped
         left_i = self._px_to_sample(_PAD)
         right_i = self._px_to_sample(_PAD + self._cw())
-        c.create_text(_PAD, _PAD + h + 4, anchor='nw', fill='#666',
+        yb = self.canvas.winfo_height() - 2
+        c.create_text(_PAD, yb, anchor='sw', fill='#666',
                       font=('Arial', 8), text=self._axis_text(left_i))
-        c.create_text(_PAD + self._cw(), _PAD + h + 4, anchor='ne', fill='#666',
+        c.create_text(_PAD + self._cw(), yb, anchor='se', fill='#666',
                       font=('Arial', 8), text=self._axis_text(right_i))
 
         # scrollbar thumb
@@ -614,6 +657,21 @@ class ArbWaveformEditor(tk.Toplevel):
         except Exception as e:
             messagebox.showerror("Template error", str(e), parent=self)
 
+    def _set_channel_value(self, ch, key, val):
+        """Write a value into a channel widget, handling both Entry (real GUI)
+        and StringVar (demo) without caring which it is."""
+        w = self.app.sg_channel_widgets[ch].get(key)
+        if w is None:
+            return
+        try:
+            if hasattr(w, 'set'):          # StringVar / Combobox
+                w.set(f'{val:g}')
+            else:                          # ttk.Entry
+                w.delete(0, tk.END)
+                w.insert(0, f'{val:g}')
+        except Exception:
+            pass
+
     def upload(self):
         app, ch = self.app, self.channel
         if not app.sg:
@@ -625,11 +683,15 @@ class ArbWaveformEditor(tk.Toplevel):
             return
         try:
             freq = app._sg_get_float(ch, 'freq', 1000.0)
-            amp = app._sg_get_float(ch, 'amp', 1.0)
-            offset = app._sg_get_float(ch, 'offset', 0.0)
+            # Editor Y is full-scale +/-y_scale volts, so the channel amplitude
+            # is 2*y_scale Vpp (offset 0); the normalized arb carries the shape.
+            amp = 2.0 * self.y_scale
+            offset = 0.0
             clean = app.sg.upload_arb(ch, name, self.samples, freq_hz=freq,
                                       amp_vpp=amp, offset_v=offset)
             app.sg.select_arb(ch, clean)
+            if hasattr(app.sg, 'set_basic_wave'):
+                app.sg.set_basic_wave(ch, AMP=amp, OFST=offset)
         except Exception as e:
             messagebox.showerror("Upload error", str(e), parent=self)
             return
@@ -642,6 +704,8 @@ class ArbWaveformEditor(tk.Toplevel):
         widgets['arb_name_var'].set(clean)
         widgets['arb_samples'] = list(self.samples)
         widgets['waveform'].set('ARB')
+        self._set_channel_value(ch, 'amp', amp)
+        self._set_channel_value(ch, 'offset', offset)
         app._sg_update_visibility(ch)
         app._sg_redraw_preview(ch)
         try:
