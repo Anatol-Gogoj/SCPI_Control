@@ -27,7 +27,6 @@ import re
 import time
 import struct
 import threading
-import pyvisa
 
 
 # --------------------------------------------------------------------------
@@ -39,10 +38,16 @@ _RM_LOCK = threading.Lock()
 
 
 def get_resource_manager():
-    """Process-wide PyVISA ResourceManager (pyvisa-py backend)."""
+    """Process-wide PyVISA ResourceManager (pyvisa-py backend).
+
+    pyvisa is imported lazily so that merely importing this module (e.g. for the
+    pure waveform/preset logic, or the hardware-free editor demo) does not
+    require pyvisa to be installed -- it's only needed to actually open a device.
+    """
     global _RM
     with _RM_LOCK:
         if _RM is None:
+            import pyvisa
             _RM = pyvisa.ResourceManager('@py')
         return _RM
 
