@@ -164,6 +164,21 @@ def test_arb_library_roundtrip(tmp_path):
     assert store.arb_names() == []
 
 
+def test_arb_recipe_sidecar(tmp_path):
+    store = SignalGenPresetStore(path=tmp_path)
+    store.arb_dir = os.path.join(os.path.dirname(tmp_path), 'arb')
+    recipe = {'version': 1, 'total_points': 8,
+              'breakpoints': [[0, 0.0], [1, 0.5]],
+              'segments': [{'type': 'LINE', 'params': {}}]}
+    store.save_arb('rec', [0.0, 0.25, 0.5], recipe=recipe)
+    assert store.load_arb_recipe('rec') == recipe
+    # saving again without a recipe drops the now-stale sidecar
+    store.save_arb('rec', [0.1, 0.2, 0.3])
+    assert store.load_arb_recipe('rec') is None
+    assert store.delete_arb('rec') is True
+    assert store.arb_names() == []
+
+
 def test_arb_name_in_channel_state():
     out = validate_channel_state({'waveform': 'ARB', 'arb_name': 'my wave!'})
     assert out['arb_name'] == 'my_wave_'         # sanitised

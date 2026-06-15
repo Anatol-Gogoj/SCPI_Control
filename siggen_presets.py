@@ -252,6 +252,9 @@ class SignalGenPresetStore:
     def _arb_path(self, name):
         return os.path.join(self.arb_dir, f'{sanitize_arb_name(name)}.csv')
 
+    def _arb_recipe_path(self, name):
+        return os.path.join(self.arb_dir, f'{sanitize_arb_name(name)}.recipe.json')
+
     def arb_names(self):
         """Sorted names of saved arb waveforms."""
         if not os.path.isdir(self.arb_dir):
@@ -259,8 +262,13 @@ class SignalGenPresetStore:
         return sorted(os.path.splitext(f)[0] for f in os.listdir(self.arb_dir)
                       if f.endswith('.csv'))
 
-    def save_arb(self, name, samples):
-        """Save samples as <arb_dir>/<name>.csv. Returns the sanitised name."""
+    def save_arb(self, name, samples, recipe=None):
+        """Save samples as <arb_dir>/<name>.csv. Returns the sanitised name.
+
+        If ``recipe`` (a JSON-serialisable breakpoint/segment dict) is given, it
+        is written alongside as <name>.recipe.json so the arb can be reopened in
+        the editor and re-edited. The CSV remains the upload source of truth.
+        """
         if not samples:
             raise ValueError("samples must be non-empty")
         clean = sanitize_arb_name(name)
@@ -272,16 +280,36 @@ class SignalGenPresetStore:
             for s in samples:
                 writer.writerow([f'{float(s):.6g}'])
         os.replace(tmp, self._arb_path(clean))
+
+        recipe_path = self._arb_recipe_path(clean)
+        if recipe is not None:
+            rtmp = recipe_path + '.tmp'
+            with open(rtmp, 'w') as f:
+                json.dump(recipe, f, indent=2)
+            os.replace(rtmp, recipe_path)
+        elif os.path.exists(recipe_path):
+            os.remove(recipe_path)  # stale recipe would no longer match the CSV
         return clean
 
     def load_arb(self, name):
         """Load samples for a saved arb. Raises FileNotFoundError/ValueError."""
         return arb_from_csv(self._arb_path(name))
 
+    def load_arb_recipe(self, name):
+        """Return the saved editor recipe for an arb, or None if there isn't one."""
+        path = self._arb_recipe_path(name)
+        if not os.path.exists(path):
+            return None
+        with open(path) as f:
+            return json.load(f)
+
     def delete_arb(self, name):
-        """Delete a saved arb. Returns True if it existed."""
+        """Delete a saved arb (and its recipe sidecar). Returns True if it existed."""
         path = self._arb_path(name)
-        if os.path.exists(path):
+        existed = os.path.exists(path)
+        if existed:
             os.remove(path)
-            return True
-        return False
+        recipe_path = self._arb_recipe_path(name)
+        if os.path.exists(recipe_path):
+            os.remove(recipe_path)
+        return existed
