@@ -19,6 +19,8 @@ output is turned off when the run finishes.
 import sys
 import math
 import time
+import struct
+import re
 import argparse
 
 from instruments import BK4055B, TekMSO24
@@ -114,11 +116,81 @@ def run_case(sg, scope, sg_ch, scope_ch, label, samples):
     return ok
 
 
+def _read_wvdt(sg, name):
+    """Query WVDT? USER,<name> and return (header_bytes, wavedata_bytes, length)."""
+    sg.inst.timeout = 12000
+    sg.write(f'WVDT? USER,{name}')
+    raw = sg.read_raw()
+    idx = raw.find(b'WAVEDATA,')
+    while idx == -1:                        # ensure we have the header
+        more = sg.read_raw()
+        if not more:
+            break
+        raw += more
+        idx = raw.find(b'WAVEDATA,')
+    m = re.search(rb'LENGTH,(\d+)B', raw[:idx] if idx >= 0 else raw)
+    length = int(m.group(1)) if m else None
+    data = raw[idx + len(b'WAVEDATA,'):] if idx >= 0 else b''
+    while length and len(data) < length:    # complete multi-chunk reads
+        more = sg.read_raw()
+        if not more:
+            break
+        data += more
+    return (raw[:idx] if idx >= 0 else raw), (data[:length] if length else data), length
+
+
+def readback_check(sg, ch):
+    """Upload a full-scale sine, read it back, and diff bytes vs what we sent
+    (and vs the known-good wave1). Tells us transport-corruption vs playback."""
+    n = BK4055B.ARB_POINTS
+    sent_samples = [math.sin(2 * math.pi * i / n) for i in range(n)]
+    name = sg.upload_arb(ch, 'RBCHK', sent_samples)
+    sent = BK4055B.samples_to_int16(BK4055B._resample(sent_samples, n))
+    print(f"uploaded '{name}': {len(sent)} bytes; in STL? USER:",
+          'RBCHK' in sg.ask('STL? USER'))
+
+    hdr, got, length = _read_wvdt(sg, name)
+    print(f"readback header: {hdr[:80]!r}")
+    print(f"declared LENGTH={length}  got {len(got)} bytes  sent {len(sent)} bytes")
+    k = min(len(sent), len(got)) // 2
+    sv = struct.unpack(f'<{k}h', sent[:2 * k])
+    gv = struct.unpack(f'<{k}h', got[:2 * k])
+    mism = sum(1 for a, b in zip(sv, gv) if a != b)
+    print(f"value mismatches: {mism}/{k}   "
+          f"sent peak={max(abs(x) for x in sv)}  got peak={max(abs(x) for x in gv) if gv else 0}")
+    print(f"first 8 sent: {sv[:8]}")
+    print(f"first 8 got : {gv[:8]}")
+    if mism == 0 and len(got) == len(sent):
+        print(">> DATA INTACT -> problem is playback/format/amplitude, not transport")
+    else:
+        print(">> DATA DIFFERS -> upload transport is still corrupting the waveform")
+
+    try:
+        _h, g2, l2 = _read_wvdt(sg, 'wave1')
+        v2 = struct.unpack(f'<{len(g2) // 2}h', g2[:len(g2) // 2 * 2])
+        print(f"reference wave1: LENGTH={l2}  peak={max(abs(x) for x in v2) if v2 else 0}")
+    except Exception as e:
+        print('wave1 readback error:', type(e).__name__, e)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Arbitrary-waveform sig gen -> scope self-test")
     ap.add_argument('--sg', type=int, default=2, choices=(1, 2))
     ap.add_argument('--scope', type=int, default=1)
+    ap.add_argument('--readback', action='store_true',
+                    help="upload a sine, read it back with WVDT? and diff the "
+                         "bytes (no scope) -- isolates transport vs playback")
     args = ap.parse_args()
+
+    if args.readback:
+        print("Connecting (sig gen only)...")
+        sg = BK4055B()
+        print(f"  sig gen: {sg.idn}")
+        try:
+            readback_check(sg, args.sg)
+        finally:
+            sg.close()
+        return 0
 
     print("Connecting...")
     sg = BK4055B()
