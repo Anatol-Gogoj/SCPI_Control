@@ -275,10 +275,12 @@ class TekMSO24(VisaInstrument):
             return None
 
     def get_all_measurements(self, channel):
-        return {
-            meas.lower(): self.measure(meas, channel)
-            for meas in ('FREQ', 'PERIOD', 'MEAN', 'PK2PK', 'RMS', 'AMPLITUDE')
-        }
+        # The MSO24 frequency measurement token is FREQUENCY -- 'FREQ' is
+        # silently accepted but returns a garbage value (~2 Hz). Keys stay
+        # short for callers. (Root cause of the GUI's frequency issue.)
+        types = (('freq', 'FREQUENCY'), ('period', 'PERIOD'), ('mean', 'MEAN'),
+                 ('pk2pk', 'PK2PK'), ('rms', 'RMS'), ('amplitude', 'AMPLITUDE'))
+        return {key: self.measure(scpi, channel) for key, scpi in types}
 
     def get_waveform(self, channel):
         """Acquire a channel waveform. Returns {'t', 'v', 'dt', 'npts'}."""

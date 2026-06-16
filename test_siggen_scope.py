@@ -82,21 +82,29 @@ def run_case(sg, scope, sg_ch, scope_ch, label, wave, freq, amp, offset):
     configure_scope(scope, scope_ch, amp, offset, freq)
     m = measure(scope, scope_ch)
 
-    checks = []
+    results = []   # (text, ok)
     if freq is not None:
-        checks.append(("freq", m.get('freq'), freq, _within(m.get('freq'), freq, FREQ_TOL)))
-        checks.append(("Vpp", m.get('pk2pk'), amp, _within(m.get('pk2pk'), amp, AMP_TOL)))
+        fm = m.get('freq')
+        results.append((f"freq {_fmt_hz(fm)} (exp {_fmt_hz(freq)})",
+                        _within(fm, freq, FREQ_TOL)))
+        # Settled AMPLITUDE underreads ramps; PK2PK overreads edges/overshoot.
+        # The true set Vpp should sit between them (within tolerance).
+        lo, hi = m.get('amplitude'), m.get('pk2pk')
+        amp_ok = (lo is not None and hi is not None
+                  and lo * (1 - AMP_TOL) <= amp <= hi * (1 + AMP_TOL))
+        lo_s = f"{lo:.2f}" if lo is not None else "--"
+        hi_s = f"{hi:.2f}" if hi is not None else "--"
+        results.append((f"Vpp {lo_s}-{hi_s} (exp {amp:.2f})", amp_ok))
     else:  # DC: no frequency, expect ~zero Vpp
-        checks.append(("Vpp", m.get('pk2pk'), 0.0, _within(m.get('pk2pk'), 0.0, 0.0, absol=0.1)))
-    checks.append(("mean", m.get('mean'), offset, _within(m.get('mean'), offset, 0.0,
-                                                          absol=max(0.05, 0.05 * amp))))
-    ok = all(c[3] for c in checks)
+        pp = m.get('pk2pk')
+        results.append((f"Vpp {pp:.3f} (exp ~0)" if pp is not None else "Vpp --",
+                        _within(pp, 0.0, 0.0, absol=0.1)))
+    mn = m.get('mean')
+    results.append((f"mean {mn:.3f} (exp {offset:.3f})" if mn is not None else "mean --",
+                    _within(mn, offset, 0.0, absol=max(0.05, 0.05 * amp))))
 
-    parts = []
-    for name, meas, exp, good in checks:
-        shown = _fmt_hz(meas) if name == "freq" else (f"{meas:.3f}" if meas is not None else "--")
-        exp_s = _fmt_hz(exp) if name == "freq" else f"{exp:.3f}"
-        parts.append(f"{name} {shown} (exp {exp_s}){'' if good else ' X'}")
+    ok = all(r[1] for r in results)
+    parts = [f"{txt}{'' if good else ' X'}" for txt, good in results]
     print(f"  {'PASS' if ok else 'FAIL'}  {label:<26}  " + "  ".join(parts))
     return ok
 

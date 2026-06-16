@@ -1345,10 +1345,14 @@ ANALYSIS:
         
         try:
             meas = self.scope.get_all_measurements(channel)
-            
+
+            # measurement dict key -> label widget key (they differ for
+            # freq/pk2pk, which is why those never displayed before)
+            label_map = {'freq': 'frequency', 'period': 'period', 'mean': 'mean',
+                         'pk2pk': 'pkpk', 'rms': 'rms', 'amplitude': 'amplitude'}
             for key, value in meas.items():
-                label_key = key.replace('_', '')
-                if label_key in self.scope_meas_labels[channel]:
+                label_key = label_map.get(key)
+                if label_key and label_key in self.scope_meas_labels[channel]:
                     if value is not None:
                         # Format appropriately
                         if key == 'freq':
