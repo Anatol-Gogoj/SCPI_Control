@@ -62,6 +62,12 @@ SG_STATE_KEYS = {'freq': 'freq_hz', 'amp': 'amp_vpp', 'offset': 'offset_v',
                  'duty': 'duty_pct', 'sym': 'sym_pct', 'phase': 'phase_deg',
                  'rise': 'rise_s', 'fall': 'fall_s', 'delay': 'delay_s'}
 
+# Arbitrary-waveform upload is disabled in the UI until the 4055B USBTMC
+# upload path is fixed (issue #20) -- the editor/backend code stays, but users
+# can't reach it (selecting ARB / the Waveform Editor) so they don't hit the
+# broken, endpoint-wedging upload. Flip to True to re-enable once #20 lands.
+SG_ARB_ENABLED = False
+
 SG_LOAD_HIGHZ = 'High-Z'   # UI label for the SCPI 'HZ' (high impedance) token
 
 class InstrumentControlGUI:
@@ -226,8 +232,8 @@ WAVEFORMS (fields adapt to the selected type):
 - PULSE: timing tests; Duty plus Rise/Fall/Delay (Advanced mode)
 - NOISE: broadband stimulus (level set on the front panel for now)
 - DC: fixed level only (set with DC Offset)
-- ARB: arbitrary waveform - select ARB then "Waveform Editor..." to
-  load a CSV, save it to the library, and upload to the instrument
+- ARB: arbitrary waveform - TEMPORARILY DISABLED while the USB upload
+  path is fixed (issue #20); standard waveforms above are unaffected
 
 BASIC vs ADVANCED:
 - Advanced mode reveals Phase, pulse edge timing (Rise/Fall/Delay),
@@ -267,12 +273,9 @@ PRESETS:
 - Presets are stored in presets/siggen_presets.json
 
 ARBITRARY WAVEFORMS:
-- CSV format: header row 'value' (or 'time,value' - time is ignored),
-  then one sample per row; values in [-1, 1], larger is normalised
-- "Save CSV Template..." writes a starter file (one sine period)
-- The library lives in presets/arb/<name>.csv; presets reference arbs
-  by name - upload the arb once, then presets can re-select it
-- Playback rate = the channel's Frequency field (one period per cycle)
+- Temporarily disabled: the BK 4055B USB arb-upload path wedges the
+  instrument, so the Waveform Editor is locked out until it's fixed
+  (issue #20). The standard waveforms are fully working.
 
 BEST PRACTICES:
 - Confirm the load setting before trusting the amplitude reading
@@ -810,7 +813,8 @@ ANALYSIS:
         wrow.pack(fill='x', pady=2)
         ttk.Label(wrow, text="Waveform:", width=16).pack(side=tk.LEFT)
         waveform = ttk.Combobox(wrow, width=10, state='readonly')
-        waveform['values'] = list(BK4055B.WAVEFORMS)
+        waveform['values'] = [w for w in BK4055B.WAVEFORMS
+                              if SG_ARB_ENABLED or w != 'ARB']
         waveform.set('SINE')
         waveform.pack(side=tk.LEFT, padx=4)
         waveform.bind('<<ComboboxSelected>>',
@@ -828,9 +832,14 @@ ANALYSIS:
             row = ttk.Frame(form)
             ttk.Label(row, text=SG_FIELD_LABELS[key], width=16).pack(side=tk.LEFT)
             if key == 'arb':
-                # Button opens the waveform editor; label shows chosen arb
-                w = ttk.Button(row, text="Waveform Editor...",
-                               command=lambda c=ch: self.sg_open_arb_dialog(c))
+                # Button opens the waveform editor; label shows chosen arb.
+                # Disabled until the upload path is fixed (issue #20).
+                if SG_ARB_ENABLED:
+                    w = ttk.Button(row, text="Waveform Editor...",
+                                   command=lambda c=ch: self.sg_open_arb_dialog(c))
+                else:
+                    w = ttk.Button(row, text="Waveform Editor (disabled)",
+                                   state='disabled')
                 name_lbl = tk.Label(row, textvariable=widgets['arb_name_var'],
                                     width=12, anchor='w')
                 w.pack(side=tk.LEFT, padx=4)
@@ -1099,7 +1108,7 @@ ANALYSIS:
                                      f"between 0 and 100, got {value:g}")
                 params[bk] = value
             self.sg.set_basic_wave(channel, **params)
-            if wave == 'ARB':
+            if wave == 'ARB' and SG_ARB_ENABLED:
                 arb = widgets['arb_name_var'].get().strip()
                 if arb:
                     # Select by name; the waveform must already be in the
@@ -1206,6 +1215,14 @@ ANALYSIS:
 
     def sg_open_arb_dialog(self, ch):
         """Open the interactive arbitrary-waveform editor for a channel."""
+        if not SG_ARB_ENABLED:
+            messagebox.showinfo(
+                "Arbitrary waveform unavailable",
+                "Arbitrary-waveform creation/upload is temporarily disabled "
+                "while the BK 4055B USB upload path is being fixed (issue #20).\n\n"
+                "The standard waveforms (sine, square, ramp, pulse, noise, DC) "
+                "all work normally.")
+            return
         ArbWaveformEditor(self, ch)
 
     def sg_refresh_presets(self):
