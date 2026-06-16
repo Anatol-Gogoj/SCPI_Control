@@ -145,6 +145,10 @@ class ArbWaveformEditor(tk.Toplevel):
         self.seg_param_frame = ttk.Frame(self.seg_frame)
         self.seg_param_frame.grid(row=2, column=0, columnspan=2, sticky='w')
         self.seg_param_vars = {}
+        tk.Label(self.seg_frame, fg='gray', justify=tk.LEFT, wraplength=190,
+                 text="Vpk = peak (±) about the baseline. "
+                      "Sine: Vpp = 2×Vpk, Vrms ≈ 0.707×Vpk.").grid(
+                          row=3, column=0, columnspan=2, sticky='w', pady=(4, 0))
 
         # Canvas
         right = ttk.Frame(main)
