@@ -98,6 +98,12 @@ class VisaInstrument:
         self.inst.timeout = self.TIMEOUT_MS
         self.inst.read_termination = '\n'
         self.inst.write_termination = '\n'
+        # Flush any stale device output (e.g. an unread binary CURVE? response
+        # from a previous run) so the first query doesn't read garbage.
+        try:
+            self.inst.clear()
+        except Exception:
+            pass
         self.idn = self.inst.query('*IDN?').strip()
         self._post_open()
 
@@ -130,6 +136,30 @@ class VisaInstrument:
         header directly.
         """
         return self.inst.write_raw(data)
+
+    def write_raw_oneshot(self, data):
+        """Write a large binary payload as ONE USBTMC Bulk-OUT message.
+
+        pyvisa-py's USBTMC writer wraps every wMaxPacketSize-sized slice
+        (64 bytes on this bench) in its own BulkOutMessage header, which
+        corrupts large binary writes -- a 32 KB arb upload gets hundreds of
+        12-byte headers injected mid-data, so the waveform stores as garbage
+        and the endpoint can wedge. Temporarily raise the endpoint's
+        wMaxPacketSize so the whole payload goes out as a single USBTMC
+        message (libusb still packetizes at the USB layer). Falls back to a
+        plain write_raw if the backend internals differ.
+        """
+        try:
+            sess = self.inst.visalib.sessions[self.inst.session]
+            ep = sess.interface.usb_send_ep
+        except (AttributeError, KeyError, TypeError):
+            return self.inst.write_raw(data)
+        old = ep.wMaxPacketSize
+        ep.wMaxPacketSize = max(old, len(data) + 64)
+        try:
+            return self.inst.write_raw(data)
+        finally:
+            ep.wMaxPacketSize = old
 
     def ask(self, command):
         """Write a command and return its response (newline-stripped)."""
@@ -299,9 +329,19 @@ class TekMSO24(VisaInstrument):
         time.sleep(0.2)
         raw_data = self.read_raw()
 
-        # IEEE 488.2 definite-length block: '#<N><length><data>'
-        header_len = 2 + int(chr(raw_data[1]))
-        data_bytes = raw_data[header_len:-1]
+        # IEEE 488.2 definite-length block: '#<N><N-digit byte count><data>'.
+        # Parse the declared length (robust to a trailing newline or none) and
+        # complete the read if the block spans more than one chunk.
+        ndig = int(chr(raw_data[1]))
+        nbytes = int(raw_data[2:2 + ndig])
+        start = 2 + ndig
+        while len(raw_data) < start + nbytes:
+            more = self.read_raw()
+            if not more:
+                break
+            raw_data += more
+        data_bytes = raw_data[start:start + nbytes]
+        data_bytes = data_bytes[:len(data_bytes) // 2 * 2]   # whole int16 samples
 
         samples = struct.unpack(f'>{len(data_bytes)//2}h', data_bytes)
         voltages = [(s - yoff) * ymult + yzero for s in samples]
@@ -470,8 +510,30 @@ class BK4055B(VisaInstrument):
 
     # -- arbitrary waveforms -------------------------------------------------
 
-    ARB_MAX_POINTS = 16384  # conservative DDS-mode default; bench-bisect the
-                            # true 4055B limit before raising (see PR notes)
+    ARB_MAX_POINTS = 16384  # editor design cap
+    ARB_POINTS = 16384      # the 4055B user-arb length (bench-verified
+                            # 2026-06-16); uploads are resampled to exactly
+                            # this -- a shorter upload plays into a partly-empty
+                            # buffer (low amplitude / distorted output).
+
+    @staticmethod
+    def _resample(samples, n):
+        """Circularly resample a periodic waveform to n points (linear)."""
+        m = len(samples)
+        if m == n:
+            return list(samples)
+        if m == 0:
+            return [0.0] * n
+        if m == 1:
+            return [float(samples[0])] * n
+        out = []
+        for i in range(n):
+            x = i * m / n              # phase in input samples [0, m)
+            lo = int(x) % m
+            frac = x - int(x)
+            hi = (lo + 1) % m
+            out.append(samples[lo] * (1 - frac) + samples[hi] * frac)
+        return out
 
     @staticmethod
     def samples_to_int16(samples):
@@ -493,33 +555,39 @@ class BK4055B(VisaInstrument):
             out += struct.pack('<h', v)
         return bytes(out)
 
-    def upload_arb(self, channel, name, samples, freq_hz, amp_vpp=1.0,
-                   offset_v=0.0, phase_deg=0.0):
+    def upload_arb(self, channel, name, samples, freq_hz=None, amp_vpp=None,
+                   offset_v=None, phase_deg=None):
         """Upload an arbitrary waveform to the instrument's user memory.
 
-        The WVDT command carries raw int16 LE sample bytes directly after the
-        'WAVEDATA,' token (NOT an IEEE-488.2 #-block), so the whole message is
-        sent via write_raw. Numeric header fields go through _fmt_param (the
-        4055B mis-parses decimal-suffixed values, see README quirks).
+        Sends ``C<n>:WVDT WVNM,<name>,LENGTH,<bytes>B,TYPE,6,WAVEDATA,<int16 LE>``
+        via write_raw (the bytes follow WAVEDATA, directly; not an IEEE block).
+        Bench-verified requirements on the 4055B (2026-06-16):
+          - LENGTH is REQUIRED, else the upload is silently discarded.
+          - the buffer length is fixed (ARB_POINTS); shorter uploads play into a
+            partly-empty buffer (tiny/distorted output), so we resample.
+          - TYPE,6 (16-bit) -- TYPE,5 stores but plays back near-zero.
+        Output level/rate are NOT stored; set them via set_basic_wave + select_arb
+        after uploading. freq/amp/offset/phase args are accepted but unused.
 
-        name is sanitised to [A-Za-z0-9_], max 16 chars, since the box stores
-        it as a filename-like identifier.
+        name is sanitised to [A-Za-z0-9_], max 16 chars; returns the clean name.
         """
         clean = re.sub(r'[^A-Za-z0-9_]', '_', str(name))[:16]
         if not clean:
             raise ValueError(f"unusable arb name {name!r}")
-        if len(samples) > self.ARB_MAX_POINTS:
-            raise ValueError(
-                f"{len(samples)} points exceeds ARB_MAX_POINTS "
-                f"({self.ARB_MAX_POINTS}); decimate the waveform first")
-        data = self.samples_to_int16(samples)
-        header = (f'C{channel}:WVDT WVNM,{clean},'
-                  f'FREQ,{self._fmt_param(float(freq_hz))},'
-                  f'AMPL,{self._fmt_param(float(amp_vpp))},'
-                  f'OFST,{self._fmt_param(float(offset_v))},'
-                  f'PHASE,{self._fmt_param(float(phase_deg))},'
-                  f'WAVEDATA,')
-        self.write_raw(header.encode('latin1') + data)
+        if not samples:
+            raise ValueError("samples must be a non-empty sequence")
+        # The box plays a fixed-length buffer, so resample to ARB_POINTS.
+        data = self.samples_to_int16(self._resample(samples, self.ARB_POINTS))
+        header = (f'C{channel}:WVDT WVNM,{clean},LENGTH,{len(data)}B,'
+                  f'TYPE,6,WAVEDATA,')
+        # The ~32 KB block needs write headroom, and the box must finish storing
+        # before the next command or its USBTMC endpoint can wedge.
+        old_to = self.inst.timeout
+        self.inst.timeout = max(old_to or 0, 20000)
+        try:
+            self.write_raw_oneshot(header.encode('latin1') + data)
+        finally:
+            self.inst.timeout = old_to
         return clean
 
     def select_arb(self, channel, name):
