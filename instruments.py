@@ -23,10 +23,10 @@ than one unit of the same model is connected):
 The DC power supply behind the CP2102 USB-UART bridge uses serial transport
 via pyserial (NOT USB-TMC); see SerialDCSupply below.
 """
+import re
 import time
 import struct
 import threading
-import pyvisa
 
 
 # --------------------------------------------------------------------------
@@ -38,10 +38,16 @@ _RM_LOCK = threading.Lock()
 
 
 def get_resource_manager():
-    """Process-wide PyVISA ResourceManager (pyvisa-py backend)."""
+    """Process-wide PyVISA ResourceManager (pyvisa-py backend).
+
+    pyvisa is imported lazily so that merely importing this module (e.g. for the
+    pure waveform/preset logic, or the hardware-free editor demo) does not
+    require pyvisa to be installed -- it's only needed to actually open a device.
+    """
     global _RM
     with _RM_LOCK:
         if _RM is None:
+            import pyvisa
             _RM = pyvisa.ResourceManager('@py')
         return _RM
 
@@ -92,6 +98,12 @@ class VisaInstrument:
         self.inst.timeout = self.TIMEOUT_MS
         self.inst.read_termination = '\n'
         self.inst.write_termination = '\n'
+        # Flush any stale device output (e.g. an unread binary CURVE? response
+        # from a previous run) so the first query doesn't read garbage.
+        try:
+            self.inst.clear()
+        except Exception:
+            pass
         self.idn = self.inst.query('*IDN?').strip()
         self._post_open()
 
@@ -115,6 +127,39 @@ class VisaInstrument:
 
     def read_raw(self):
         return self.inst.read_raw()
+
+    def write_raw(self, data):
+        """Write raw bytes verbatim (no termination/encoding munging).
+
+        Needed for commands that carry binary payloads, e.g. the 4055B's
+        WVDT arbitrary-waveform upload where sample bytes follow the ASCII
+        header directly.
+        """
+        return self.inst.write_raw(data)
+
+    def write_raw_oneshot(self, data):
+        """Write a large binary payload as ONE USBTMC Bulk-OUT message.
+
+        pyvisa-py's USBTMC writer wraps every wMaxPacketSize-sized slice
+        (64 bytes on this bench) in its own BulkOutMessage header, which
+        corrupts large binary writes -- a 32 KB arb upload gets hundreds of
+        12-byte headers injected mid-data, so the waveform stores as garbage
+        and the endpoint can wedge. Temporarily raise the endpoint's
+        wMaxPacketSize so the whole payload goes out as a single USBTMC
+        message (libusb still packetizes at the USB layer). Falls back to a
+        plain write_raw if the backend internals differ.
+        """
+        try:
+            sess = self.inst.visalib.sessions[self.inst.session]
+            ep = sess.interface.usb_send_ep
+        except (AttributeError, KeyError, TypeError):
+            return self.inst.write_raw(data)
+        old = ep.wMaxPacketSize
+        ep.wMaxPacketSize = max(old, len(data) + 64)
+        try:
+            return self.inst.write_raw(data)
+        finally:
+            ep.wMaxPacketSize = old
 
     def ask(self, command):
         """Write a command and return its response (newline-stripped)."""
@@ -260,10 +305,12 @@ class TekMSO24(VisaInstrument):
             return None
 
     def get_all_measurements(self, channel):
-        return {
-            meas.lower(): self.measure(meas, channel)
-            for meas in ('FREQ', 'PERIOD', 'MEAN', 'PK2PK', 'RMS', 'AMPLITUDE')
-        }
+        # The MSO24 frequency measurement token is FREQUENCY -- 'FREQ' is
+        # silently accepted but returns a garbage value (~2 Hz). Keys stay
+        # short for callers. (Root cause of the GUI's frequency issue.)
+        types = (('freq', 'FREQUENCY'), ('period', 'PERIOD'), ('mean', 'MEAN'),
+                 ('pk2pk', 'PK2PK'), ('rms', 'RMS'), ('amplitude', 'AMPLITUDE'))
+        return {key: self.measure(scpi, channel) for key, scpi in types}
 
     def get_waveform(self, channel):
         """Acquire a channel waveform. Returns {'t', 'v', 'dt', 'npts'}."""
@@ -282,9 +329,19 @@ class TekMSO24(VisaInstrument):
         time.sleep(0.2)
         raw_data = self.read_raw()
 
-        # IEEE 488.2 definite-length block: '#<N><length><data>'
-        header_len = 2 + int(chr(raw_data[1]))
-        data_bytes = raw_data[header_len:-1]
+        # IEEE 488.2 definite-length block: '#<N><N-digit byte count><data>'.
+        # Parse the declared length (robust to a trailing newline or none) and
+        # complete the read if the block spans more than one chunk.
+        ndig = int(chr(raw_data[1]))
+        nbytes = int(raw_data[2:2 + ndig])
+        start = 2 + ndig
+        while len(raw_data) < start + nbytes:
+            more = self.read_raw()
+            if not more:
+                break
+            raw_data += more
+        data_bytes = raw_data[start:start + nbytes]
+        data_bytes = data_bytes[:len(data_bytes) // 2 * 2]   # whole int16 samples
 
         samples = struct.unpack(f'>{len(data_bytes)//2}h', data_bytes)
         voltages = [(s - yoff) * ymult + yzero for s in samples]
@@ -309,9 +366,44 @@ class BK4055B(VisaInstrument):
     """
     VID = 0xf4ec
     PID = 0xee38
-    TIMEOUT_MS = 2000
+    # 2 s proved too tight for BSWV? read-back right after a multi-parameter
+    # write (VI_ERROR_TMO seen on the bench, 2026-06-11).
+    TIMEOUT_MS = 5000
 
     WAVEFORMS = ('SINE', 'SQUARE', 'RAMP', 'PULSE', 'NOISE', 'ARB', 'DC')
+
+    # BSWV keys whose values are numeric (carry a unit suffix on read-back).
+    # WVTP and any other key are kept as raw strings by get_basic_wave_dict.
+    _BSWV_NUMERIC = (
+        'FRQ', 'PERI', 'AMP', 'AMPVRMS', 'OFST', 'HLEV', 'LLEV',
+        'PHSE', 'DUTY', 'SYM', 'RISE', 'FALL', 'DLY', 'WIDTH',
+    )
+
+    @staticmethod
+    def _fmt_param(value):
+        """Format a numeric SCPI parameter the firmware parses reliably.
+
+        The 4055B mis-parses some decimal-suffixed values: 'DUTY,50.0' lands
+        as 5% duty (bench-verified 2026-06-11; the box appears to read the
+        digits in 0.01% units). Send plain decimal notation with no trailing
+        '.0' and no scientific exponent: 50.0 -> '50', 1.68e-08 ->
+        '0.0000000168'. Non-floats pass through unchanged.
+        """
+        if isinstance(value, float):
+            return f'{value:.12f}'.rstrip('0').rstrip('.') or '0'
+        return str(value)
+
+    @staticmethod
+    def _strip_unit(value):
+        """Parse a BSWV/OUTP numeric value, dropping any unit suffix.
+
+        Values come back like '100HZ', '0.01S', '2V', '1.41421Vrms'. Leading
+        sign, digits, decimal point and exponent form the number; everything
+        after is the unit. Returns a float, or the original string if it does
+        not start with a number.
+        """
+        m = re.match(r'[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?', value.strip())
+        return float(m.group()) if m else value
 
     def set_waveform(self, channel, wave):
         if wave.upper() not in self.WAVEFORMS:
@@ -319,20 +411,206 @@ class BK4055B(VisaInstrument):
         self.write(f'C{channel}:BSWV WVTP,{wave.upper()}')
 
     def set_frequency(self, channel, freq_hz):
-        self.write(f'C{channel}:BSWV FRQ,{freq_hz}')
+        self.write(f'C{channel}:BSWV FRQ,{self._fmt_param(freq_hz)}')
 
     def set_amplitude_vpp(self, channel, amp_vpp):
-        self.write(f'C{channel}:BSWV AMP,{amp_vpp}')
+        self.write(f'C{channel}:BSWV AMP,{self._fmt_param(amp_vpp)}')
 
     def set_offset(self, channel, offset_v):
-        self.write(f'C{channel}:BSWV OFST,{offset_v}')
+        self.write(f'C{channel}:BSWV OFST,{self._fmt_param(offset_v)}')
+
+    def set_basic_wave(self, channel, **params):
+        """Set several basic-wave parameters in one command.
+
+        Keys are BSWV parameter names (case-insensitive), e.g.
+        set_basic_wave(1, WVTP='SINE', FRQ=1000, AMP=2, OFST=0). Pushing them
+        together is one bus round-trip rather than one per setter.
+        """
+        if not params:
+            return
+        if 'WVTP' in {k.upper() for k in params}:
+            wave = next(v for k, v in params.items() if k.upper() == 'WVTP')
+            if str(wave).upper() not in self.WAVEFORMS:
+                raise ValueError(f"Waveform must be one of {self.WAVEFORMS}")
+        body = ','.join(f'{k.upper()},{self._fmt_param(v)}'
+                        for k, v in params.items())
+        self.write(f'C{channel}:BSWV {body}')
 
     def set_output(self, channel, on):
         self.write(f'C{channel}:OUTP {"ON" if on else "OFF"}')
 
+    def set_output_full(self, channel, on, load=None, polarity=None):
+        """Set output state plus optional load and polarity in one command.
+
+        load: a resistance in ohms (e.g. 50) or 'HZ' for high impedance.
+        polarity: 'NOR' (normal) or 'INVT' (inverted).
+        """
+        parts = ['ON' if on else 'OFF']
+        if load is not None:
+            parts.append(f'LOAD,{load}')
+        if polarity is not None:
+            parts.append(f'PLRT,{polarity.upper()}')
+        self.write(f'C{channel}:OUTP {",".join(parts)}')
+
+    def set_load_polarity(self, channel, load=None, polarity=None):
+        """Set output load and/or polarity WITHOUT changing the on/off state.
+
+        The SDG dialect accepts OUTP with only LOAD/PLRT arguments, leaving the
+        output state untouched (e.g. 'C1:OUTP LOAD,50'). Used by the GUI so
+        Apply can configure the channel while a separate button gates the
+        output.
+        """
+        parts = []
+        if load is not None:
+            parts.append(f'LOAD,{load}')
+        if polarity is not None:
+            parts.append(f'PLRT,{polarity.upper()}')
+        if parts:
+            self.write(f'C{channel}:OUTP {",".join(parts)}')
+
     def get_basic_wave(self, channel):
         """Raw query of the current basic-wave settings on a channel."""
         return self.ask(f'C{channel}:BSWV?')
+
+    def get_basic_wave_dict(self, channel):
+        """Parse the current basic-wave settings into a dict.
+
+        The instrument echoes e.g.
+            C1:BSWV WVTP,SINE,FRQ,100HZ,PERI,0.01S,AMP,2V,OFST,0V,...
+        The leading 'C1:BSWV ' echo is stripped, the remainder split into
+        KEY,VALUE pairs; numeric values (see _BSWV_NUMERIC) are converted to
+        float with their unit suffix removed. WVTP and unknown keys are kept as
+        raw strings. Tolerant of the variable, wave-type-dependent key list.
+        """
+        raw = self.get_basic_wave(channel)
+        body = raw.split(' ', 1)[1] if ' ' in raw else raw
+        tokens = [t for t in body.split(',') if t != '']
+        out = {}
+        for key, value in zip(tokens[0::2], tokens[1::2]):
+            key = key.upper()
+            out[key] = self._strip_unit(value) if key in self._BSWV_NUMERIC else value
+        return out
+
+    def get_output_dict(self, channel):
+        """Parse output state into {'state': bool, 'load': str, 'polarity': str}.
+
+        The instrument echoes e.g. 'C1:OUTP ON,LOAD,HZ,PLRT,NOR'. Load is kept
+        as a string ('HZ' or a numeric ohm value like '50').
+        """
+        raw = self.ask(f'C{channel}:OUTP?')
+        body = raw.split(' ', 1)[1] if ' ' in raw else raw
+        tokens = [t for t in body.split(',') if t != '']
+        state = tokens[0].upper() == 'ON' if tokens else False
+        pairs = dict(zip(tokens[1::2], tokens[2::2]))
+        return {
+            'state': state,
+            'load': pairs.get('LOAD', 'HZ'),
+            'polarity': pairs.get('PLRT', 'NOR'),
+        }
+
+    # -- arbitrary waveforms -------------------------------------------------
+
+    ARB_MAX_POINTS = 16384  # editor design cap
+    ARB_POINTS = 16384      # the 4055B user-arb length (bench-verified
+                            # 2026-06-16); uploads are resampled to exactly
+                            # this -- a shorter upload plays into a partly-empty
+                            # buffer (low amplitude / distorted output).
+
+    @staticmethod
+    def _resample(samples, n):
+        """Circularly resample a periodic waveform to n points (linear)."""
+        m = len(samples)
+        if m == n:
+            return list(samples)
+        if m == 0:
+            return [0.0] * n
+        if m == 1:
+            return [float(samples[0])] * n
+        out = []
+        for i in range(n):
+            x = i * m / n              # phase in input samples [0, m)
+            lo = int(x) % m
+            frac = x - int(x)
+            hi = (lo + 1) % m
+            out.append(samples[lo] * (1 - frac) + samples[hi] * frac)
+        return out
+
+    @staticmethod
+    def samples_to_int16(samples):
+        """Normalise float samples to full-scale signed 16-bit LE bytes.
+
+        Values are scaled so the largest |sample| maps to full scale when any
+        |sample| exceeds 1.0; otherwise [-1, 1] maps directly. Full scale is
+        +/-32767 (symmetric), little-endian two's complement per the Siglent
+        SDG arb format.
+        """
+        if not samples:
+            raise ValueError("samples must be a non-empty sequence")
+        peak = max(abs(float(s)) for s in samples)
+        scale = 32767.0 / peak if peak > 1.0 else 32767.0
+        out = bytearray()
+        for s in samples:
+            v = int(round(float(s) * scale))
+            v = max(-32768, min(32767, v))
+            out += struct.pack('<h', v)
+        return bytes(out)
+
+    def upload_arb(self, channel, name, samples, freq_hz=None, amp_vpp=None,
+                   offset_v=None, phase_deg=None):
+        """Upload an arbitrary waveform to the instrument's user memory.
+
+        Sends ``C<n>:WVDT WVNM,<name>,LENGTH,<bytes>B,TYPE,6,WAVEDATA,<int16 LE>``
+        via write_raw (the bytes follow WAVEDATA, directly; not an IEEE block).
+        Bench-verified requirements on the 4055B (2026-06-16):
+          - LENGTH is REQUIRED, else the upload is silently discarded.
+          - the buffer length is fixed (ARB_POINTS); shorter uploads play into a
+            partly-empty buffer (tiny/distorted output), so we resample.
+          - TYPE,6 (16-bit) -- TYPE,5 stores but plays back near-zero.
+        Output level/rate are NOT stored; set them via set_basic_wave + select_arb
+        after uploading. freq/amp/offset/phase args are accepted but unused.
+
+        name is sanitised to [A-Za-z0-9_], max 16 chars; returns the clean name.
+        """
+        clean = re.sub(r'[^A-Za-z0-9_]', '_', str(name))[:16]
+        if not clean:
+            raise ValueError(f"unusable arb name {name!r}")
+        if not samples:
+            raise ValueError("samples must be a non-empty sequence")
+        # The box plays a fixed-length buffer, so resample to ARB_POINTS.
+        data = self.samples_to_int16(self._resample(samples, self.ARB_POINTS))
+        header = (f'C{channel}:WVDT WVNM,{clean},LENGTH,{len(data)}B,'
+                  f'TYPE,6,WAVEDATA,')
+        # The ~32 KB block needs write headroom, and the box must finish storing
+        # before the next command or its USBTMC endpoint can wedge.
+        old_to = self.inst.timeout
+        self.inst.timeout = max(old_to or 0, 20000)
+        try:
+            self.write_raw_oneshot(header.encode('latin1') + data)
+        finally:
+            self.inst.timeout = old_to
+        return clean
+
+    def select_arb(self, channel, name):
+        """Put a channel in ARB mode playing the named user waveform."""
+        self.write(f'C{channel}:BSWV WVTP,ARB')
+        self.write(f'C{channel}:ARWV NAME,{name}')
+
+    def get_arb_dict(self, channel):
+        """Parse 'C1:ARWV INDEX,2,NAME,wave1' -> {'index': 2, 'name': 'wave1'}.
+
+        Either key may be missing depending on firmware; absent keys are
+        returned as None.
+        """
+        raw = self.ask(f'C{channel}:ARWV?')
+        body = raw.split(' ', 1)[1] if ' ' in raw else raw
+        tokens = [t for t in body.split(',') if t != '']
+        pairs = {k.upper(): v for k, v in zip(tokens[0::2], tokens[1::2])}
+        index = pairs.get('INDEX')
+        try:
+            index = int(index) if index is not None else None
+        except ValueError:
+            pass
+        return {'index': index, 'name': pairs.get('NAME')}
 
 
 # --------------------------------------------------------------------------
@@ -395,6 +673,9 @@ if __name__ == '__main__':
         try:
             inst = cls()
             print(f"  IDN: {inst.idn}")
+            if isinstance(inst, BK4055B):
+                for ch in (1, 2):
+                    print(f"  CH{ch} BSWV: {inst.get_basic_wave_dict(ch)}")
             inst.close()
         except Exception as e:
             print(f"  {type(e).__name__}: {e}")
