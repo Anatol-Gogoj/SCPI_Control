@@ -31,6 +31,11 @@ _UNDO_DEPTH = 50
 # frequency is derived as 1/(span * factor) on upload.
 _UNIT_FACTORS = {'µs': 1e-6, 'ms': 1e-3, 's': 1.0}
 
+# Segment params edited in volts (shown x y_scale, stored normalized) so they
+# match the breakpoint Y / Y-axis units. Everything else (cycles, duty, sym,
+# phase, rise/fall) keeps its own unit.
+_VOLT_PARAMS = ('amp', 'offset')
+
 
 class ArbWaveformEditor(tk.Toplevel):
     def __init__(self, app, channel):
@@ -282,7 +287,9 @@ class ArbWaveformEditor(tk.Toplevel):
             if advanced and not adv:
                 continue
             ttk.Label(self.seg_param_frame, text=f"{label}:").grid(row=row, column=0, sticky='w')
-            var = tk.StringVar(value=str(params.get(key, default)))
+            raw = params.get(key, default)
+            shown = raw * self.y_scale if key in _VOLT_PARAMS else raw
+            var = tk.StringVar(value=f'{shown:g}')
             ent = ttk.Entry(self.seg_param_frame, width=8, textvariable=var)
             ent.grid(row=row, column=1, pady=1)
             ent.bind('<Return>', lambda e: self._apply_segment_params())
@@ -300,7 +307,12 @@ class ArbWaveformEditor(tk.Toplevel):
         if self._sel is None or self._sel >= len(self.recipe['segments']):
             return
         try:
-            params = {k: float(v.get()) for k, v in self.seg_param_vars.items()}
+            params = {}
+            for k, v in self.seg_param_vars.items():
+                val = float(v.get())
+                if k in _VOLT_PARAMS:        # volts -> normalized
+                    val = val / self.y_scale
+                params[k] = val
         except ValueError:
             return
         if params != (self.recipe['segments'][self._sel].get('params') or {}):
@@ -401,6 +413,7 @@ class ArbWaveformEditor(tk.Toplevel):
         self.y_scale = v
         self.yscale_var.set(f'{v:g}')
         self._refresh_tree()
+        self._load_segment_form()      # re-show amp/offset in the new volts
         self._redraw()
 
     def _x_max(self):
