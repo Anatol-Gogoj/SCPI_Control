@@ -26,6 +26,11 @@ _PAD = 12           # canvas inner padding (px)
 _MIN_SPP = 1 / 8    # min samples-per-pixel (max zoom: 8 px/sample)
 _UNDO_DEPTH = 50
 
+# X-axis time units (factor to seconds). The breakpoint X is real time in the
+# selected unit; the waveform's total span is one period, so the channel
+# frequency is derived as 1/(span * factor) on upload.
+_UNIT_FACTORS = {'µs': 1e-6, 'ms': 1e-3, 's': 1.0}
+
 
 class ArbWaveformEditor(tk.Toplevel):
     def __init__(self, app, channel):
@@ -45,7 +50,7 @@ class ArbWaveformEditor(tk.Toplevel):
         self.view_start = 0.0          # first visible sample index
         self.samples_per_px = 1.0      # zoom
         self.n_periods = 1
-        self.x_axis_time = False
+        self.time_unit = 'ms'         # X axis is real time in this unit
         self.y_scale = 10.0            # full-scale +/- volts (4055B max 20 Vpp HiZ)
         self._drag_idx = None          # breakpoint being dragged
         self._sel = None               # selected breakpoint index
@@ -107,7 +112,7 @@ class ArbWaveformEditor(tk.Toplevel):
         side.pack(side=tk.LEFT, fill='y')
         self.tree = ttk.Treeview(side, columns=('x', 'y', 'type'),
                                  show='headings', height=12, selectmode='browse')
-        for col, txt, w in (('x', 'X', 70), ('y', 'Y (V)', 70), ('type', 'To next', 80)):
+        for col, txt, w in (('x', 'X (ms)', 70), ('y', 'Y (V)', 70), ('type', 'To next', 80)):
             self.tree.heading(col, text=txt)
             self.tree.column(col, width=w, anchor='center')
         self.tree.pack(fill='y')
@@ -162,9 +167,12 @@ class ArbWaveformEditor(tk.Toplevel):
                           values=['1', '2', '3'])
         pc.pack(side=tk.LEFT)
         pc.bind('<<ComboboxSelected>>', lambda e: self._set_periods())
-        self.axis_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(view, text="X = time", variable=self.axis_var,
-                        command=self._toggle_axis).pack(side=tk.LEFT, padx=12)
+        ttk.Label(view, text="Time unit:").pack(side=tk.LEFT, padx=(12, 2))
+        self.unit_var = tk.StringVar(value=self.time_unit)
+        uc = ttk.Combobox(view, width=4, state='readonly', textvariable=self.unit_var,
+                          values=list(_UNIT_FACTORS.keys()))
+        uc.pack(side=tk.LEFT)
+        uc.bind('<<ComboboxSelected>>', lambda e: self._set_unit())
         ttk.Button(view, text="Undo", command=self.undo).pack(side=tk.RIGHT, padx=2)
         ttk.Button(view, text="Redo", command=self.redo).pack(side=tk.RIGHT, padx=2)
         self.hbar = ttk.Scrollbar(self, orient='horizontal', command=self._on_scroll)
@@ -398,16 +406,26 @@ class ArbWaveformEditor(tk.Toplevel):
     def _x_max(self):
         return self.recipe['breakpoints'][-1][0]
 
+    def _x0(self):
+        return self.recipe['breakpoints'][0][0]
+
+    def _xspan(self):
+        span = self._x_max() - self._x0()
+        return span if span > 0 else 1.0
+
+    def _duration_s(self):
+        """Played period in seconds = X span in the selected time unit."""
+        return self._xspan() * _UNIT_FACTORS[self.time_unit]
+
     def _update_dt_label(self):
-        freq = self.app._sg_get_float(self.channel, 'freq', 1000.0)
+        # The X span IS the played period; the channel frequency is derived
+        # from it on upload. Points = total samples (resolution).
         n = self.recipe['total_points']
-        if freq > 0:
-            # Points = total samples (resolution). The arb plays as ONE period
-            # at the channel frequency, so duration = 1/freq regardless of N;
-            # the effective sample rate is N*freq.
-            self.dt_label.config(
-                text=f"{n} samples  ·  1 period @ {freq:g} Hz = {1000.0 / freq:.3f} ms"
-                     f"  ·  {n * freq / 1e6:.3g} MSa/s")
+        dur_s = self._duration_s()
+        freq = 1.0 / dur_s if dur_s > 0 else 0.0
+        self.dt_label.config(
+            text=f"{n} samples  ·  period {self._xspan():g} {self.time_unit} "
+                 f"= {freq:g} Hz  ·  {n * freq / 1e6:.3g} MSa/s")
 
     def _fit_all(self):
         w = self._cw()
@@ -428,8 +446,10 @@ class ArbWaveformEditor(tk.Toplevel):
         self.n_periods = int(self.periods_var.get())
         self._fit_all()
 
-    def _toggle_axis(self):
-        self.x_axis_time = self.axis_var.get()
+    def _set_unit(self):
+        self.time_unit = self.unit_var.get()
+        self.tree.heading('x', text=f'X ({self.time_unit})')
+        self._refresh_tree()
         self._redraw()
 
     def _on_scroll(self, *args):
@@ -469,8 +489,12 @@ class ArbWaveformEditor(tk.Toplevel):
 
     def _bp_pixel(self, x_coord, y):
         """Pixel position of a breakpoint (drawn in the first period)."""
-        idx = x_coord / self._x_max() * len(self.samples)
+        idx = (x_coord - self._x0()) / self._xspan() * len(self.samples)
         return self._px(idx), self._py(y)
+
+    def _sample_to_xcoord(self, idx):
+        """Map a sample index (within one period) to its X time coordinate."""
+        return self._x0() + (idx / len(self.samples)) * self._xspan()
 
     # -- canvas drawing ----------------------------------------------------
     def _redraw(self):
@@ -533,12 +557,7 @@ class ArbWaveformEditor(tk.Toplevel):
             self.hbar.set(max(0.0, lo), min(1.0, hi))
 
     def _axis_text(self, sample_idx):
-        if self.x_axis_time:
-            freq = self.app._sg_get_float(self.channel, 'freq', 1000.0)
-            if freq > 0:
-                t = (sample_idx / len(self.samples)) * (1.0 / freq)
-                return f"{t * 1e3:.3g} ms"
-        return f"x={sample_idx / len(self.samples) * self._x_max():.3g}"
+        return f"{self._sample_to_xcoord(sample_idx):g} {self.time_unit}"
 
     # -- canvas interaction ------------------------------------------------
     def _hit_breakpoint(self, xp, yp):
@@ -560,7 +579,7 @@ class ArbWaveformEditor(tk.Toplevel):
             return
         # add a point at the clicked coordinate (within the period)
         idx = self._px_to_sample(evt.x) % len(self.samples)
-        x_coord = idx / len(self.samples) * self._x_max()
+        x_coord = self._sample_to_xcoord(idx)
         y = self._py_to_value(evt.y)
         try:
             self._commit(ab.add_point(self.recipe, x_coord, y))
@@ -571,14 +590,15 @@ class ArbWaveformEditor(tk.Toplevel):
         if self._drag_idx is None:
             return
         idx = self._px_to_sample(evt.x) % len(self.samples)
-        x_coord = idx / len(self.samples) * self._x_max()
+        x_coord = self._sample_to_xcoord(idx)
         y = self._py_to_value(evt.y)
         # move without pushing another undo entry (snapshot taken on press)
         self.recipe = ab.move_point(self.recipe, self._drag_idx, x_coord, y)
         self.samples = ab.render_recipe(self.recipe)
         self._dirty = True
         self.readout.config(
-            text=f"point {self._drag_idx}:  x={x_coord:.3f}   y={y * self.y_scale:.3f} V")
+            text=f"point {self._drag_idx}:  x={x_coord:.3f} {self.time_unit}"
+                 f"   y={y * self.y_scale:.3f} V")
         self._refresh_tree()
         self.tree.selection_set(str(self._drag_idx))
         self._redraw()
@@ -719,7 +739,9 @@ class ArbWaveformEditor(tk.Toplevel):
             messagebox.showerror("Upload", "Enter a name first", parent=self)
             return
         try:
-            freq = app._sg_get_float(ch, 'freq', 1000.0)
+            # The X time span is the played period -> derive channel frequency.
+            dur_s = self._duration_s()
+            freq = 1.0 / dur_s if dur_s > 0 else 1000.0
             # Editor Y is full-scale +/-y_scale volts, so the channel amplitude
             # is 2*y_scale Vpp (offset 0); the normalized arb carries the shape.
             amp = 2.0 * self.y_scale
@@ -728,7 +750,7 @@ class ArbWaveformEditor(tk.Toplevel):
                                       amp_vpp=amp, offset_v=offset)
             app.sg.select_arb(ch, clean)
             if hasattr(app.sg, 'set_basic_wave'):
-                app.sg.set_basic_wave(ch, AMP=amp, OFST=offset)
+                app.sg.set_basic_wave(ch, FRQ=freq, AMP=amp, OFST=offset)
         except Exception as e:
             messagebox.showerror("Upload error", str(e), parent=self)
             return
@@ -741,6 +763,7 @@ class ArbWaveformEditor(tk.Toplevel):
         widgets['arb_name_var'].set(clean)
         widgets['arb_samples'] = list(self.samples)
         widgets['waveform'].set('ARB')
+        self._set_channel_value(ch, 'freq', freq)
         self._set_channel_value(ch, 'amp', amp)
         self._set_channel_value(ch, 'offset', offset)
         app._sg_update_visibility(ch)
