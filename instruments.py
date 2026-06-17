@@ -212,16 +212,22 @@ class BK894(VisaInstrument):
         self.write(f':FUNC:IMP {mode.upper()}')
 
     def set_frequency(self, freq_hz):
-        """Set test frequency (100 Hz to 200 kHz)."""
-        if not 100 <= freq_hz <= 200000:
-            raise ValueError("Frequency must be 100 Hz to 200 kHz")
+        """Set test frequency (100 Hz to 500 kHz)."""
+        if not 100 <= freq_hz <= 500000:
+            raise ValueError("Frequency must be 100 Hz to 500 kHz")
         self.write(f':FREQ {freq_hz}')
 
     def set_voltage(self, voltage):
-        """Set AC test voltage (0.01 to 2.0 V)."""
+        """Set AC test voltage (0.01 to 2.0 V).
+
+        The BK 894's AC test-level command is plain ``:VOLT`` (set and query),
+        bench-verified 2026-06-16 -- NOT ``:LEV:VOLT`` nor the E4980A-style
+        ``:VOLT:LEV``; both are silently rejected on this unit. The meter
+        clamps the level at 2.0 V, so higher values are out of range.
+        """
         if not 0.01 <= voltage <= 2.0:
             raise ValueError("Voltage must be 0.01 to 2.0 V")
-        self.write(f':LEV:VOLT {voltage}')
+        self.write(f':VOLT {voltage}')
 
     def measure(self):
         """Return (primary, secondary, status). status 0 = good."""
@@ -233,6 +239,7 @@ class BK894(VisaInstrument):
         return {
             'mode': self.ask(':FUNC:IMP?'),
             'frequency': float(self.ask(':FREQ?')),
+            'voltage': float(self.ask(':VOLT?')),
         }
 
 
