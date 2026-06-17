@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 """
-Lab Instrument Control GUI
-Multi-instrument control with CSV data logging
+Lab Instrument Control GUI.
+
+Tabbed Tk interface for the bench instruments (auto-connects on launch; each
+tab has a Reconnect button):
+  - LCR Meter (BK 894)
+  - Oscilloscope (Tektronix MSO24)
+  - Signal Generator (BK 4055B): per-channel waveform / frequency / amplitude /
+    offset with an Apply-then-Output workflow, live preview, and presets.
+    Arbitrary-waveform creation is gated behind SG_ARB_ENABLED (off) until the
+    USB upload path is fixed -- see issue #20.
+  - Data Logging (CSV)
+
+A version readout is shown in the footer. Instrument drivers live in
+instruments.py; signal-gen presets in siggen_presets.py.
 """
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
