@@ -16,10 +16,12 @@ A version readout is shown in the footer. Instrument drivers live in
 instruments.py; signal-gen presets in siggen_presets.py.
 """
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, scrolledtext
 import csv
 import os
 import queue
+import subprocess
+import sys
 import time
 from datetime import datetime
 from instruments import BK894, TekMSO24, BK4055B
@@ -88,6 +90,15 @@ class InstrumentControlGUI:
         self.root = root
         self.root.title(f"Lab Instrument Control  —  {version_string()}")
         self.root.geometry("1000x750")
+
+        # Menu bar: Tools -> Update Software
+        menubar = tk.Menu(self.root)
+        tools_menu = tk.Menu(menubar, tearoff=0)
+        tools_menu.add_command(label="Update Software…",
+                               command=self.open_update_software)
+        menubar.add_cascade(label="Tools", menu=tools_menu)
+        self.root.config(menu=menubar)
+        self._updating = False
 
         # Instrument connections
         self.lcr = None
@@ -823,6 +834,118 @@ ANALYSIS:
                               foreground='red')
         self.status_bar.config(text=f"Sweep failed: {err}")
         messagebox.showerror("Sweep error", f"{err}\n\nPartial CSV (if any): {out_path}")
+
+    # ---- Software update (git pull + redeploy to the shared drive) ---------
+    def _find_update_script(self):
+        """Locate update_software.sh (deployed beside the app on the share)."""
+        here = os.path.dirname(os.path.abspath(__file__))
+        candidates = [
+            os.path.normpath(os.path.join(here, os.pardir, 'update_software.sh')),
+            '/mnt/shareDrive/_software/update_software.sh',
+        ]
+        for path in candidates:
+            if os.path.isfile(path):
+                return path
+        return None
+
+    def open_update_software(self):
+        """Pull the latest code and redeploy to the shared drive, then offer to
+        restart. Runs update_software.sh in a worker thread; output is streamed
+        to a dialog (queue-marshalled, never touching Tk off the main thread)."""
+        if self._updating:
+            return
+        script = self._find_update_script()
+        if not script:
+            messagebox.showerror(
+                "Update Software",
+                "Could not find update_software.sh.\n\nExpected it on the shared "
+                "drive at /mnt/shareDrive/_software/update_software.sh.")
+            return
+        if not messagebox.askyesno(
+                "Update Software",
+                "This pulls the latest code from GitHub, redeploys it to the "
+                "shared drive for all users, then offers to restart.\n\nContinue?"):
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Update Software")
+        win.geometry("720x430")
+        win.transient(self.root)
+        txt = scrolledtext.ScrolledText(win, wrap='word', font='TkFixedFont')
+        txt.pack(fill='both', expand=True, padx=8, pady=(8, 4))
+        txt.configure(state='disabled')
+        btns = tk.Frame(win)
+        btns.pack(fill='x', padx=8, pady=(0, 8))
+        close_btn = tk.Button(btns, text="Close", command=win.destroy, state='disabled')
+        close_btn.pack(side='right')
+        restart_btn = tk.Button(btns, text="Restart now", command=self._restart_app,
+                                state='disabled')
+        restart_btn.pack(side='right', padx=(0, 6))
+
+        q = queue.Queue()
+        self._updating = True
+        self.status_bar.config(text="Updating software…")
+        self._append_update_text(txt, f"$ bash {script}\n\n")
+        threading.Thread(target=self._update_worker, args=(script, q),
+                         daemon=True).start()
+        self.root.after(50, self._drain_update_queue, q, txt, close_btn, restart_btn)
+
+    def _update_worker(self, script, q):
+        """Background thread: run update_software.sh, stream output to the queue."""
+        try:
+            proc = subprocess.Popen(
+                ['bash', script], stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, bufsize=1)
+            for line in proc.stdout:
+                q.put(('line', line))
+            proc.wait()
+            q.put(('done', proc.returncode))
+        except Exception as e:
+            q.put(('line', f"\n[error launching update] {e}\n"))
+            q.put(('done', 1))
+
+    def _append_update_text(self, txt, s):
+        txt.configure(state='normal')
+        txt.insert('end', s)
+        txt.see('end')
+        txt.configure(state='disabled')
+
+    def _drain_update_queue(self, q, txt, close_btn, restart_btn):
+        """Main-thread poller: drain update output and update the dialog."""
+        final = False
+        rc = None
+        try:
+            while True:
+                kind, payload = q.get_nowait()
+                if kind == 'line':
+                    self._append_update_text(txt, payload)
+                elif kind == 'done':
+                    rc = payload
+                    final = True
+        except queue.Empty:
+            pass
+        if not final:
+            self.root.after(50, self._drain_update_queue, q, txt, close_btn, restart_btn)
+            return
+        self._updating = False
+        close_btn.config(state='normal')
+        if rc == 0:
+            self._append_update_text(
+                txt, "\n✓ Update complete. Restart to load the new version.\n")
+            self.status_bar.config(text="Update complete — restart to apply")
+            restart_btn.config(state='normal')
+        else:
+            self._append_update_text(
+                txt, f"\n✗ Update failed (exit {rc}). See output above.\n")
+            self.status_bar.config(text=f"Update failed (exit {rc})")
+
+    def _restart_app(self):
+        """Re-exec the GUI process to load freshly-updated code."""
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
     def create_scope_tab(self):
         """Create oscilloscope control tab"""
