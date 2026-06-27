@@ -517,11 +517,12 @@ class BK4055B(VisaInstrument):
 
     # -- arbitrary waveforms -------------------------------------------------
 
-    ARB_MAX_POINTS = 16384  # editor design cap
-    ARB_POINTS = 16384      # the 4055B user-arb length (bench-verified
-                            # 2026-06-16); uploads are resampled to exactly
-                            # this -- a shorter upload plays into a partly-empty
-                            # buffer (low amplitude / distorted output).
+    ARB_MAX_POINTS = 16384      # editor design cap / DDS table depth
+    ARB_POINTS = 16384          # legacy fixed DDS buffer length (TrueArb does
+                                # NOT need this -- kept for set_legacy callers)
+    ARB_DEFAULT_POINTS = 1024   # default TrueArb upload depth: a short buffer
+                                # (~2 KB) uploads fast and is far less likely to
+                                # wedge the USBTMC endpoint than a 32 KB DDS one.
 
     @staticmethod
     def _resample(samples, n):
@@ -562,40 +563,108 @@ class BK4055B(VisaInstrument):
             out += struct.pack('<h', v)
         return bytes(out)
 
-    def upload_arb(self, channel, name, samples, freq_hz=None, amp_vpp=None,
-                   offset_v=None, phase_deg=None):
-        """Upload an arbitrary waveform to the instrument's user memory.
+    def build_wvdt(self, channel, name, samples, points=None, freq_hz=None,
+                   amp_vpp=None, offset_v=None, phase_deg=None):
+        """Build the raw ``WVDT`` upload bytes (no I/O). Returns (clean, blob).
 
-        Sends ``C<n>:WVDT WVNM,<name>,LENGTH,<bytes>B,TYPE,6,WAVEDATA,<int16 LE>``
-        via write_raw (the bytes follow WAVEDATA, directly; not an IEEE block).
-        Bench-verified requirements on the 4055B (2026-06-16):
-          - LENGTH is REQUIRED, else the upload is silently discarded.
-          - the buffer length is fixed (ARB_POINTS); shorter uploads play into a
-            partly-empty buffer (tiny/distorted output), so we resample.
-          - TYPE,6 (16-bit) -- TYPE,5 stores but plays back near-zero.
-        Output level/rate are NOT stored; set them via set_basic_wave + select_arb
-        after uploading. freq/amp/offset/phase args are accepted but unused.
+        Uses the official SDG2000X/"X-series" form (Siglent SDG Programming
+        Guide PG02-E05x), which omits LENGTH and TYPE::
 
-        name is sanitised to [A-Za-z0-9_], max 16 chars; returns the clean name.
+            C<n>:WVDT WVNM,<name>,FREQ,<f>,AMPL,<a>,OFST,<o>,PHASE,<p>,WAVEDATA,<int16 LE>
+
+        The earlier ``LENGTH,<n>B,TYPE,6`` form was reverse-engineered around the
+        corrupted USB transport (issue #20), not the protocol -- the guide says
+        LENGTH "is not necessary for the X series" and its example sends no TYPE.
+        Sample bytes follow ``WAVEDATA,`` directly (not an IEEE block).
+
+        Split out from upload_arb so it can be unit-tested headless and verified
+        with ``test_arb_scope.py --readback`` without driving the bus.
         """
         clean = re.sub(r'[^A-Za-z0-9_]', '_', str(name))[:16]
         if not clean:
             raise ValueError(f"unusable arb name {name!r}")
         if not samples:
             raise ValueError("samples must be a non-empty sequence")
-        # The box plays a fixed-length buffer, so resample to ARB_POINTS.
-        data = self.samples_to_int16(self._resample(samples, self.ARB_POINTS))
-        header = (f'C{channel}:WVDT WVNM,{clean},LENGTH,{len(data)}B,'
-                  f'TYPE,6,WAVEDATA,')
-        # The ~32 KB block needs write headroom, and the box must finish storing
-        # before the next command or its USBTMC endpoint can wedge.
+        n = points if points is not None else min(len(samples),
+                                                  self.ARB_DEFAULT_POINTS)
+        n = max(8, min(int(n), self.ARB_MAX_POINTS))
+        data = self.samples_to_int16(self._resample(samples, n))
+        fields = [f'WVNM,{clean}']
+        if freq_hz is not None:
+            fields.append(f'FREQ,{self._fmt_param(freq_hz)}')
+        if amp_vpp is not None:
+            fields.append(f'AMPL,{self._fmt_param(amp_vpp)}')
+        if offset_v is not None:
+            fields.append(f'OFST,{self._fmt_param(offset_v)}')
+        if phase_deg is not None:
+            fields.append(f'PHASE,{self._fmt_param(phase_deg)}')
+        header = f'C{channel}:WVDT ' + ','.join(fields) + ',WAVEDATA,'
+        return clean, header.encode('latin1') + data
+
+    def upload_arb(self, channel, name, samples, freq_hz=None, amp_vpp=None,
+                   offset_v=None, phase_deg=None, points=None):
+        """Upload an arbitrary waveform to the instrument's user memory.
+
+        Defaults to a SHORT buffer (``ARB_DEFAULT_POINTS`` = 1024 points, ~2 KB)
+        in the spec-correct X-series WVDT form -- both to fit the box's dedicated
+        short-arb (TrueArb) path and because small uploads are far less likely to
+        wedge the pyvisa-py USBTMC endpoint than a 32 KB DDS upload (issue #20).
+        Pass ``points`` to override the resample depth (capped to ARB_MAX_POINTS).
+
+        Pair with ``set_sample_rate(channel, 'TARB', samples*freq)`` so the box
+        plays the exact buffer at the right rate, then ``select_arb``. Output
+        level can also be set via ``set_basic_wave``.
+
+        name is sanitised to [A-Za-z0-9_], max 16 chars; returns the clean name.
+        """
+        clean, blob = self.build_wvdt(channel, name, samples, points=points,
+                                      freq_hz=freq_hz, amp_vpp=amp_vpp,
+                                      offset_v=offset_v, phase_deg=phase_deg)
+        # Give the box headroom to finish storing before the next command, or
+        # its USBTMC endpoint can wedge.
         old_to = self.inst.timeout
         self.inst.timeout = max(old_to or 0, 20000)
         try:
-            self.write_raw_oneshot(header.encode('latin1') + data)
+            self.write_raw_oneshot(blob)
         finally:
             self.inst.timeout = old_to
         return clean
+
+    def set_sample_rate(self, channel, mode=None, value=None):
+        """Set the arb playback mode (DDS vs TrueArb) and/or sample rate.
+
+        ``C<n>:SRATE MODE,<DDS|TARB>,VALUE,<Sa/s>``. In TrueArb mode the box
+        plays the uploaded buffer point-by-point at <value> Sa/s, so the output
+        frequency = sample_rate / num_points -- this is the SDG2000X/4055B's
+        dedicated path for short custom arbs and avoids the DDS 16k resample.
+        The SDG2000X supports MODE and VALUE but not the INTER (interpolation)
+        parameter, so it is intentionally not exposed here.
+        """
+        parts = []
+        if mode is not None:
+            parts.append(f'MODE,{mode}')
+        if value is not None:
+            parts.append(f'VALUE,{self._fmt_param(value)}')
+        if not parts:
+            raise ValueError("set_sample_rate needs a mode and/or value")
+        self.write(f'C{channel}:SRATE ' + ','.join(parts))
+
+    def get_sample_rate_dict(self, channel):
+        """Parse 'C1:SRATE MODE,TARB,VALUE,1000000Sa/s,...' into a dict.
+
+        Returns {'mode': 'TARB'|'DDS'|None, 'value': float|None}.
+        """
+        raw = self.ask(f'C{channel}:SRATE?')
+        body = raw.split(' ', 1)[1] if ' ' in raw else raw
+        tokens = [t for t in body.split(',') if t != '']
+        pairs = {k.upper(): v for k, v in zip(tokens[0::2], tokens[1::2])}
+        value = pairs.get('VALUE')
+        if value is not None:
+            try:
+                value = self._strip_unit(value)
+            except Exception:
+                pass
+        return {'mode': pairs.get('MODE'), 'value': value}
 
     def select_arb(self, channel, name):
         """Put a channel in ARB mode playing the named user waveform."""
