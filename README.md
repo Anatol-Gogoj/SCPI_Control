@@ -93,6 +93,17 @@ For a headless smoke test of the transport stack:
 
 This lists all PyVISA-visible USB-TMC resources, then instantiates each known class and prints its `*IDN?` response.
 
+## Webcam tab
+
+The **Webcam** tab provides live preview plus snapshot, interval, and stepped capture for a USB (UVC/V4L2) camera:
+
+- **Live preview** at ~20 fps with an optional variance-of-Laplacian focus score overlay.
+- **Snapshot** saves the current frame (timestamped) to the chosen folder.
+- **Interval capture** saves a frame every *N* seconds (optionally for a fixed count).
+- **Stepped capture** steps a signal-generator parameter (CH1/CH2 DC offset or amplitude) from start→stop by a step, dwells, and captures a frame at each value — useful for characterizing something optical vs. drive level. It can also log a `*_focus.csv` of the focus score per step. (A dedicated DC supply isn't wired yet — see `SerialDCSupply` stub / issue #3 — so the sweep drives the signal generator.)
+
+Capture needs `opencv-python-headless`, `Pillow`, and `numpy` (in `requirements.txt`); the tab degrades to an install hint if they're missing. Capture logic lives in `webcam.py` (device probing, focus metric, filename/step planning are pure and headless-tested in `test_webcam.py`); the Tk tab is in `gui.py`.
+
 ## Adding a new instrument
 
 1. Look up its USB VID/PID (`lsusb` or `dmesg`).
