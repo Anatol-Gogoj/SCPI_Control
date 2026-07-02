@@ -29,6 +29,7 @@ from siggen_presets import SignalGenPresetStore
 from arb_editor import ArbWaveformEditor
 from waveform_render import unit_waveform, scale_waveform
 from version import version_string
+import webcam
 import threading
 
 # ---- Signal generator field rules -----------------------------------------
@@ -115,7 +116,19 @@ class InstrumentControlGUI:
         # Signal-generator state
         self.sg_channel_widgets = {}
         self.sg_presets = SignalGenPresetStore()
-        
+
+        # Webcam state (worker thread + thread-safe UI queue, like the sweep)
+        self.cam = None
+        self.cam_previewing = False
+        self.cam_preview_job = None
+        self.cam_last_frame = None        # last RGB frame (numpy) for snapshots
+        self.cam_photo = None             # keep a ref so Tk doesn't GC the image
+        self.cam_interval_job = None
+        self.cam_capture_index = 0
+        self.cam_seq_running = False
+        self.cam_seq_thread = None
+        self.cam_seq_queue = queue.Queue()
+
         # Create notebook (tabbed interface)
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill='both', expand=True, padx=10, pady=10)
@@ -125,6 +138,7 @@ class InstrumentControlGUI:
         self.create_scope_tab()
         self.create_sg_tab()
         self.create_logging_tab()
+        self.create_webcam_tab()
         
         # Footer: status bar (left, stretches) + version readout (right)
         footer = tk.Frame(root)
@@ -135,9 +149,23 @@ class InstrumentControlGUI:
                                  relief=tk.SUNKEN, anchor=tk.E, padx=8)
         version_label.pack(side=tk.RIGHT)
         
+        # Clean up the camera (and any capture loop) on window close.
+        self.root.protocol('WM_DELETE_WINDOW', self._on_app_close)
+
         # Auto-connect on startup
         self.root.after(100, self.auto_connect)
-    
+
+    def _on_app_close(self):
+        """Release the webcam and stop capture loops before exiting."""
+        try:
+            self.cam_seq_running = False
+            self.cam_stop_preview()
+            if self.cam is not None:
+                self.cam.close()
+        except Exception:
+            pass
+        self.root.destroy()
+
     def auto_connect(self):
         """Attempt to connect to instruments on startup"""
         try:
@@ -2090,6 +2118,394 @@ ANALYSIS:
             self.log_text.config(state='disabled')
         
         self.root.after(0, update)
+
+    # ==================== Webcam tab ====================
+    def create_webcam_tab(self):
+        """USB webcam: live preview, snapshot, interval + stepped capture."""
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="Webcam")
+
+        ok, reason = webcam.deps_available()
+        if not ok:
+            msg = ("Webcam capture needs OpenCV, Pillow and numpy.\n\n"
+                   f"({reason})\n\n"
+                   "Install on the bench, then relaunch:\n"
+                   "    pip install opencv-python-headless Pillow numpy\n"
+                   "or use Tools > Update Software (they're in requirements.txt).")
+            tk.Label(tab, text=msg, justify=tk.LEFT, padx=20, pady=20,
+                     fg='#a00').pack(anchor='w')
+            return
+
+        # --- device + preview controls ---
+        top = ttk.Frame(tab, padding=8)
+        top.pack(fill='x')
+        ttk.Label(top, text="Camera:").pack(side=tk.LEFT)
+        self.cam_index_var = tk.StringVar()
+        self.cam_combo = ttk.Combobox(top, width=8, state='readonly',
+                                      textvariable=self.cam_index_var)
+        self.cam_combo.pack(side=tk.LEFT, padx=4)
+        ttk.Button(top, text="Refresh", command=self.cam_refresh_devices).pack(side=tk.LEFT)
+        self.cam_preview_btn = ttk.Button(top, text="Start Preview",
+                                          command=self.cam_toggle_preview)
+        self.cam_preview_btn.pack(side=tk.LEFT, padx=8)
+        ttk.Button(top, text="Snapshot", command=self.cam_snapshot).pack(side=tk.LEFT)
+        self.cam_focus_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(top, text="Show focus score",
+                        variable=self.cam_focus_var).pack(side=tk.LEFT, padx=8)
+
+        # --- preview image ---
+        self.cam_view = tk.Label(tab, bg='black', width=80, height=24,
+                                 anchor='center',
+                                 text="(preview off)", fg='gray')
+        self.cam_view.pack(fill='both', expand=True, padx=8, pady=4)
+
+        # --- output folder ---
+        out = ttk.Frame(tab, padding=(8, 0))
+        out.pack(fill='x')
+        ttk.Label(out, text="Save to:").pack(side=tk.LEFT)
+        default_dir = os.path.join(os.path.expanduser('~'), 'captures')
+        self.cam_dir_var = tk.StringVar(value=default_dir)
+        ttk.Entry(out, textvariable=self.cam_dir_var, width=44).pack(
+            side=tk.LEFT, padx=4)
+        ttk.Button(out, text="Browse", command=self._cam_browse_dir).pack(side=tk.LEFT)
+        ttk.Label(out, text="Prefix:").pack(side=tk.LEFT, padx=(10, 0))
+        self.cam_prefix_var = tk.StringVar(value='cap')
+        ttk.Entry(out, textvariable=self.cam_prefix_var, width=12).pack(
+            side=tk.LEFT, padx=4)
+
+        # --- interval capture ---
+        iv = ttk.LabelFrame(tab, text="Interval capture", padding=8)
+        iv.pack(fill='x', padx=8, pady=4)
+        ttk.Label(iv, text="Every").pack(side=tk.LEFT)
+        self.cam_interval_var = tk.StringVar(value='5')
+        ttk.Entry(iv, textvariable=self.cam_interval_var, width=7).pack(side=tk.LEFT, padx=4)
+        ttk.Label(iv, text="s,  count (0 = until stopped):").pack(side=tk.LEFT)
+        self.cam_count_var = tk.StringVar(value='0')
+        ttk.Entry(iv, textvariable=self.cam_count_var, width=7).pack(side=tk.LEFT, padx=4)
+        self.cam_interval_btn = ttk.Button(iv, text="Start interval",
+                                           command=self.cam_toggle_interval)
+        self.cam_interval_btn.pack(side=tk.LEFT, padx=8)
+
+        # --- stepped (voltage) capture via the signal generator ---
+        st = ttk.LabelFrame(tab, text="Stepped capture (sig-gen sweep)", padding=8)
+        st.pack(fill='x', padx=8, pady=4)
+        ttk.Label(st, text="SG CH").grid(row=0, column=0, sticky='w')
+        self.cam_sg_ch = ttk.Combobox(st, width=4, state='readonly', values=['1', '2'])
+        self.cam_sg_ch.set('1')
+        self.cam_sg_ch.grid(row=0, column=1, padx=2)
+        ttk.Label(st, text="param").grid(row=0, column=2, sticky='w', padx=(8, 0))
+        self.cam_sg_param = ttk.Combobox(st, width=12, state='readonly',
+                                         values=['DC offset (V)', 'Amplitude (Vpp)'])
+        self.cam_sg_param.set('DC offset (V)')
+        self.cam_sg_param.grid(row=0, column=3, padx=2)
+        ttk.Label(st, text="start").grid(row=1, column=0, sticky='w')
+        self.cam_step_start = tk.StringVar(value='0')
+        ttk.Entry(st, textvariable=self.cam_step_start, width=7).grid(row=1, column=1)
+        ttk.Label(st, text="stop").grid(row=1, column=2, sticky='w', padx=(8, 0))
+        self.cam_step_stop = tk.StringVar(value='5')
+        ttk.Entry(st, textvariable=self.cam_step_stop, width=7).grid(row=1, column=3)
+        ttk.Label(st, text="step").grid(row=1, column=4, sticky='w', padx=(8, 0))
+        self.cam_step_step = tk.StringVar(value='1')
+        ttk.Entry(st, textvariable=self.cam_step_step, width=7).grid(row=1, column=5)
+        ttk.Label(st, text="dwell s").grid(row=1, column=6, sticky='w', padx=(8, 0))
+        self.cam_step_dwell = tk.StringVar(value='1.0')
+        ttk.Entry(st, textvariable=self.cam_step_dwell, width=7).grid(row=1, column=7)
+        self.cam_seq_focus = tk.BooleanVar(value=True)
+        ttk.Checkbutton(st, text="log focus CSV", variable=self.cam_seq_focus).grid(
+            row=0, column=4, columnspan=2, sticky='w', padx=(8, 0))
+        self.cam_seq_btn = ttk.Button(st, text="Run sweep", command=self.cam_toggle_sequence)
+        self.cam_seq_btn.grid(row=0, column=6, columnspan=2, padx=8)
+        self.cam_seq_status = ttk.Label(st, text="", foreground='gray')
+        self.cam_seq_status.grid(row=2, column=0, columnspan=8, sticky='w', pady=(4, 0))
+
+        self.cam_refresh_devices()
+
+    def _cam_browse_dir(self):
+        d = filedialog.askdirectory(initialdir=self.cam_dir_var.get() or '.')
+        if d:
+            self.cam_dir_var.set(d)
+
+    def cam_refresh_devices(self):
+        idxs = webcam.list_cameras()
+        vals = [str(i) for i in idxs]
+        self.cam_combo['values'] = vals
+        if vals and not self.cam_index_var.get():
+            self.cam_index_var.set(vals[0])
+        # status_bar may not exist yet during initial tab construction.
+        if hasattr(self, 'status_bar'):
+            self.status_bar.config(
+                text=f"Found {len(vals)} camera(s)" if vals else "No cameras found")
+
+    def _cam_open_selected(self):
+        """Open (or reopen) the camera at the selected index. Returns the Camera."""
+        idx_str = self.cam_index_var.get()
+        if not idx_str:
+            raise RuntimeError("no camera selected (click Refresh)")
+        idx = int(idx_str)
+        if self.cam is not None and getattr(self.cam, 'index', None) == idx \
+                and self.cam.is_open:
+            return self.cam
+        if self.cam is not None:
+            self.cam.close()
+        self.cam = webcam.Camera(idx).open()
+        return self.cam
+
+    def cam_toggle_preview(self):
+        if self.cam_previewing:
+            self.cam_stop_preview()
+        else:
+            self.cam_start_preview()
+
+    def cam_start_preview(self):
+        try:
+            self._cam_open_selected()
+        except Exception as e:
+            messagebox.showerror("Webcam", f"Could not open camera:\n{e}")
+            return
+        self.cam_previewing = True
+        self.cam_preview_btn.config(text="Stop Preview")
+        self._cam_preview_tick()
+
+    def cam_stop_preview(self):
+        self.cam_previewing = False
+        if self.cam_preview_job is not None:
+            try:
+                self.root.after_cancel(self.cam_preview_job)
+            except Exception:
+                pass
+            self.cam_preview_job = None
+        if hasattr(self, 'cam_preview_btn'):
+            self.cam_preview_btn.config(text="Start Preview")
+
+    def _cam_preview_tick(self):
+        if not self.cam_previewing or self.cam is None:
+            return
+        frame = self.cam.read_rgb()
+        if frame is not None:
+            self.cam_last_frame = frame
+            self._cam_show(frame)
+        # ~20 fps; light enough for a lab tool
+        self.cam_preview_job = self.root.after(50, self._cam_preview_tick)
+
+    def _cam_show(self, rgb):
+        """Render an RGB numpy frame into the preview label (with optional
+        focus-score overlay)."""
+        from PIL import Image, ImageTk
+        img = Image.fromarray(rgb)
+        # Fit within the current view size, keeping aspect ratio.
+        maxw = max(self.cam_view.winfo_width() - 4, 320)
+        maxh = max(self.cam_view.winfo_height() - 4, 240)
+        img.thumbnail((maxw, maxh))
+        photo = ImageTk.PhotoImage(img)
+        text = ''
+        if self.cam_focus_var.get():
+            try:
+                text = f"focus {webcam.focus_score(rgb):.0f}"
+            except Exception:
+                text = ''
+        self.cam_view.config(image=photo, text=text, compound='center',
+                             fg='lime')
+        self.cam_photo = photo            # keep a ref
+
+    def _cam_save_frame(self, frame, value=None):
+        """Save a frame to the output folder; returns the path or None."""
+        import cv2
+        folder = self.cam_dir_var.get().strip() or '.'
+        fname = webcam.capture_filename(self.cam_prefix_var.get().strip() or 'cap',
+                                        self.cam_capture_index, value=value,
+                                        ts=datetime.now())
+        path = os.path.join(folder, fname)
+        os.makedirs(folder, exist_ok=True)
+        bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        if cv2.imwrite(path, bgr):
+            self.cam_capture_index += 1
+            return path
+        return None
+
+    def cam_snapshot(self):
+        frame = self.cam_last_frame
+        if frame is None and self.cam is not None:
+            frame = self.cam.read_rgb()
+        if frame is None:
+            messagebox.showerror("Webcam", "No frame to save (start preview first)")
+            return
+        path = self._cam_save_frame(frame)
+        self.status_bar.config(text=f"Saved {path}" if path else "Save failed")
+
+    # ---- interval capture (main-thread timer, uses the preview stream) ----
+    def cam_toggle_interval(self):
+        if self.cam_interval_job is not None:
+            self._cam_stop_interval()
+        else:
+            self._cam_start_interval()
+
+    def _cam_start_interval(self):
+        try:
+            interval = float(self.cam_interval_var.get())
+            count = int(self.cam_count_var.get())
+            if interval <= 0:
+                raise ValueError("interval must be > 0")
+        except ValueError as e:
+            messagebox.showerror("Interval capture", str(e))
+            return
+        if not self.cam_previewing:
+            self.cam_start_preview()
+        self._cam_interval_remaining = count if count > 0 else -1
+        self.cam_interval_btn.config(text="Stop interval")
+        self.status_bar.config(text="Interval capture running")
+        self._cam_interval_tick(int(interval * 1000))
+
+    def _cam_stop_interval(self):
+        if self.cam_interval_job is not None:
+            try:
+                self.root.after_cancel(self.cam_interval_job)
+            except Exception:
+                pass
+            self.cam_interval_job = None
+        if hasattr(self, 'cam_interval_btn'):
+            self.cam_interval_btn.config(text="Start interval")
+
+    def _cam_interval_tick(self, period_ms):
+        frame = self.cam_last_frame
+        if frame is not None:
+            path = self._cam_save_frame(frame)
+            if path:
+                self.status_bar.config(text=f"Interval saved {os.path.basename(path)}")
+            if self._cam_interval_remaining > 0:
+                self._cam_interval_remaining -= 1
+                if self._cam_interval_remaining == 0:
+                    self._cam_stop_interval()
+                    self.status_bar.config(text="Interval capture complete")
+                    return
+        self.cam_interval_job = self.root.after(
+            period_ms, self._cam_interval_tick, period_ms)
+
+    # ---- stepped capture: step a sig-gen param, capture at each value ----
+    def cam_toggle_sequence(self):
+        if self.cam_seq_running:
+            self.cam_seq_running = False
+            self.cam_seq_status.config(text="Stopping…", foreground='orange')
+        else:
+            self._cam_start_sequence()
+
+    def _cam_start_sequence(self):
+        if not self.sg:
+            messagebox.showerror("Stepped capture", "Signal generator not connected")
+            return
+        try:
+            values = webcam.frange(self.cam_step_start.get(),
+                                   self.cam_step_stop.get(),
+                                   self.cam_step_step.get())
+            dwell = float(self.cam_step_dwell.get())
+            if dwell < 0:
+                raise ValueError("dwell must be >= 0")
+        except ValueError as e:
+            messagebox.showerror("Stepped capture", str(e))
+            return
+        try:
+            self._cam_open_selected()
+        except Exception as e:
+            messagebox.showerror("Webcam", f"Could not open camera:\n{e}")
+            return
+        # The worker owns the camera; pause live preview to avoid double reads.
+        self.cam_stop_preview()
+        ch = int(self.cam_sg_ch.get())
+        key = 'OFST' if self.cam_sg_param.get().startswith('DC') else 'AMP'
+        csv_path = None
+        if self.cam_seq_focus.get():
+            csv_path = os.path.join(self.cam_dir_var.get().strip() or '.',
+                                    f"{self.cam_prefix_var.get().strip() or 'cap'}"
+                                    f"_focus.csv")
+        self.cam_seq_running = True
+        self.cam_seq_btn.config(text="Stop sweep")
+        self.cam_seq_status.config(text=f"Sweeping {len(values)} steps…",
+                                   foreground='black')
+        while not self.cam_seq_queue.empty():
+            try:
+                self.cam_seq_queue.get_nowait()
+            except queue.Empty:
+                break
+        self.cam_seq_thread = threading.Thread(
+            target=self._cam_seq_worker,
+            args=(ch, key, values, dwell, csv_path), daemon=True)
+        self.cam_seq_thread.start()
+        self.root.after(50, self._drain_cam_queue)
+
+    def _cam_seq_worker(self, ch, key, values, dwell, csv_path):
+        """Background: set the sig-gen param, dwell, capture, optional focus."""
+        rows = []
+        try:
+            for n, v in enumerate(values):
+                if not self.cam_seq_running:
+                    break
+                self.sg.set_basic_wave(ch, **{key: float(v)})
+                # dwell in small chunks so Stop stays responsive
+                end = time.monotonic() + dwell
+                while self.cam_seq_running and time.monotonic() < end:
+                    time.sleep(min(0.05, max(0, end - time.monotonic())))
+                if not self.cam_seq_running:
+                    break
+                frame = self.cam.read_rgb()
+                path, score = None, None
+                if frame is not None:
+                    path = self._cam_save_frame(frame, value=v)
+                    if csv_path is not None:
+                        try:
+                            score = webcam.focus_score(frame)
+                        except Exception:
+                            score = None
+                        rows.append((v, os.path.basename(path or ''), score))
+                self.cam_seq_queue.put(('step', n + 1, len(values), v, path, score))
+        except Exception as e:
+            self.cam_seq_queue.put(('error', str(e)))
+            return
+        if csv_path and rows:
+            try:
+                with open(csv_path, 'w', newline='') as f:
+                    w = csv.writer(f)
+                    w.writerow(['value', 'file', 'focus_score'])
+                    w.writerows(rows)
+            except Exception:
+                pass
+        self.cam_seq_queue.put(('done', len(values), csv_path))
+
+    def _drain_cam_queue(self):
+        final = False
+        try:
+            while True:
+                evt = self.cam_seq_queue.get_nowait()
+                kind = evt[0]
+                if kind == 'step':
+                    _, i, total, v, path, score = evt
+                    extra = f", focus {score:.0f}" if score is not None else ""
+                    self.cam_seq_status.config(
+                        text=f"step {i}/{total}: {v:g} -> "
+                             f"{os.path.basename(path) if path else 'no frame'}{extra}",
+                        foreground='black')
+                elif kind == 'done':
+                    _, total, csv_path = evt
+                    self.cam_seq_running = False
+                    self.cam_seq_btn.config(text="Run sweep")
+                    msg = f"Sweep complete: {total} steps"
+                    if csv_path:
+                        msg += f"; focus -> {os.path.basename(csv_path)}"
+                    self.cam_seq_status.config(text=msg, foreground='green')
+                    self.status_bar.config(text=msg)
+                    final = True
+                elif kind == 'error':
+                    self.cam_seq_running = False
+                    self.cam_seq_btn.config(text="Run sweep")
+                    self.cam_seq_status.config(text=f"Sweep failed: {evt[1]}",
+                                               foreground='red')
+                    final = True
+        except queue.Empty:
+            pass
+        if not final and self.cam_seq_running:
+            self.root.after(50, self._drain_cam_queue)
+        elif not final:
+            # stopped by user
+            self.cam_seq_btn.config(text="Run sweep")
+            self.cam_seq_status.config(text="Sweep stopped", foreground='orange')
 
 
 
