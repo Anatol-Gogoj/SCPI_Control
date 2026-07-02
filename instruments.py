@@ -140,14 +140,12 @@ class VisaInstrument:
     def write_raw_oneshot(self, data):
         """Write a large binary payload as ONE USBTMC Bulk-OUT message.
 
-        pyvisa-py's USBTMC writer wraps every wMaxPacketSize-sized slice
-        (64 bytes on this bench) in its own BulkOutMessage header, which
-        corrupts large binary writes -- a 32 KB arb upload gets hundreds of
-        12-byte headers injected mid-data, so the waveform stores as garbage
-        and the endpoint can wedge. Temporarily raise the endpoint's
-        wMaxPacketSize so the whole payload goes out as a single USBTMC
-        message (libusb still packetizes at the USB layer). Falls back to a
-        plain write_raw if the backend internals differ.
+        DIAGNOSTIC ONLY -- do not use in production paths. On the 4055B any
+        single USBTMC transfer longer than one 64-byte USB packet hard-wedges
+        the firmware (bench-verified 2026-07-02, even for pure-ASCII queries);
+        only a front-panel power cycle recovers it. Kept solely so
+        ``test_arb_usb_probe.py`` can demonstrate the wedge. For real uploads
+        use ``write_raw_single_packet``.
         """
         try:
             sess = self.inst.visalib.sessions[self.inst.session]
@@ -367,6 +365,22 @@ class BK4055B(VisaInstrument):
     SCPI syntax matches the Siglent SDG2000X series (which the 4055B is OEM-
     rebadged from). Channel index in SCPI is 1 or 2.
 
+    USB TRANSPORT LIMIT (firmware 1.01.01.33R3, bench-verified 2026-07-02):
+    the box hard-wedges on any USBTMC Bulk-OUT transfer spanning more than
+    one 64-byte USB packet -- even a padded pure-ASCII ``*IDN?`` -- and only
+    a front-panel power cycle recovers it. Chaining a command across several
+    single-packet USBTMC messages does NOT help: the firmware processes the
+    first message as the whole command and silently drops the continuations
+    (a 2 KB WVDT upload stores as its first ~24 data bytes). Net effect:
+    **USB commands are capped at 52 bytes** (64 minus the 12-byte USBTMC
+    header), so arb upload over USB is impossible and long text commands
+    must be split -- ``write`` raises rather than wedge, ``set_basic_wave``
+    auto-splits, ``upload_arb`` requires a LAN resource::
+
+        sg = BK4055B(resource='TCPIP0::<ip>::INSTR')   # or ::5025::SOCKET
+
+    Reads (Bulk-IN) are unaffected: multi-KB query responses work over USB.
+
     NOTE: command syntax is conservatively chosen to match the Siglent SDG
     programming manual; verify against the BK 4055B-specific manual before
     relying on edge-case behavior.
@@ -376,6 +390,25 @@ class BK4055B(VisaInstrument):
     # 2 s proved too tight for BSWV? read-back right after a multi-parameter
     # write (VI_ERROR_TMO seen on the bench, 2026-06-11).
     TIMEOUT_MS = 5000
+
+    # Max bytes (incl. the '\n' terminator) the firmware accepts per USB
+    # command: one 64-byte packet minus the 12-byte USBTMC header.
+    USB_MAX_CMD = 52
+
+    def _usb_transport(self):
+        """True when talking over USBTMC (where the 52-byte cap applies)."""
+        return getattr(self, 'resource', '').startswith('USB')
+
+    def write(self, command):
+        if self._usb_transport() and len(command) + 1 > self.USB_MAX_CMD:
+            raise ValueError(
+                f"SCPI command is {len(command) + 1} bytes incl. newline; the "
+                f"4055B USB firmware wedges on anything over "
+                f"{self.USB_MAX_CMD} (needs a front-panel power cycle). "
+                f"Split the command or connect via LAN. "
+                f"Offending command: {command[:60]!r}"
+            )
+        super().write(command)
 
     WAVEFORMS = ('SINE', 'SQUARE', 'RAMP', 'PULSE', 'NOISE', 'ARB', 'DC')
 
@@ -432,6 +465,12 @@ class BK4055B(VisaInstrument):
         Keys are BSWV parameter names (case-insensitive), e.g.
         set_basic_wave(1, WVTP='SINE', FRQ=1000, AMP=2, OFST=0). Pushing them
         together is one bus round-trip rather than one per setter.
+
+        Over USB the chain is auto-split into multiple BSWV commands of at
+        most USB_MAX_CMD bytes each (parameter order preserved, WVTP first as
+        passed) -- a single long chain like WVTP,SQUARE,...,DUTY,50,PHSE,0
+        exceeds the firmware's 52-byte USB command cap and would wedge the
+        box. Incremental BSWV sets are natively supported by the SDG dialect.
         """
         if not params:
             return
@@ -439,9 +478,22 @@ class BK4055B(VisaInstrument):
             wave = next(v for k, v in params.items() if k.upper() == 'WVTP')
             if str(wave).upper() not in self.WAVEFORMS:
                 raise ValueError(f"Waveform must be one of {self.WAVEFORMS}")
-        body = ','.join(f'{k.upper()},{self._fmt_param(v)}'
-                        for k, v in params.items())
-        self.write(f'C{channel}:BSWV {body}')
+        tokens = [f'{k.upper()},{self._fmt_param(v)}' for k, v in params.items()]
+        prefix = f'C{channel}:BSWV '
+        if not self._usb_transport():
+            self.write(prefix + ','.join(tokens))
+            return
+        # Greedily pack tokens into commands that fit the USB cap.
+        batch = []
+        for tok in tokens:
+            trial = prefix + ','.join(batch + [tok])
+            if batch and len(trial) + 1 > self.USB_MAX_CMD:
+                self.write(prefix + ','.join(batch))
+                batch = [tok]
+            else:
+                batch.append(tok)
+        if batch:
+            self.write(prefix + ','.join(batch))
 
     def set_output(self, channel, on):
         self.write(f'C{channel}:OUTP {"ON" if on else "OFF"}')
@@ -567,18 +619,20 @@ class BK4055B(VisaInstrument):
                    amp_vpp=None, offset_v=None, phase_deg=None):
         """Build the raw ``WVDT`` upload bytes (no I/O). Returns (clean, blob).
 
-        Uses the official SDG2000X/SDG6000X 16-bit-arb form (Siglent app note
-        "Building an Arb with 16-bit steps"), with EVERY header field present::
+        Uses the MINIMAL header -- the only form this firmware accepts::
 
-            C<n>:WVDT WVNM,<name>,FREQ,<f>,TYPE,8,AMPL,<a>,OFST,<o>,PHASE,<p>,WAVEDATA,<int16 LE>
+            C<n>:WVDT WVNM,<name>,WAVEDATA,<int16 LE>
 
-        The full field set is NOT optional over USBTMC: a minimal header
-        (``WVNM,<name>,WAVEDATA,``) hard-wedges the 4055B's SCPI parser
-        (bench-verified 2026-06-28 and 2026-07-02 -- the box stops answering
-        reads until a front-panel power cycle; the tinylabs SDG2000X library
-        gets away with the minimal form only over LAN). ``TYPE,8`` marks
-        16-bit sample data. Sample bytes follow ``WAVEDATA,`` directly (not an
-        IEEE block); no trailing terminator.
+        The full-field form from the Siglent 16-bit-arb app note
+        (``FREQ,...,TYPE,8,AMPL,...,OFST,...,PHASE,...``) is silently
+        REJECTED by the 4055B: the box stays alive but stores nothing
+        (bench-verified 2026-07-02; the tinylabs SDG2000X library uses the
+        minimal form for the same reason). Frequency, amplitude and offset
+        are set separately via ``SRATE``/``BSWV`` after ``select_arb``. The
+        ``freq_hz``/``amp_vpp``/``offset_v``/``phase_deg`` kwargs are
+        accepted for API compatibility but intentionally unused. Sample
+        bytes follow ``WAVEDATA,`` directly (not an IEEE block); no trailing
+        terminator.
 
         Split out from upload_arb so it can be unit-tested headless and verified
         with ``test_arb_scope.py --readback`` without driving the bus.
@@ -592,43 +646,49 @@ class BK4055B(VisaInstrument):
                                                   self.ARB_DEFAULT_POINTS)
         n = max(8, min(int(n), self.ARB_MAX_POINTS))
         data = self.samples_to_int16(self._resample(samples, n))
-        # Field order matches the Siglent example; all fields always sent.
-        fields = [
-            f'WVNM,{clean}',
-            f'FREQ,{self._fmt_param(freq_hz if freq_hz is not None else 1000)}',
-            'TYPE,8',
-            f'AMPL,{self._fmt_param(amp_vpp if amp_vpp is not None else 2.0)}',
-            f'OFST,{self._fmt_param(offset_v if offset_v is not None else 0)}',
-            f'PHASE,{self._fmt_param(phase_deg if phase_deg is not None else 0)}',
-        ]
-        header = f'C{channel}:WVDT ' + ','.join(fields) + ',WAVEDATA,'
+        header = f'C{channel}:WVDT WVNM,{clean},WAVEDATA,'
         return clean, header.encode('latin1') + data
 
     def upload_arb(self, channel, name, samples, freq_hz=None, amp_vpp=None,
                    offset_v=None, phase_deg=None, points=None):
         """Upload an arbitrary waveform to the instrument's user memory.
 
-        Defaults to a SHORT buffer (``ARB_DEFAULT_POINTS`` = 1024 points, ~2 KB)
-        in the spec-correct X-series WVDT form -- both to fit the box's dedicated
-        short-arb (TrueArb) path and because small uploads are far less likely to
-        wedge the pyvisa-py USBTMC endpoint than a 32 KB DDS upload (issue #20).
-        Pass ``points`` to override the resample depth (capped to ARB_MAX_POINTS).
+        REQUIRES A LAN RESOURCE. Over USB this firmware caps every command at
+        52 bytes: a one-message upload wedges the box (front-panel power cycle
+        to recover) and chained single-packet messages silently truncate the
+        waveform to its first ~24 data bytes (bench-verified 2026-07-02 via
+        ``WVDT?`` readback -- the name registers, the data does not). So this
+        method refuses to even try over USB. Open the box via LAN instead::
+
+            sg = BK4055B(resource='TCPIP0::<ip>::INSTR')
+
+        Defaults to a SHORT buffer (``ARB_DEFAULT_POINTS`` = 1024 points,
+        ~2 KB) in the minimal WVDT form (see ``build_wvdt``). Pass ``points``
+        to override the resample depth (capped to ARB_MAX_POINTS).
 
         Pair with ``set_sample_rate(channel, 'TARB', samples*freq)`` so the box
         plays the exact buffer at the right rate, then ``select_arb``. Output
-        level can also be set via ``set_basic_wave``.
+        level goes via ``set_basic_wave`` (the WVDT header cannot carry it --
+        the full-field form is rejected, see ``build_wvdt``).
 
         name is sanitised to [A-Za-z0-9_], max 16 chars; returns the clean name.
         """
+        if self._usb_transport():
+            raise RuntimeError(
+                "Arb upload over USB is impossible on this 4055B firmware: "
+                "USB commands are capped at 52 bytes (longer transfers wedge "
+                "the box; chained messages are silently truncated). Connect "
+                "the instrument via Ethernet and open it as "
+                "BK4055B(resource='TCPIP0::<ip>::INSTR')."
+            )
         clean, blob = self.build_wvdt(channel, name, samples, points=points,
                                       freq_hz=freq_hz, amp_vpp=amp_vpp,
                                       offset_v=offset_v, phase_deg=phase_deg)
-        # Give the box headroom to finish storing before the next command, or
-        # its USBTMC endpoint can wedge.
+        # Give the box headroom to finish storing before the next command.
         old_to = self.inst.timeout
         self.inst.timeout = max(old_to or 0, 20000)
         try:
-            self.write_raw_oneshot(blob)
+            self.write_raw(blob)
         finally:
             self.inst.timeout = old_to
         return clean

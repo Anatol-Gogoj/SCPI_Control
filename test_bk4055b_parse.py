@@ -143,10 +143,9 @@ def test_upload_arb_message():
     assert clean == 'my_wave_'                 # sanitised name returned
     assert len(sg.sent_raw) == 1
     msg = sg.sent_raw[0]
-    # Full official header (Siglent 16-bit-arb app note): every field always
-    # present, TYPE,8, no LENGTH. Minimal headers wedge the box over USBTMC.
-    header = (b'C1:WVDT WVNM,my_wave_,FREQ,1000,TYPE,8,'
-              b'AMPL,2,OFST,0,PHASE,0,WAVEDATA,')
+    # Minimal header only: the 4055B silently rejects the full-field
+    # app-note form (bench 2026-07-02) -- level/rate go via BSWV/SRATE.
+    header = b'C1:WVDT WVNM,my_wave_,WAVEDATA,'
     assert msg.startswith(header)
     assert b'LENGTH' not in msg
     payload = msg[len(header):]

@@ -36,28 +36,28 @@ def _split_wvdt(blob):
     return blob[:idx].decode('latin1'), blob[idx:]
 
 
-def test_wvdt_full_header_always_sent():
-    # Minimal headers (WVNM+WAVEDATA only) hard-wedge the 4055B over USBTMC
-    # (bench 2026-07-02); the official Siglent USB example always sends every
-    # field, in this order, with TYPE,8 (16-bit samples) and no LENGTH.
+def test_wvdt_minimal_header():
+    # The 4055B silently REJECTS the full-field app-note header
+    # (FREQ/TYPE/AMPL/OFST/PHASE) -- alive but nothing stored (bench
+    # 2026-07-02). Only the minimal form stores, matching the tinylabs lib.
     sg = FakeSG()
     _, blob = sg.build_wvdt(1, 'wave1', [0.0, 1.0, 0.0, -1.0], points=4)
     header, _ = _split_wvdt(blob)
-    assert header == ('C1:WVDT WVNM,wave1,FREQ,1000,TYPE,8,'
-                      'AMPL,2,OFST,0,PHASE,0,WAVEDATA,'), header
-    assert 'LENGTH' not in header, "X-series WVDT must omit LENGTH"
+    assert header == 'C1:WVDT WVNM,wave1,WAVEDATA,', header
+    assert 'LENGTH' not in header and 'TYPE' not in header
 
 
-def test_wvdt_explicit_fields():
+def test_wvdt_level_kwargs_not_in_header():
+    # freq/amp/offset/phase kwargs are API-compat no-ops: the firmware
+    # rejects any WVDT carrying them, so they must never reach the header.
     sg = FakeSG()
     _, blob = sg.build_wvdt(2, 'w', [0.0, 1.0], points=2,
                             freq_hz=2500.0, amp_vpp=4.0, offset_v=0.5,
                             phase_deg=90.0)
     header, _ = _split_wvdt(blob)
-    assert header.startswith('C2:WVDT WVNM,w,')
-    # _fmt_param strips trailing .0; TYPE,8 sits between FREQ and AMPL
-    assert 'FREQ,2500,TYPE,8,AMPL,4' in header, header
-    assert 'OFST,0.5' in header and 'PHASE,90' in header
+    assert header == 'C2:WVDT WVNM,w,WAVEDATA,', header
+    for tok in ('FREQ', 'AMPL', 'OFST', 'PHASE'):
+        assert tok not in header, header
 
 
 def test_payload_is_int16_le_fullscale():
@@ -115,6 +115,67 @@ def test_upload_arb_sends_one_raw_blob():
     assert name == 'wave1'
     assert len(sg.sent_raw) == 1, "upload should be a single raw write"
     assert sg.sent_raw[0].startswith(b'C1:WVDT WVNM,wave1')
+
+
+def test_upload_arb_refuses_usb():
+    # USB commands are capped at 52 bytes by the firmware (2026-07-02):
+    # longer transfers wedge the box, chained messages silently truncate.
+    # upload_arb must refuse rather than corrupt/wedge.
+    sg = FakeSG()
+    sg.resource = 'USB0::62700::60984::FAKE::0::INSTR'
+    try:
+        sg.upload_arb(1, 'w', [0.0, 1.0], points=8)
+        assert False, "upload_arb over USB must raise"
+    except RuntimeError as e:
+        assert 'LAN' in str(e) or 'TCPIP' in str(e)
+    assert not sg.sent_raw, "nothing may be written over USB"
+
+
+class FakeUSB(BK4055B):
+    """BK4055B on a fake USB resource, capturing inst.write (real write())."""
+    def __init__(self):
+        self.resource = 'USB0::62700::60984::FAKE::0::INSTR'
+        self.captured = []
+        self.inst = types.SimpleNamespace(timeout=2000,
+                                          write=self.captured.append)
+
+
+def test_write_guard_rejects_long_usb_command():
+    sg = FakeUSB()
+    sg.write('C1:BSWV FRQ,1000')                       # short: fine
+    assert sg.captured == ['C1:BSWV FRQ,1000']
+    long_cmd = 'C1:BSWV WVTP,SQUARE,FRQ,1000,AMP,2,OFST,0,DUTY,50,PHSE,0'
+    assert len(long_cmd) + 1 > BK4055B.USB_MAX_CMD
+    try:
+        sg.write(long_cmd)
+        assert False, "52+ byte USB command must raise, not wedge the box"
+    except ValueError as e:
+        assert 'wedge' in str(e)
+    assert len(sg.captured) == 1
+
+
+def test_set_basic_wave_autosplits_over_usb():
+    sg = FakeUSB()
+    sg.set_basic_wave(1, WVTP='SQUARE', FRQ=1000.0, AMP=2.0, OFST=0.0,
+                      DUTY=50.0, PHSE=0.0)
+    assert len(sg.captured) > 1, "long chain must split over USB"
+    rebuilt = []
+    for cmd in sg.captured:
+        assert cmd.startswith('C1:BSWV '), cmd
+        assert len(cmd) + 1 <= BK4055B.USB_MAX_CMD, f"too long: {cmd!r}"
+        rebuilt += cmd[len('C1:BSWV '):].split(',')
+    # every parameter delivered exactly once, order preserved, WVTP first
+    assert rebuilt == ['WVTP', 'SQUARE', 'FRQ', '1000', 'AMP', '2',
+                       'OFST', '0', 'DUTY', '50', 'PHSE', '0'], rebuilt
+
+
+def test_set_basic_wave_single_command_over_lan():
+    sg = FakeUSB()
+    sg.resource = 'TCPIP0::192.168.1.50::INSTR'
+    sg.set_basic_wave(1, WVTP='SQUARE', FRQ=1000.0, AMP=2.0, OFST=0.0,
+                      DUTY=50.0, PHSE=0.0)
+    assert sg.captured == ['C1:BSWV WVTP,SQUARE,FRQ,1000,AMP,2,OFST,0,'
+                           'DUTY,50,PHSE,0'], sg.captured
 
 
 def test_set_sample_rate_truearb():

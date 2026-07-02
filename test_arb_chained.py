@@ -1,55 +1,40 @@
 #!/usr/bin/env python3
 """
-Single-packet-per-message arb upload test for the BK 4055B.
+Arb upload acceptance test for the BK 4055B -- LAN transport.
 
-Bench findings 2026-07-02: the 4055B firmware hard-wedges on ANY USBTMC
-transfer that spans more than one 64-byte USB packet (even a padded *IDN?).
-Every working command ever sent fits one packet. So: chunk large payloads
-into USBTMC messages of <= 52 data bytes (12-byte header + 52 = exactly one
-64-byte packet), EOM only on the last message -- spec-legal continuation,
-and no transfer ever exceeds a single packet.
+Bench findings 2026-07-02 (firmware 1.01.01.33R3), all via USB probes +
+WVDT? readback:
+  * Any USBTMC Bulk-OUT transfer spanning more than one 64-byte USB packet
+    hard-wedges the box (even a padded pure-ASCII *IDN?); only a
+    front-panel power cycle recovers it.
+  * Chaining a command across single-packet USBTMC messages does NOT
+    reassemble: the first message is processed as the whole command and the
+    continuations are silently dropped (a 2 KB WVDT stored as 24 bytes).
+  * The full-field app-note WVDT header is silently rejected (alive, but
+    nothing stored); only the minimal WVNM,<name>,WAVEDATA, form stores.
+  => USB commands are capped at 52 bytes; arb upload REQUIRES LAN.
 
-pyvisa-py already chunks at usb_send_ep.wMaxPacketSize *data* bytes per
-message; temporarily lowering that attribute to 52 turns its stock writer
-into exactly the framing we need.
-
-Stages (aliveness-gated, stops at first wedge):
+This script verifies the production upload path end to end over a given
+resource, including a WVDT? readback byte-compare (aliveness or catalog
+presence alone is NOT success -- the name registers even when the data is
+truncated):
   1. baseline *IDN?
-  2. padded 70-byte *IDN? via 52-byte chunking (2 single-packet messages)
-  3. WVDT full header, 8 pts, single-packet chunked
-  4. WVDT 256 pts, then 1024 pts
-  5. STL? USER catalog, ARWV select, SRATE TARB round-trip
+  2. upload_arb 8 / 256 / 1024-pt sines; STL? catalog check after each
+  3. WVDT? readback of the 1024-pt wave; byte-diff vs what was sent
+  4. select CHNK1024, TrueArb SRATE, ARWV/SRATE readbacks
 
-    .venv/bin/python test_arb_chained.py --sg 1
+    .venv/bin/python test_arb_chained.py --resource 'TCPIP0::<ip>::INSTR'
+
+Run against USB (no --resource) to confirm upload_arb correctly REFUSES
+rather than wedging/truncating.
 """
 import sys
 import math
 import time
+import struct
 import argparse
-from contextlib import contextmanager
 
 from instruments import BK4055B
-
-PACKET = 64          # bulk endpoint wMaxPacketSize on this bench
-HDR = 12             # USBTMC BulkOutMessage header size
-
-
-@contextmanager
-def one_packet_messages(sg):
-    """Force pyvisa-py to emit single-packet USBTMC messages (<=52B data)."""
-    sess = sg.inst.visalib.sessions[sg.inst.session]
-    ep = sess.interface.usb_send_ep
-    old = ep.wMaxPacketSize
-    ep.wMaxPacketSize = PACKET - HDR
-    try:
-        yield
-    finally:
-        ep.wMaxPacketSize = old
-
-
-def chunked_write_raw(sg, blob):
-    with one_packet_messages(sg):
-        sg.inst.write_raw(blob)
 
 
 def alive(sg, tag, wait=1.0):
@@ -64,62 +49,72 @@ def alive(sg, tag, wait=1.0):
         return False
 
 
-def upload(sg, ch, name, npts):
-    samples = [math.sin(2 * math.pi * i / npts) for i in range(npts)]
-    clean, blob = sg.build_wvdt(ch, name, samples, points=npts)
+def read_wvdt_payload(sg, name):
+    """Return the WAVEDATA bytes of a stored user waveform via WVDT?."""
+    sg.write(f'WVDT? USER,{name}')
     old = sg.inst.timeout
-    sg.inst.timeout = 30000
-    t0 = time.time()
+    sg.inst.timeout = 15000
     try:
-        chunked_write_raw(sg, blob)
+        raw = sg.inst.read_raw()
     finally:
         sg.inst.timeout = old
-    msgs = (len(blob) + PACKET - HDR - 1) // (PACKET - HDR)
-    print(f"  sent {len(blob)}B as {msgs} single-packet messages "
-          f"in {time.time() - t0:.2f}s")
-    return clean
+    marker = b'WAVEDATA,'
+    idx = raw.find(marker)
+    if idx < 0:
+        raise ValueError(f"no WAVEDATA in response: {raw[:80]!r}")
+    return raw[idx + len(marker):].rstrip(b'\n')
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--sg', type=int, default=1, choices=(1, 2))
+    ap.add_argument('--resource', default=None,
+                    help="VISA resource, e.g. TCPIP0::192.168.1.50::INSTR "
+                         "(default: USB auto-discovery)")
     args = ap.parse_args()
 
     print("Connecting...")
-    sg = BK4055B()
+    sg = BK4055B(resource=args.resource)
+    print(f"  {sg.resource}")
     print(f"  {sg.idn}")
-    if not alive(sg, 'stage1-baseline', wait=0):
+    if not alive(sg, 'baseline', wait=0):
         return 2
 
-    print("stage 2: padded query via 52-byte chunking...")
-    try:
-        chunked_write_raw(sg, (' ' * 64 + '*IDN?\n').encode())
-        sg.inst.timeout = 5000
-        print(f"  response: {sg.inst.read().strip()[:32]}")
-    except Exception as e:
-        print(f"  padded query failed: {type(e).__name__}")
-    if not alive(sg, 'stage2'):
-        print(">> WEDGED even at one packet per message -> firmware cannot "
-              "take multi-message commands either. USB path is hopeless; "
-              "use LAN or a firmware update.")
-        return 1
-
+    payloads = {}
     for npts in (8, 256, 1024):
-        print(f"stage: WVDT {npts} pts...")
-        name = upload(sg, args.sg, f'CHNK{npts}', npts)
+        name = f'CHNK{npts}'
+        print(f"stage: upload_arb {npts} pts as {name!r}...")
+        samples = [math.sin(2 * math.pi * i / npts) for i in range(npts)]
+        t0 = time.time()
+        try:
+            clean = sg.upload_arb(args.sg, name, samples, points=npts)
+        except RuntimeError as e:
+            print(f"  upload_arb refused: {e}")
+            print(">> Over USB this is CORRECT behavior (52-byte firmware "
+                  "cap). Re-run with --resource 'TCPIP0::<ip>::INSTR'.")
+            return 3
+        print(f"  upload returned in {time.time() - t0:.2f}s")
         if not alive(sg, f'{npts}pts', wait=2.0):
-            print(f">> WEDGED at {npts}-pt upload (chunked). Uploads below "
-                  f"this size survived -- note the boundary.")
+            print(f">> WEDGED at {npts}-pt upload over {sg.resource}.")
             return 1
-
-    print("stage 5: catalog / select / TrueArb round-trip...")
-    try:
         cat = sg.ask('STL? USER')
-        print(f"  STL? USER: {cat[:120]}")
-    except Exception as e:
-        print(f"  STL? failed: {type(e).__name__}")
-    if not alive(sg, 'post-STL'):
+        print(f"  {clean} in catalog: {clean in cat}")
+        payloads[clean] = sg.samples_to_int16(sg._resample(samples, npts))
+
+    print("stage: WVDT? readback byte-compare (CHNK1024)...")
+    sent = payloads['CHNK1024']
+    got = read_wvdt_payload(sg, 'CHNK1024')
+    print(f"  sent {len(sent)}B, got {len(got)}B")
+    k = min(len(sent), len(got)) // 2
+    sv = struct.unpack(f'<{k}h', sent[:2 * k])
+    gv = struct.unpack(f'<{k}h', got[:2 * k])
+    mism = sum(1 for a, b in zip(sv, gv) if a != b)
+    print(f"  value mismatches: {mism}/{k}")
+    if len(got) != len(sent) or mism:
+        print(">> DATA TRUNCATED/CORRUPTED -- transport still broken.")
         return 1
+
+    print("stage: select / TrueArb round-trip...")
     sg.select_arb(args.sg, 'CHNK1024')
     sg.set_sample_rate(args.sg, mode='TARB', value=1000 * 1024)
     time.sleep(0.3)
@@ -131,8 +126,8 @@ def main():
     ok = alive(sg, 'final')
     sg.close()
     if ok:
-        print(">> FULL PIPELINE SURVIVED -- single-packet chunking is the "
-              "transport fix. Run test_arb_scope.py --sg 1 --scope 1 next.")
+        print(">> FULL PIPELINE VERIFIED (upload + readback + TrueArb). "
+              "Run test_arb_scope.py next for the analog shape check.")
     return 0 if ok else 1
 
 
