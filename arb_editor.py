@@ -763,11 +763,20 @@ class ArbWaveformEditor(tk.Toplevel):
             # is 2*y_scale Vpp (offset 0); the normalized arb carries the shape.
             amp = 2.0 * self.y_scale
             offset = 0.0
-            clean = app.sg.upload_arb(ch, name, self.samples, freq_hz=freq,
-                                      amp_vpp=amp, offset_v=offset)
+            # Upload a SHORT buffer and play it via TrueArb: the box outputs the
+            # exact npts points at sample_rate = freq*npts, so output period ==
+            # the X span. Short buffers avoid the 32 KB DDS upload that wedges
+            # the USBTMC endpoint (issue #20).
+            npts = getattr(app.sg, 'ARB_DEFAULT_POINTS', 1024)
+            clean = app.sg.upload_arb(ch, name, self.samples, points=npts,
+                                      freq_hz=freq, amp_vpp=amp, offset_v=offset)
             app.sg.select_arb(ch, clean)
+            if hasattr(app.sg, 'set_sample_rate'):
+                app.sg.set_sample_rate(ch, mode='TARB', value=freq * npts)
+            # Amplitude/offset are mode-independent; frequency comes from SRATE
+            # in TrueArb, so don't push FRQ (it would flip the box back to DDS).
             if hasattr(app.sg, 'set_basic_wave'):
-                app.sg.set_basic_wave(ch, FRQ=freq, AMP=amp, OFST=offset)
+                app.sg.set_basic_wave(ch, AMP=amp, OFST=offset)
         except Exception as e:
             messagebox.showerror("Upload error", str(e), parent=self)
             return

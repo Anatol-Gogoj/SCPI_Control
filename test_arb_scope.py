@@ -83,10 +83,14 @@ def capture(scope, ch):
 
 
 def run_case(sg, scope, sg_ch, scope_ch, label, samples):
-    name = sg.upload_arb(sg_ch, label.split()[0], samples,
+    # Short buffer + TrueArb: play npts points at FREQ*npts Sa/s so the output
+    # period is 1/FREQ. Avoids the 32 KB DDS upload that wedges USBTMC (#20).
+    npts = sg.ARB_DEFAULT_POINTS
+    name = sg.upload_arb(sg_ch, label.split()[0], samples, points=npts,
                          freq_hz=FREQ, amp_vpp=AMP_VPP, offset_v=0.0)
     sg.select_arb(sg_ch, name)
-    sg.set_basic_wave(sg_ch, FRQ=FREQ, AMP=AMP_VPP, OFST=0.0)
+    sg.set_sample_rate(sg_ch, mode='TARB', value=FREQ * npts)
+    sg.set_basic_wave(sg_ch, AMP=AMP_VPP, OFST=0.0)
     sg.set_output(sg_ch, True)
 
     wf = capture(scope, scope_ch)
@@ -142,9 +146,9 @@ def _read_wvdt(sg, name):
 def readback_check(sg, ch):
     """Upload a full-scale sine, read it back, and diff bytes vs what we sent
     (and vs the known-good wave1). Tells us transport-corruption vs playback."""
-    n = BK4055B.ARB_POINTS
+    n = BK4055B.ARB_DEFAULT_POINTS          # short buffer = the path we use
     sent_samples = [math.sin(2 * math.pi * i / n) for i in range(n)]
-    name = sg.upload_arb(ch, 'RBCHK', sent_samples)
+    name = sg.upload_arb(ch, 'RBCHK', sent_samples, points=n)
     sent = BK4055B.samples_to_int16(BK4055B._resample(sent_samples, n))
     print(f"uploaded '{name}': {len(sent)} bytes; in STL? USER:",
           'RBCHK' in sg.ask('STL? USER'))
