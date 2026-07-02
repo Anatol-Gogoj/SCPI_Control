@@ -567,15 +567,18 @@ class BK4055B(VisaInstrument):
                    amp_vpp=None, offset_v=None, phase_deg=None):
         """Build the raw ``WVDT`` upload bytes (no I/O). Returns (clean, blob).
 
-        Uses the official SDG2000X/"X-series" form (Siglent SDG Programming
-        Guide PG02-E05x), which omits LENGTH and TYPE::
+        Uses the official SDG2000X/SDG6000X 16-bit-arb form (Siglent app note
+        "Building an Arb with 16-bit steps"), with EVERY header field present::
 
-            C<n>:WVDT WVNM,<name>,FREQ,<f>,AMPL,<a>,OFST,<o>,PHASE,<p>,WAVEDATA,<int16 LE>
+            C<n>:WVDT WVNM,<name>,FREQ,<f>,TYPE,8,AMPL,<a>,OFST,<o>,PHASE,<p>,WAVEDATA,<int16 LE>
 
-        The earlier ``LENGTH,<n>B,TYPE,6`` form was reverse-engineered around the
-        corrupted USB transport (issue #20), not the protocol -- the guide says
-        LENGTH "is not necessary for the X series" and its example sends no TYPE.
-        Sample bytes follow ``WAVEDATA,`` directly (not an IEEE block).
+        The full field set is NOT optional over USBTMC: a minimal header
+        (``WVNM,<name>,WAVEDATA,``) hard-wedges the 4055B's SCPI parser
+        (bench-verified 2026-06-28 and 2026-07-02 -- the box stops answering
+        reads until a front-panel power cycle; the tinylabs SDG2000X library
+        gets away with the minimal form only over LAN). ``TYPE,8`` marks
+        16-bit sample data. Sample bytes follow ``WAVEDATA,`` directly (not an
+        IEEE block); no trailing terminator.
 
         Split out from upload_arb so it can be unit-tested headless and verified
         with ``test_arb_scope.py --readback`` without driving the bus.
@@ -589,15 +592,15 @@ class BK4055B(VisaInstrument):
                                                   self.ARB_DEFAULT_POINTS)
         n = max(8, min(int(n), self.ARB_MAX_POINTS))
         data = self.samples_to_int16(self._resample(samples, n))
-        fields = [f'WVNM,{clean}']
-        if freq_hz is not None:
-            fields.append(f'FREQ,{self._fmt_param(freq_hz)}')
-        if amp_vpp is not None:
-            fields.append(f'AMPL,{self._fmt_param(amp_vpp)}')
-        if offset_v is not None:
-            fields.append(f'OFST,{self._fmt_param(offset_v)}')
-        if phase_deg is not None:
-            fields.append(f'PHASE,{self._fmt_param(phase_deg)}')
+        # Field order matches the Siglent example; all fields always sent.
+        fields = [
+            f'WVNM,{clean}',
+            f'FREQ,{self._fmt_param(freq_hz if freq_hz is not None else 1000)}',
+            'TYPE,8',
+            f'AMPL,{self._fmt_param(amp_vpp if amp_vpp is not None else 2.0)}',
+            f'OFST,{self._fmt_param(offset_v if offset_v is not None else 0)}',
+            f'PHASE,{self._fmt_param(phase_deg if phase_deg is not None else 0)}',
+        ]
         header = f'C{channel}:WVDT ' + ','.join(fields) + ',WAVEDATA,'
         return clean, header.encode('latin1') + data
 

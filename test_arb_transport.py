@@ -36,26 +36,28 @@ def _split_wvdt(blob):
     return blob[:idx].decode('latin1'), blob[idx:]
 
 
-def test_wvdt_has_no_length_or_type():
+def test_wvdt_full_header_always_sent():
+    # Minimal headers (WVNM+WAVEDATA only) hard-wedge the 4055B over USBTMC
+    # (bench 2026-07-02); the official Siglent USB example always sends every
+    # field, in this order, with TYPE,8 (16-bit samples) and no LENGTH.
     sg = FakeSG()
     _, blob = sg.build_wvdt(1, 'wave1', [0.0, 1.0, 0.0, -1.0], points=4)
     header, _ = _split_wvdt(blob)
-    assert header.startswith('C1:WVDT WVNM,wave1'), header
+    assert header == ('C1:WVDT WVNM,wave1,FREQ,1000,TYPE,8,'
+                      'AMPL,2,OFST,0,PHASE,0,WAVEDATA,'), header
     assert 'LENGTH' not in header, "X-series WVDT must omit LENGTH"
-    assert 'TYPE' not in header, "X-series WVDT must omit TYPE"
-    assert header.endswith('WAVEDATA,'), header
 
 
-def test_wvdt_optional_fields():
+def test_wvdt_explicit_fields():
     sg = FakeSG()
     _, blob = sg.build_wvdt(2, 'w', [0.0, 1.0], points=2,
-                            freq_hz=1000.0, amp_vpp=2.0, offset_v=0.0,
-                            phase_deg=0.0)
+                            freq_hz=2500.0, amp_vpp=4.0, offset_v=0.5,
+                            phase_deg=90.0)
     header, _ = _split_wvdt(blob)
     assert header.startswith('C2:WVDT WVNM,w,')
-    # _fmt_param strips trailing .0
-    assert 'FREQ,1000' in header and 'AMPL,2' in header
-    assert 'OFST,0' in header and 'PHASE,0' in header
+    # _fmt_param strips trailing .0; TYPE,8 sits between FREQ and AMPL
+    assert 'FREQ,2500,TYPE,8,AMPL,4' in header, header
+    assert 'OFST,0.5' in header and 'PHASE,90' in header
 
 
 def test_payload_is_int16_le_fullscale():
