@@ -16,6 +16,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 import arb_build as ab
+import easywave_export as ew
 from siggen_presets import (arb_from_csv, write_arb_template, sanitize_arb_name)
 from instruments import BK4055B
 
@@ -203,6 +204,9 @@ class ArbWaveformEditor(tk.Toplevel):
         ttk.Button(lib, text="Import CSV...", command=self.import_csv).grid(row=1, column=0, columnspan=2, pady=6, sticky='w')
         ttk.Button(lib, text="Export CSV...", command=self.export_csv).grid(row=1, column=2, pady=6)
         ttk.Button(lib, text="Save Template...", command=self.save_template).grid(row=1, column=3, pady=6)
+        ttk.Button(lib, text="Export for EasyWaveX (flash drive)...",
+                   command=self.export_easywavex).grid(row=1, column=4, columnspan=2,
+                                                       pady=6, padx=(12, 0), sticky='w')
         ttk.Label(lib, text="Send to CH:").grid(row=2, column=0, sticky='e', pady=6)
         self.target_var = tk.StringVar(value=str(self.channel))
         ttk.Combobox(lib, width=4, state='readonly', textvariable=self.target_var,
@@ -730,6 +734,10 @@ class ArbWaveformEditor(tk.Toplevel):
         except Exception as e:
             messagebox.showerror("Template error", str(e), parent=self)
 
+    def export_easywavex(self):
+        """Flash-drive workaround for the 4055B's no-arb-over-USB firmware."""
+        EasyWaveXExportDialog(self)
+
     def _set_channel_value(self, ch, key, val):
         """Write a value into a channel widget, handling both Entry (real GUI)
         and StringVar (demo) without caring which it is."""
@@ -778,7 +786,12 @@ class ArbWaveformEditor(tk.Toplevel):
             if hasattr(app.sg, 'set_basic_wave'):
                 app.sg.set_basic_wave(ch, AMP=amp, OFST=offset)
         except Exception as e:
-            messagebox.showerror("Upload error", str(e), parent=self)
+            msg = str(e)
+            if 'over USB' in msg:
+                msg += ("\n\nWorkaround: use 'Export for EasyWaveX (flash "
+                        "drive)...' -- save the CSV, copy it to a flash "
+                        "drive, and load it in EasyWaveX manually.")
+            messagebox.showerror("Upload error", msg, parent=self)
             return
         # persist the recipe too, so the uploaded arb stays re-editable
         try:
@@ -802,3 +815,108 @@ class ArbWaveformEditor(tk.Toplevel):
             text=f"CH{ch}: uploaded '{clean}' ({len(self.samples)} pts) @ {freq:g} Hz")
         self._lib_refresh()
         self._dirty = False
+
+
+class EasyWaveXExportDialog(tk.Toplevel):
+    """Export the current waveform as an EasyWaveX template CSV.
+
+    This is the USB workaround: the 4055B firmware cannot take arb uploads
+    over USB (52-byte command cap -- see README quirks), so the file must
+    travel by FLASH DRIVE and be loaded into EasyWaveX manually. The dialog
+    says so, loudly, so nobody mistakes it for a direct upload.
+
+    Field defaults follow the lab instructions (easywave_export docstring):
+    frequency = 1/T_total, amp = highest voltage value, offset = amp/2,
+    phase = 0. All editable. 1 V in the file = 1 kV at the Trek output.
+    """
+
+    def __init__(self, editor):
+        super().__init__(editor)
+        self.editor = editor
+        self.title("Export for EasyWaveX (flash drive)")
+        self.transient(editor)
+        self.resizable(False, False)
+
+        # Real voltage values: editor samples are normalized to +/-1 at
+        # +/-y_scale volts full scale.
+        self.values_v = [s * editor.y_scale for s in editor.samples]
+        defaults = ew.suggest_header(self.values_v, editor._duration_s())
+
+        tk.Label(self,
+                 text=("This does NOT send anything to the 4055B.\n"
+                       "The instrument cannot accept waveform uploads over USB "
+                       "(firmware limit).\n"
+                       "Save the CSV, copy it to a FLASH DRIVE, and load it in "
+                       "EasyWaveX manually."),
+                 bg='#7a4a00', fg='white', justify=tk.LEFT,
+                 font=('TkDefaultFont', 10, 'bold'),
+                 padx=12, pady=10, anchor='w').pack(fill='x')
+
+        frm = ttk.Frame(self, padding=12)
+        frm.pack(fill='both', expand=True)
+        self._vars = {}
+        rows = [
+            ('frequency', 'Frequency (Hz):', defaults['freq_hz'],
+             '= 1 / T_total (waveform period from the editor X span)'),
+            ('amp', 'Amp (V):', defaults['amp_v'],
+             'highest voltage value in the waveform'),
+            ('offset', 'Offset (V):', defaults['offset_v'], 'amp / 2'),
+            ('phase', 'Phase (deg):', defaults['phase_deg'], 'leave 0'),
+        ]
+        for r, (key, label, val, hint) in enumerate(rows):
+            ttk.Label(frm, text=label).grid(row=r, column=0, sticky='e', pady=2)
+            var = tk.StringVar(value=f'{val:g}')
+            self._vars[key] = var
+            ttk.Entry(frm, width=14, textvariable=var).grid(
+                row=r, column=1, sticky='w', padx=6, pady=2)
+            ttk.Label(frm, text=hint, foreground='gray').grid(
+                row=r, column=2, sticky='w', pady=2)
+
+        n_src = len(self.values_v)
+        ttk.Label(frm, text=(
+            f"Waveform is resampled from {n_src} to exactly "
+            f"{ew.EASYWAVE_POINTS} points (EasyWaveX requirement).\n"
+            "Trek convention: 1 V in the file = 1 kV at the Trek output."),
+            justify=tk.LEFT).grid(row=4, column=0, columnspan=3,
+                                  sticky='w', pady=(10, 0))
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=5, column=0, columnspan=3, sticky='e', pady=(12, 0))
+        ttk.Button(btns, text="Save CSV...", command=self._save).pack(
+            side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side=tk.LEFT)
+
+    def _save(self):
+        try:
+            freq = float(self._vars['frequency'].get())
+            amp = float(self._vars['amp'].get())
+            offset = float(self._vars['offset'].get())
+            phase = float(self._vars['phase'].get())
+        except ValueError:
+            messagebox.showerror("EasyWaveX export",
+                                 "All fields must be numbers", parent=self)
+            return
+        name = self.editor.name_entry.get().strip() or 'waveform'
+        path = filedialog.asksaveasfilename(
+            parent=self, title="Save EasyWaveX CSV (goes on a flash drive)",
+            defaultextension=".csv",
+            initialfile=f"{sanitize_arb_name(name)}.csv",
+            filetypes=[("CSV files", "*.csv")])
+        if not path:
+            return
+        try:
+            ew.write_easywave_csv(path, self.values_v, freq, amp, offset,
+                                  phase)
+        except Exception as e:
+            messagebox.showerror("EasyWaveX export", str(e), parent=self)
+            return
+        self.editor.app.status_bar.config(text=f"EasyWaveX CSV written: {path}")
+        messagebox.showinfo(
+            "EasyWaveX export",
+            f"Saved:\n{path}\n\n"
+            "Nothing was sent to the 4055B. Next steps:\n"
+            "1. Copy the file to a flash drive.\n"
+            "2. Take the drive to the EasyWaveX PC.\n"
+            "3. In EasyWaveX, import the CSV to generate the waveform.",
+            parent=self)
+        self.destroy()
