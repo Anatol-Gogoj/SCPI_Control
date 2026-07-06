@@ -15,6 +15,7 @@ import os
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
+import arb_bin
 import arb_build as ab
 import easywave_export as ew
 from siggen_presets import (arb_from_csv, write_arb_template, sanitize_arb_name)
@@ -204,15 +205,21 @@ class ArbWaveformEditor(tk.Toplevel):
         ttk.Button(lib, text="Import CSV...", command=self.import_csv).grid(row=1, column=0, columnspan=2, pady=6, sticky='w')
         ttk.Button(lib, text="Export CSV...", command=self.export_csv).grid(row=1, column=2, pady=6)
         ttk.Button(lib, text="Save Template...", command=self.save_template).grid(row=1, column=3, pady=6)
+        # Flash-drive routes (USB arb upload is impossible on this firmware).
+        # .bin goes straight into the 4055B's front USB port; the EasyWaveX
+        # CSV is the fallback via the Windows PC.
+        ttk.Button(lib, text="Export .bin for 4055B flash drive...",
+                   command=self.export_bin).grid(row=2, column=0, columnspan=3,
+                                                 pady=(0, 6), sticky='w')
         ttk.Button(lib, text="Export for EasyWaveX (flash drive)...",
-                   command=self.export_easywavex).grid(row=1, column=4, columnspan=2,
-                                                       pady=6, padx=(12, 0), sticky='w')
-        ttk.Label(lib, text="Send to CH:").grid(row=2, column=0, sticky='e', pady=6)
+                   command=self.export_easywavex).grid(row=2, column=3, columnspan=3,
+                                                       pady=(0, 6), padx=(12, 0), sticky='w')
+        ttk.Label(lib, text="Send to CH:").grid(row=3, column=0, sticky='e', pady=6)
         self.target_var = tk.StringVar(value=str(self.channel))
         ttk.Combobox(lib, width=4, state='readonly', textvariable=self.target_var,
-                     values=['1', '2']).grid(row=2, column=1, sticky='w', pady=6)
+                     values=['1', '2']).grid(row=3, column=1, sticky='w', pady=6)
         ttk.Button(lib, text="Upload && Select",
-                   command=self.upload).grid(row=2, column=2, columnspan=2,
+                   command=self.upload).grid(row=3, column=2, columnspan=2,
                                              pady=6, padx=4, sticky='w')
 
         hint = ("Click canvas to add a point - drag a dot to move it - right-click a dot to delete. "
@@ -738,6 +745,10 @@ class ArbWaveformEditor(tk.Toplevel):
         """Flash-drive workaround for the 4055B's no-arb-over-USB firmware."""
         EasyWaveXExportDialog(self)
 
+    def export_bin(self):
+        """Direct .bin for the 4055B's front USB port (bypasses EasyWaveX)."""
+        BinExportDialog(self)
+
     def _set_channel_value(self, ch, key, val):
         """Write a value into a channel widget, handling both Entry (real GUI)
         and StringVar (demo) without caring which it is."""
@@ -815,6 +826,86 @@ class ArbWaveformEditor(tk.Toplevel):
             text=f"CH{ch}: uploaded '{clean}' ({len(self.samples)} pts) @ {freq:g} Hz")
         self._lib_refresh()
         self._dirty = False
+
+
+class BinExportDialog(tk.Toplevel):
+    """Export the current waveform as a 4055B flash-drive .bin.
+
+    The shortest arb path on this firmware: no EasyWaveX, no LAN. The file
+    is the reverse-engineered headerless format the 4055B recalls from its
+    FRONT USB port (16384 x int16 LE, shape only -- see arb_bin.py). The
+    banner makes clear nothing is sent to the instrument from here, and the
+    dialog spells out the front-panel settings to dial in after recall,
+    since frequency/amplitude/offset are NOT stored in the file.
+    """
+
+    def __init__(self, editor):
+        super().__init__(editor)
+        self.editor = editor
+        self.title("Export .bin for 4055B flash drive")
+        self.transient(editor)
+        self.resizable(False, False)
+
+        tk.Label(self,
+                 text=("This does NOT send anything to the 4055B.\n"
+                       "Save the .bin, copy it to a FLASH DRIVE, and plug the "
+                       "drive into the\n4055B's FRONT USB port "
+                       "(Store/Recall > recall the file as an ARB)."),
+                 bg='#7a4a00', fg='white', justify=tk.LEFT,
+                 font=('TkDefaultFont', 10, 'bold'),
+                 padx=12, pady=10, anchor='w').pack(fill='x')
+
+        frm = ttk.Frame(self, padding=12)
+        frm.pack(fill='both', expand=True)
+
+        dur_s = editor._duration_s()
+        freq = 1.0 / dur_s if dur_s > 0 else 0.0
+        amp = 2.0 * editor.y_scale
+        self._panel = (freq, amp)
+        ttk.Label(frm, text=(
+            f"The file holds the SHAPE only ({arb_bin.BIN_POINTS} points, "
+            f"resampled from {len(editor.samples)}).\n"
+            "After recalling it, set these on the front panel to reproduce "
+            "the editor view:\n"
+            f"    Frequency: {freq:g} Hz   (= 1 / {editor._xspan():g} "
+            f"{editor.time_unit})\n"
+            f"    Amplitude: {amp:g} Vpp\n"
+            f"    Offset:    0 V"),
+            justify=tk.LEFT).grid(row=0, column=0, sticky='w')
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=1, column=0, sticky='e', pady=(12, 0))
+        ttk.Button(btns, text="Save .bin...", command=self._save).pack(
+            side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side=tk.LEFT)
+
+    def _save(self):
+        name = self.editor.name_entry.get().strip() or 'waveform'
+        path = filedialog.asksaveasfilename(
+            parent=self, title="Save 4055B .bin (goes on a flash drive)",
+            defaultextension=".bin",
+            initialfile=f"{sanitize_arb_name(name)}.bin",
+            filetypes=[("4055B waveform", "*.bin")])
+        if not path:
+            return
+        try:
+            arb_bin.write_arb_bin(path, self.editor.samples)
+        except Exception as e:
+            messagebox.showerror(".bin export", str(e), parent=self)
+            return
+        freq, amp = self._panel
+        self.editor.app.status_bar.config(text=f"4055B .bin written: {path}")
+        messagebox.showinfo(
+            ".bin export",
+            f"Saved:\n{path}\n\n"
+            "Nothing was sent to the 4055B. Next steps:\n"
+            "1. Copy the file to a flash drive (FAT-formatted).\n"
+            "2. Plug the drive into the 4055B's FRONT USB port.\n"
+            "3. Store/Recall > recall the file as an ARB waveform.\n"
+            f"4. On the front panel set Frequency {freq:g} Hz, "
+            f"Amplitude {amp:g} Vpp, Offset 0 V.",
+            parent=self)
+        self.destroy()
 
 
 class EasyWaveXExportDialog(tk.Toplevel):
