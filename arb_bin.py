@@ -18,6 +18,8 @@ WVDT upload path, so a wave plays identically whichever route it takes.
 
 Headless self-test: .venv/bin/python test_arb_bin.py
 """
+import getpass
+import os
 import struct
 
 from easywave_export import resample_linear
@@ -49,8 +51,39 @@ def parse_arb_bin(blob):
 
 
 def write_arb_bin(path, samples, points=BIN_POINTS):
-    """Build and write the .bin; returns the byte count (2 * points)."""
+    """Build and write the .bin; returns the byte count (2 * points).
+
+    fsync's the file so it survives the stick being yanked right after.
+    """
     blob = build_arb_bin(samples, points)
     with open(path, 'wb') as f:
         f.write(blob)
+        f.flush()
+        os.fsync(f.fileno())
     return len(blob)
+
+
+def find_flash_drives(roots=None, require_mount=True):
+    """Return mounted, writable removable-media directories.
+
+    GNOME automounts sticks under /run/media/<user>/<label> (RHEL 9); /media
+    variants are checked for good measure. `roots`/`require_mount` exist for
+    the headless test, which cannot create real mount points.
+    """
+    if roots is None:
+        user = getpass.getuser()
+        roots = [f'/run/media/{user}', f'/media/{user}', '/media']
+    drives = []
+    for root in roots:
+        try:
+            names = sorted(os.listdir(root))
+        except OSError:
+            continue
+        for name in names:
+            path = os.path.join(root, name)
+            if not os.path.isdir(path) or not os.access(path, os.W_OK):
+                continue
+            if require_mount and not os.path.ismount(path):
+                continue
+            drives.append(path)
+    return drives

@@ -8,8 +8,8 @@ Run: .venv/bin/python test_arb_bin.py
 import os
 import struct
 
-from arb_bin import (BIN_POINTS, FULL_SCALE, build_arb_bin, parse_arb_bin,
-                     write_arb_bin)
+from arb_bin import (BIN_POINTS, FULL_SCALE, build_arb_bin, find_flash_drives,
+                     parse_arb_bin, write_arb_bin)
 
 _REFERENCE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           'arb_bin_reference_9step.bin')
@@ -79,6 +79,21 @@ def test_write_arb_bin(tmp='/tmp/_arb_bin_test.bin'):
         assert n == len(blob) == BIN_POINTS * 2
     finally:
         os.unlink(tmp)
+
+
+def test_find_flash_drives(root='/tmp/_arb_bin_media'):
+    import shutil
+    os.makedirs(os.path.join(root, 'STICK'), exist_ok=True)
+    os.makedirs(os.path.join(root, 'RO_STICK'), exist_ok=True)
+    os.chmod(os.path.join(root, 'RO_STICK'), 0o555)      # not writable
+    try:
+        found = find_flash_drives(roots=[root], require_mount=False)
+        assert found == [os.path.join(root, 'STICK')], found
+        # missing roots are silently skipped
+        assert find_flash_drives(roots=['/nonexistent_xyz']) == []
+    finally:
+        os.chmod(os.path.join(root, 'RO_STICK'), 0o755)
+        shutil.rmtree(root)
 
 
 def _run():

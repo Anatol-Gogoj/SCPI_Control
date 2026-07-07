@@ -871,23 +871,79 @@ class BinExportDialog(tk.Toplevel):
             f"{editor.time_unit})\n"
             f"    Amplitude: {amp:g} Vpp\n"
             f"    Offset:    0 V"),
-            justify=tk.LEFT).grid(row=0, column=0, sticky='w')
+            justify=tk.LEFT).grid(row=0, column=0, columnspan=2, sticky='w')
+
+        # Live flash-drive detection: plug a stick into THIS PC and save to
+        # it in one click; the label re-checks every second.
+        self.stick_label = ttk.Label(frm, justify=tk.LEFT)
+        self.stick_label.grid(row=1, column=0, columnspan=2, sticky='w',
+                              pady=(10, 0))
+        self.stick_btn = ttk.Button(frm, text="Save to flash drive",
+                                    command=self._save_to_stick)
+        self.stick_btn.grid(row=2, column=0, sticky='w', pady=(6, 0))
 
         btns = ttk.Frame(frm)
-        btns.grid(row=1, column=0, sticky='e', pady=(12, 0))
+        btns.grid(row=2, column=1, sticky='e', pady=(6, 0))
         ttk.Button(btns, text="Save .bin...", command=self._save).pack(
             side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Cancel", command=self.destroy).pack(side=tk.LEFT)
+        self._poll_sticks()
+
+    def _poll_sticks(self):
+        try:
+            sticks = arb_bin.find_flash_drives()
+        except Exception:
+            sticks = []
+        self._sticks = sticks
+        if sticks:
+            self.stick_label.config(
+                text=f"Flash drive detected: {sticks[0]}", foreground='#006400')
+            self.stick_btn.state(['!disabled'])
+        else:
+            self.stick_label.config(
+                text=("No flash drive detected -- plug one into this PC "
+                      "(or use 'Save .bin...' and copy it over yourself)."),
+                foreground='#8a5a00')
+            self.stick_btn.state(['disabled'])
+        # keep polling while the dialog is open
+        self._poll_id = self.after(1000, self._poll_sticks)
+
+    def destroy(self):
+        if getattr(self, '_poll_id', None) is not None:
+            self.after_cancel(self._poll_id)
+            self._poll_id = None
+        super().destroy()
+
+    def _save_to_stick(self):
+        sticks = arb_bin.find_flash_drives()
+        if not sticks:
+            messagebox.showerror(".bin export", "No flash drive mounted",
+                                 parent=self)
+            return
+        name = sanitize_arb_name(self.editor.name_entry.get().strip()
+                                 or 'waveform')
+        path = os.path.join(sticks[0], f'{name}.bin')
+        if os.path.exists(path) and not messagebox.askyesno(
+                ".bin export", f"{path} exists -- overwrite?", parent=self):
+            return
+        self._write_and_confirm(path, on_stick=True)
 
     def _save(self):
         name = self.editor.name_entry.get().strip() or 'waveform'
+        sticks = getattr(self, '_sticks', [])
         path = filedialog.asksaveasfilename(
             parent=self, title="Save 4055B .bin (goes on a flash drive)",
             defaultextension=".bin",
+            initialdir=sticks[0] if sticks else None,
             initialfile=f"{sanitize_arb_name(name)}.bin",
             filetypes=[("4055B waveform", "*.bin")])
         if not path:
             return
+        self._write_and_confirm(path,
+                                on_stick=any(path.startswith(s + os.sep)
+                                             for s in sticks))
+
+    def _write_and_confirm(self, path, on_stick):
         try:
             arb_bin.write_arb_bin(path, self.editor.samples)
         except Exception as e:
@@ -895,13 +951,18 @@ class BinExportDialog(tk.Toplevel):
             return
         freq, amp = self._panel
         self.editor.app.status_bar.config(text=f"4055B .bin written: {path}")
+        if on_stick:
+            steps = ("1. EJECT/unmount the drive before pulling it out.\n"
+                     "2. Plug the drive into the 4055B's FRONT USB port.\n"
+                     "3. Store/Recall > recall the file as an ARB waveform.\n")
+        else:
+            steps = ("1. Copy the file to a flash drive (FAT-formatted).\n"
+                     "2. Plug the drive into the 4055B's FRONT USB port.\n"
+                     "3. Store/Recall > recall the file as an ARB waveform.\n")
         messagebox.showinfo(
             ".bin export",
             f"Saved:\n{path}\n\n"
-            "Nothing was sent to the 4055B. Next steps:\n"
-            "1. Copy the file to a flash drive (FAT-formatted).\n"
-            "2. Plug the drive into the 4055B's FRONT USB port.\n"
-            "3. Store/Recall > recall the file as an ARB waveform.\n"
+            f"Nothing was sent to the 4055B. Next steps:\n{steps}"
             f"4. On the front panel set Frequency {freq:g} Hz, "
             f"Amplitude {amp:g} Vpp, Offset 0 V.",
             parent=self)
@@ -988,9 +1049,14 @@ class EasyWaveXExportDialog(tk.Toplevel):
                                  "All fields must be numbers", parent=self)
             return
         name = self.editor.name_entry.get().strip() or 'waveform'
+        try:
+            sticks = arb_bin.find_flash_drives()
+        except Exception:
+            sticks = []
         path = filedialog.asksaveasfilename(
             parent=self, title="Save EasyWaveX CSV (goes on a flash drive)",
             defaultextension=".csv",
+            initialdir=sticks[0] if sticks else None,
             initialfile=f"{sanitize_arb_name(name)}.csv",
             filetypes=[("CSV files", "*.csv")])
         if not path:
