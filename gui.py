@@ -8,8 +8,9 @@ tab has a Reconnect button):
   - Oscilloscope (Tektronix MSO24)
   - Signal Generator (BK 4055B): per-channel waveform / frequency / amplitude /
     offset with an Apply-then-Output workflow, live preview, and presets.
-    Arbitrary-waveform creation is gated behind SG_ARB_ENABLED (off) until the
-    USB upload path is fixed -- see issue #20.
+    Arbitrary waveforms are designed in the Waveform Editor and delivered
+    to the box as a flash-drive .bin (front USB port); direct upload over
+    the wire is LAN-only -- see issue #20.
   - Data Logging (CSV)
 
 A version readout is shown in the footer. Instrument drivers live in
@@ -78,11 +79,12 @@ SG_STATE_KEYS = {'freq': 'freq_hz', 'amp': 'amp_vpp', 'offset': 'offset_v',
                  'duty': 'duty_pct', 'sym': 'sym_pct', 'phase': 'phase_deg',
                  'rise': 'rise_s', 'fall': 'fall_s', 'delay': 'delay_s'}
 
-# Arbitrary-waveform upload is disabled in the UI until the 4055B USBTMC
-# upload path is fixed (issue #20) -- the editor/backend code stays, but users
-# can't reach it (selecting ARB / the Waveform Editor) so they don't hit the
-# broken, endpoint-wedging upload. Flip to True to re-enable once #20 lands.
-SG_ARB_ENABLED = False
+# Arbitrary waveforms are back on: the editor exports a flash-drive .bin
+# that the 4055B recalls from its FRONT USB port, so no waveform data has to
+# cross the USB wire. The driver still refuses upload_arb over USB (the
+# 52-byte firmware cap wedges the box -- issue #20); Upload & Select needs
+# LAN. Flip to False to hide the ARB waveform + Waveform Editor again.
+SG_ARB_ENABLED = True
 
 SG_LOAD_HIGHZ = 'High-Z'   # UI label for the SCPI 'HZ' (high impedance) token
 
@@ -289,8 +291,8 @@ WAVEFORMS (fields adapt to the selected type):
 - PULSE: timing tests; Duty plus Rise/Fall/Delay (Advanced mode)
 - NOISE: broadband stimulus (level set on the front panel for now)
 - DC: fixed level only (set with DC Offset)
-- ARB: arbitrary waveform - TEMPORARILY DISABLED while the USB upload
-  path is fixed (issue #20); standard waveforms above are unaffected
+- ARB: arbitrary waveform - design it in the Waveform Editor, export a
+  .bin to a flash drive, recall it on the 4055B (see ARBITRARY WAVEFORMS)
 
 BASIC vs ADVANCED:
 - Advanced mode reveals Phase, pulse edge timing (Rise/Fall/Delay),
@@ -330,9 +332,15 @@ PRESETS:
 - Presets are stored in presets/siggen_presets.json
 
 ARBITRARY WAVEFORMS:
-- Temporarily disabled: the BK 4055B USB arb-upload path wedges the
-  instrument, so the Waveform Editor is locked out until it's fixed
-  (issue #20). The standard waveforms are fully working.
+- Select ARB and click "Waveform Editor..." to design a custom shape
+- USB cannot carry the waveform data (52-byte firmware cap), so use
+  "Export .bin for 4055B flash drive...": save the .bin to a flash
+  drive, plug it into the 4055B's FRONT USB port, and recall it via
+  Store/Recall on the front panel
+- The export pre-fills the channel (ARB + frequency/amplitude/offset);
+  after recalling, click Apply to push those settings over USB (they
+  are short commands and safe) - or dial them in on the front panel
+- "Upload && Select" (direct upload) works over LAN only (issue #20)
 
 BEST PRACTICES:
 - Confirm the load setting before trusting the amplitude reading
@@ -1413,7 +1421,8 @@ ANALYSIS:
             ttk.Label(row, text=SG_FIELD_LABELS[key], width=16).pack(side=tk.LEFT)
             if key == 'arb':
                 # Button opens the waveform editor; label shows chosen arb.
-                # Disabled until the upload path is fixed (issue #20).
+                # The disabled branch survives so SG_ARB_ENABLED can gate
+                # the feature off again if the bench needs it.
                 if SG_ARB_ENABLED:
                     w = ttk.Button(row, text="Waveform Editor...",
                                    command=lambda c=ch: self.sg_open_arb_dialog(c))
@@ -1692,7 +1701,8 @@ ANALYSIS:
                 arb = widgets['arb_name_var'].get().strip()
                 if arb:
                     # Select by name; the waveform must already be in the
-                    # instrument's user memory (Waveform Editor uploads it)
+                    # instrument (recalled from a flash-drive .bin on the
+                    # front USB port, or uploaded over LAN)
                     self.sg.select_arb(channel, arb)
             self.sg.set_load_polarity(channel,
                                       load=self._sg_load_to_wire(channel),

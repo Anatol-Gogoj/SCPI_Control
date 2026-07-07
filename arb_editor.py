@@ -764,6 +764,26 @@ class ArbWaveformEditor(tk.Toplevel):
         except Exception:
             pass
 
+    def stage_on_channel(self, ch, name, freq, amp, offset):
+        """Mirror an arb onto a channel's widgets (waveform=ARB, name,
+        freq/amp/offset, preview samples) WITHOUT touching the instrument.
+
+        Used after both delivery routes: a LAN upload (the arb is now in the
+        box) and a flash-drive .bin export (the user recalls it on the front
+        panel, then Apply pushes these staged settings over USB -- BSWV/ARWV
+        are short commands, safe under the 52-byte cap).
+        """
+        app = self.app
+        widgets = app.sg_channel_widgets[ch]
+        widgets['arb_name_var'].set(name)
+        widgets['arb_samples'] = list(self.samples)
+        widgets['waveform'].set('ARB')
+        self._set_channel_value(ch, 'freq', freq)
+        self._set_channel_value(ch, 'amp', amp)
+        self._set_channel_value(ch, 'offset', offset)
+        app._sg_update_visibility(ch)
+        app._sg_redraw_preview(ch)
+
     def upload(self):
         app = self.app
         ch = int(self.target_var.get())
@@ -799,9 +819,10 @@ class ArbWaveformEditor(tk.Toplevel):
         except Exception as e:
             msg = str(e)
             if 'over USB' in msg:
-                msg += ("\n\nWorkaround: use 'Export for EasyWaveX (flash "
-                        "drive)...' -- save the CSV, copy it to a flash "
-                        "drive, and load it in EasyWaveX manually.")
+                msg += ("\n\nWorkaround: use 'Export .bin for 4055B flash "
+                        "drive...' -- save the .bin to a flash drive and "
+                        "recall it on the 4055B's front USB port. (Or the "
+                        "EasyWaveX CSV export as a fallback.)")
             messagebox.showerror("Upload error", msg, parent=self)
             return
         # persist the recipe too, so the uploaded arb stays re-editable
@@ -809,15 +830,7 @@ class ArbWaveformEditor(tk.Toplevel):
             self.app.sg_presets.save_arb(clean, self.samples, recipe=self.recipe)
         except Exception:
             pass
-        widgets = app.sg_channel_widgets[ch]
-        widgets['arb_name_var'].set(clean)
-        widgets['arb_samples'] = list(self.samples)
-        widgets['waveform'].set('ARB')
-        self._set_channel_value(ch, 'freq', freq)
-        self._set_channel_value(ch, 'amp', amp)
-        self._set_channel_value(ch, 'offset', offset)
-        app._sg_update_visibility(ch)
-        app._sg_redraw_preview(ch)
+        self.stage_on_channel(ch, clean, freq, amp, offset)
         try:
             app._sg_refresh_applied(ch)
         except Exception:
@@ -837,6 +850,11 @@ class BinExportDialog(tk.Toplevel):
     banner makes clear nothing is sent to the instrument from here, and the
     dialog spells out the front-panel settings to dial in after recall,
     since frequency/amplitude/offset are NOT stored in the file.
+
+    Saving also stages the "Send to CH" channel in the main GUI (waveform
+    ARB, name, freq/amp/offset, preview), so after recalling the file on
+    the box the user can push those settings with one Apply click -- the
+    BSWV/ARWV commands involved are short and USB-safe.
     """
 
     def __init__(self, editor):
@@ -862,15 +880,22 @@ class BinExportDialog(tk.Toplevel):
         freq = 1.0 / dur_s if dur_s > 0 else 0.0
         amp = 2.0 * editor.y_scale
         self._panel = (freq, amp)
+        try:
+            self._target_ch = int(editor.target_var.get())
+        except (TypeError, ValueError):
+            self._target_ch = editor.channel
         ttk.Label(frm, text=(
             f"The file holds the SHAPE only ({arb_bin.BIN_POINTS} points, "
             f"resampled from {len(editor.samples)}).\n"
-            "After recalling it, set these on the front panel to reproduce "
-            "the editor view:\n"
+            "After recalling it, these settings reproduce the editor view:\n"
             f"    Frequency: {freq:g} Hz   (= 1 / {editor._xspan():g} "
             f"{editor.time_unit})\n"
             f"    Amplitude: {amp:g} Vpp\n"
-            f"    Offset:    0 V"),
+            f"    Offset:    0 V\n"
+            f"Saving pre-fills CH{self._target_ch} in the GUI with them -- "
+            f"after the recall, one click on\n\"Apply CH{self._target_ch} "
+            "Settings\" pushes them over USB (or set them on the front "
+            "panel)."),
             justify=tk.LEFT).grid(row=0, column=0, columnspan=2, sticky='w')
 
         # Live flash-drive detection: plug a stick into THIS PC and save to
@@ -950,6 +975,12 @@ class BinExportDialog(tk.Toplevel):
             messagebox.showerror(".bin export", str(e), parent=self)
             return
         freq, amp = self._panel
+        ch = self._target_ch
+        # Stage the channel so one Apply click pushes freq/amp/offset (and
+        # selects the arb by name) once the file has been recalled on the box.
+        # The box lists a recalled file under its filename, so stage the stem.
+        name = os.path.splitext(os.path.basename(path))[0]
+        self.editor.stage_on_channel(ch, name, freq, amp, 0.0)
         self.editor.app.status_bar.config(text=f"4055B .bin written: {path}")
         if on_stick:
             steps = ("1. EJECT/unmount the drive before pulling it out.\n"
@@ -963,8 +994,10 @@ class BinExportDialog(tk.Toplevel):
             ".bin export",
             f"Saved:\n{path}\n\n"
             f"Nothing was sent to the 4055B. Next steps:\n{steps}"
-            f"4. On the front panel set Frequency {freq:g} Hz, "
-            f"Amplitude {amp:g} Vpp, Offset 0 V.",
+            f"4. CH{ch} is pre-filled in the GUI: click 'Apply CH{ch} "
+            f"Settings' to push\n    Frequency {freq:g} Hz, Amplitude "
+            f"{amp:g} Vpp, Offset 0 V over USB\n    (or set them on the "
+            "front panel).",
             parent=self)
         self.destroy()
 
