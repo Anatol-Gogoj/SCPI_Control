@@ -138,27 +138,27 @@ def test_samples_to_int16():
 
 def test_upload_arb_message():
     sg = FakeSG()
-    # Already full length -> uploaded as-is (no resample).
-    samples = [0.0, 1.0, 0.0, -1.0] * (BK4055B.ARB_POINTS // 4)
-    clean = sg.upload_arb(1, 'my wave!', samples)
+    samples = [0.0, 1.0, 0.0, -1.0] * 8        # 32 points
+    clean = sg.upload_arb(1, 'my wave!', samples, points=32)
     assert clean == 'my_wave_'                 # sanitised name returned
     assert len(sg.sent_raw) == 1
     msg = sg.sent_raw[0]
-    # LENGTH,<bytes>B + TYPE are required or the 4055B silently discards it.
-    nbytes = BK4055B.ARB_POINTS * 2
-    header = f'C1:WVDT WVNM,my_wave_,LENGTH,{nbytes}B,TYPE,6,WAVEDATA,'.encode('latin1')
+    # Minimal header only: the 4055B silently rejects the full-field
+    # app-note form (bench 2026-07-02) -- level/rate go via BSWV/SRATE.
+    header = b'C1:WVDT WVNM,my_wave_,WAVEDATA,'
     assert msg.startswith(header)
+    assert b'LENGTH' not in msg
     payload = msg[len(header):]
-    assert len(payload) == nbytes
+    assert len(payload) == 32 * 2
     assert struct.unpack('<4h', payload[:8]) == (0, 32767, 0, -32767)
 
 
-def test_upload_arb_resamples_to_fixed_length():
-    # Any input length is resampled to ARB_POINTS (the box's fixed buffer).
+def test_upload_arb_defaults_to_short_buffer():
+    # No explicit points -> short ARB_DEFAULT_POINTS buffer (not 16384).
     sg = FakeSG()
-    sg.upload_arb(1, 'short', [0.0, 1.0, 0.0, -1.0])      # 4 -> 16384
+    sg.upload_arb(1, 'short', [0.0, 1.0, 0.0, -1.0] * 1000)
     payload = sg.sent_raw[0].split(b'WAVEDATA,', 1)[1]
-    assert len(payload) == BK4055B.ARB_POINTS * 2
+    assert len(payload) == BK4055B.ARB_DEFAULT_POINTS * 2
 
 
 def test_select_arb_and_arwv_parse():
