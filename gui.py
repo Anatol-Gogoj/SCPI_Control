@@ -26,6 +26,7 @@ import sys
 import time
 from datetime import datetime
 from instruments import BK894, TekMSO24, BK4055B
+import lcr_format
 from siggen_presets import SignalGenPresetStore
 from arb_editor import ArbWaveformEditor
 from waveform_render import unit_waveform, scale_waveform
@@ -203,7 +204,7 @@ CONFIGURATION:
   - CPD: Capacitance + Dissipation Factor (for capacitors)
   - LSRS: Inductance (series) + Resistance (for inductors)
   - RX: Resistance + Reactance (for general impedance)
-- Frequency: Test frequency (100 Hz to 200 kHz)
+- Frequency: Test frequency (100 Hz to 500 kHz)
   - Use 1 kHz for general capacitor testing
   - Use 100 Hz for electrolytics
   - Use 10 kHz+ for high-frequency components
@@ -465,6 +466,9 @@ ANALYSIS:
                    command=self.show_lcr_tips).pack(side=tk.RIGHT)
 
         self.lcr_continuous = False
+        # Mode the instrument is actually in (set on Apply / read-back);
+        # readouts are labeled by THIS, not the dropdown (issue #38).
+        self.lcr_applied_mode = None
 
     # ---- LCR Sweep ------------------------------------------------------
 
@@ -1279,6 +1283,7 @@ ANALYSIS:
         try:
             config = self.lcr.get_config()
             self.lcr_mode.set(config['mode'].upper())
+            self.lcr_applied_mode = config['mode'].upper()
             self.lcr_freq.delete(0, tk.END)
             self.lcr_freq.insert(0, str(int(config['frequency'])))
             if 'voltage' in config:
@@ -1300,7 +1305,8 @@ ANALYSIS:
             self.lcr.set_mode(mode)
             self.lcr.set_frequency(freq)
             self.lcr.set_voltage(volt)
-            
+            self.lcr_applied_mode = mode.upper()
+
             time.sleep(0.3)
             self.status_bar.config(text=f"LCR configured: {mode}, {freq} Hz, {volt} V")
         except Exception as e:
@@ -1313,23 +1319,25 @@ ANALYSIS:
         
         try:
             primary, secondary, status = self.lcr.measure()
-            mode = self.lcr_mode.get()
-            
-            # Format based on mode
-            if 'C' in mode:
-                p_str = f"{primary*1e9:.3f} nF"
-            elif 'L' in mode:
-                p_str = f"{primary*1e6:.3f} µH"
-            elif 'Z' in mode:
-                p_str = f"{primary:.3f} Ω"
-            else:
-                p_str = f"{primary:.6g}"
-            
-            self.lcr_primary_label.config(text=f"Primary: {p_str}")
-            self.lcr_secondary_label.config(text=f"Secondary: {secondary:.6g}")
-            self.lcr_status_label.config(text=f"Status: {'OK' if status == 0 else 'Error'}")
         except Exception as e:
+            # In continuous mode this used to re-raise every 200 ms and
+            # stack a modal dialog per tick (issue #38): stop polling FIRST
+            # so exactly one dialog appears.
+            was_continuous = self.lcr_continuous
+            self.lcr_stop_continuous()
+            if was_continuous:
+                self.status_bar.config(
+                    text=f"Continuous LCR read stopped: {e}")
             messagebox.showerror("Measurement Error", str(e))
+            return
+
+        # Label by the mode the instrument is actually in, not whatever the
+        # dropdown was flipped to since the last Apply (issue #38).
+        mode = self.lcr_applied_mode or self.lcr_mode.get()
+        p_str, s_str = lcr_format.format_measurement(mode, primary, secondary)
+        self.lcr_primary_label.config(text=f"Primary: {p_str}")
+        self.lcr_secondary_label.config(text=f"Secondary: {s_str}")
+        self.lcr_status_label.config(text=f"Status: {'OK' if status == 0 else 'Error'}")
     
     def lcr_start_continuous(self):
         self.lcr_continuous = True
