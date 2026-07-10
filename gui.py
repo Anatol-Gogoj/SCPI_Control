@@ -27,6 +27,7 @@ import time
 from datetime import datetime
 from instruments import BK894, TekMSO24, BK4055B
 import lcr_format
+import scope_trace
 from siggen_presets import SignalGenPresetStore
 from arb_editor import ArbWaveformEditor
 from waveform_render import unit_waveform, scale_waveform
@@ -339,14 +340,14 @@ AUTOMATED MEASUREMENTS:
 - RMS is true RMS, not peak/√2
 
 WAVEFORM CAPTURE:
-- Saves time and voltage arrays to CSV
-- Useful for offline analysis, FFT, etc.
-- Captures current screen contents
+- Transfers the acquired sample record (not a screenshot) and shows it
+  in a plot window: min/max envelope, auto-scaled axes, pk-pk summary
+- Save CSV from the plot window for offline analysis
+- Narrow glitches survive the plot's decimation (min/max per column)
 
 TIPS:
 - Use AutoSet for quick setup on unknown signals
 - Stop acquisition before changing major settings
-- For low-frequency signals, increase memory depth
 - Ground unused channels to reduce noise"""
         
         messagebox.showinfo("Oscilloscope Tips", tips)
@@ -2058,36 +2059,25 @@ ANALYSIS:
             messagebox.showerror("Measurement Error", str(e))
     
     def scope_capture_waveform(self, channel):
-        """Capture waveform for a specific channel"""
+        """Fetch a channel's sample record off the UI thread, then show it
+        in a plot window -- Save CSV lives there (issues #40/#42)."""
         if not self.scope:
             messagebox.showerror("Error", "Oscilloscope not connected")
             return
-        
-        try:
-            filename = filedialog.asksaveasfilename(
-                defaultextension=".csv",
-                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-                initialfile=f"waveform_ch{channel}.csv"
-            )
-            
-            if not filename:
+        self.status_bar.config(text=f"Capturing CH{channel} waveform...")
+
+        def done(waveform, error):
+            if error:
+                messagebox.showerror("Capture Error", str(error))
+                self.status_bar.config(text=f"CH{channel} capture failed")
                 return
-            
-            self.status_bar.config(text=f"Capturing CH{channel} waveform...")
-            self.root.update()
-            
-            waveform = self.scope.get_waveform(channel)
-            
-            with open(filename, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['Time (s)', 'Voltage (V)'])
-                for t, v in zip(waveform['t'], waveform['v']):
-                    writer.writerow([t, v])
-            
-            self.status_bar.config(text=f"CH{channel} waveform saved: {filename}")
-            messagebox.showinfo("Success", f"Waveform saved to {filename}")
-        except Exception as e:
-            messagebox.showerror("Capture Error", str(e))
+            self.status_bar.config(
+                text=f"CH{channel} waveform captured "
+                     f"({waveform['npts']} points)")
+            scope_trace.TraceWindow(self, channel, waveform)
+
+        self._run_bg(lambda: self.scope.get_waveform(channel), done,
+                     busy='scope-io')
     
     # Logging methods
     def select_log_dir(self):
