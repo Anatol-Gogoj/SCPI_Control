@@ -30,6 +30,7 @@ from instruments import BK894, TekMSO24, BK4055B
 import lcr_format
 import scope_trace
 from siggen_presets import SignalGenPresetStore
+from ui_widgets import ScrollableTab, add_tooltip
 from arb_editor import ArbWaveformEditor
 from waveform_render import unit_waveform, scale_waveform
 from version import version_string
@@ -75,6 +76,29 @@ SG_FIELD_WAVEFORMS = {
 }
 
 SG_ADVANCED_FIELDS = {'phase', 'rise', 'fall', 'delay', 'load', 'polarity'}
+
+# hover help per field (ui_widgets.add_tooltip); attached in the build loop
+SG_FIELD_TOOLTIPS = {
+    'freq': 'Output frequency (Hz). For ARB this is the repetition rate '
+            'of the whole recalled waveform.',
+    'amp': 'Peak-to-peak amplitude (V). Calibrated for the selected Load '
+           '-- check Load before trusting the number.',
+    'offset': 'DC level added to the waveform (V).',
+    'stdev': 'Noise level: standard deviation of the gaussian noise (V).',
+    'mean': 'Noise DC mean / center level (V).',
+    'duty': 'High-time as a percentage of the period (0-100).',
+    'sym': 'Ramp symmetry: 50% = triangle, 100% = rising sawtooth, '
+           '0% = falling sawtooth.',
+    'phase': 'Phase offset in degrees.',
+    'rise': 'Pulse 10-90% rise time (s).',
+    'fall': 'Pulse 90-10% fall time (s).',
+    'delay': 'Pulse delay from the period start (s).',
+    'load': 'What the output feeds: High-Z (e.g. scope 1 MOhm input) or '
+            'ohms for a matched load. Amplitude is calibrated for this '
+            'setting -- into open circuit the real voltage is ~2x the '
+            '50 Ohm value.',
+    'polarity': 'NOR = normal output, INVT = inverted.',
+}
 
 # field key -> BSWV SCPI parameter
 SG_BSWV_KEYS = {'freq': 'FRQ', 'amp': 'AMP', 'offset': 'OFST',
@@ -456,10 +480,18 @@ CONNECTION:
 - Auto-detected via PyVISA (USB VID 0x0471, PID 0x2827)
 
 CONFIGURATION:
-- Mode: Select measurement type
-  - CPD: Capacitance + Dissipation Factor (for capacitors)
-  - LSRS: Inductance (series) + Resistance (for inductors)
-  - RX: Resistance + Reactance (for general impedance)
+- Mode: which pair the meter reports (primary + secondary)
+  - CPD / CPQ: capacitance + D (loss) or Q - the everyday capacitor
+    modes; D = tan(delta), lower means a better dielectric
+  - CPG / CPRP: capacitance + conductance / parallel resistance
+  - CSD / CSQ / CSRS: SERIES-model capacitance - use for large C or
+    low impedance (e.g. electrolytics at 100 Hz)
+  - LSRS / LSRD / LPRS / LPRP: inductance (series/parallel model)
+    + winding resistance
+  - RX: resistance + reactance (general impedance parts)
+  - ZTD / ZTR: impedance magnitude + phase (degrees / radians)
+  - Rule of thumb: high impedance (>10 kΩ) -> parallel model
+    (CP*/LP*); low impedance (<1 kΩ) -> series model (CS*/LS*)
 - Frequency: Test frequency (100 Hz to 500 kHz)
   - Use 1 kHz for general capacitor testing
   - Use 100 Hz for electrolytics
@@ -471,14 +503,19 @@ DC BIAS, SPEED & RANGE:
 - DC Bias applies a steady voltage across the DUT during the AC test
   (C-vs-bias derating of class-II ceramics, etc.): set the volts, tick
   Bias ON, Apply. Untick + Apply to switch it off.
-- Speed (SLOW/MED/FAST) + Avg trade accuracy against reading rate;
-  SLOW + averaging gives the cleanest D readings
+- Speed = the meter's APERTURE (integration time per reading):
+  SLOW is most accurate with the quietest D readings, FAST updates
+  quickest, MED is the everyday default
+- Avg = how many raw readings the METER averages into each reported
+  result (1-256); SLOW + Avg 8-16 gives the cleanest dissipation
+  numbers on small capacitors
 - Auto range OFF holds the current range: no mid-sweep range-hunting
   glitches on a fixed DUT (re-enable for unknown parts)
 
 FIXTURE CORRECTION:
-- Open Corr (fixture empty) / Short Corr (terminals shorted) sweep all
-  test frequencies and de-embed the fixture from every later reading
+- Open Correction (fixture empty) / Short Correction (terminals
+  shorted) sweep all test frequencies and de-embed the fixture from
+  every later reading
 - Redo the corrections whenever the fixture or leads change
 - The sweep takes tens of seconds; the meter is busy while it runs
 
@@ -679,8 +716,9 @@ ANALYSIS:
     
     def create_lcr_tab(self):
         """Create LCR meter control tab"""
-        lcr_frame = ttk.Frame(self.notebook)
-        self.notebook.add(lcr_frame, text="LCR Meter (BK 894)")
+        _tab = ScrollableTab(self.notebook)
+        self.notebook.add(_tab, text="LCR Meter (BK 894)")
+        lcr_frame = _tab.body
         
         # Connection status
         status_frame = ttk.LabelFrame(lcr_frame, text="Connection", padding=10)
@@ -701,18 +739,30 @@ ANALYSIS:
         self.lcr_mode.grid(row=0, column=1, padx=10, pady=5)
         self.lcr_mode['values'] = list(BK894.MODES.keys())
         self.lcr_mode.set('CPD')
+        add_tooltip(self.lcr_mode,
+                    "Measurement pair (primary + secondary):\n"
+                    + "\n".join(f"  {k}: {v}"
+                                 for k, v in BK894.MODES.items())
+                    + "\nCP/LP = parallel model (small C / large L);"
+                    " CS/LS = series model (large C / low impedance).")
         
         # Frequency
         ttk.Label(config_frame, text="Frequency (Hz):").grid(row=1, column=0, sticky='w', pady=5)
         self.lcr_freq = ttk.Entry(config_frame, width=20)
         self.lcr_freq.grid(row=1, column=1, padx=10, pady=5)
         self.lcr_freq.insert(0, "1000")
+        add_tooltip(self.lcr_freq,
+                    "AC test frequency, 100 Hz to 500 kHz. 1 kHz is the "
+                    "standard capacitor test; use 100 Hz for electrolytics.")
         
         # Voltage
         ttk.Label(config_frame, text="Voltage (V):").grid(row=2, column=0, sticky='w', pady=5)
         self.lcr_volt = ttk.Entry(config_frame, width=20)
         self.lcr_volt.grid(row=2, column=1, padx=10, pady=5)
         self.lcr_volt.insert(0, "1.0")
+        add_tooltip(self.lcr_volt,
+                    "AC test level, 0.01 to 2.0 V. 1.0 V is standard; the "
+                    "meter clamps anything higher to 2.0 V.")
 
         # Bias / aperture / range / correction (issue #44) -- laid out to
         # the RIGHT of mode/freq/volt so the tab gets no taller (issue #26).
@@ -721,9 +771,15 @@ ANALYSIS:
         self.lcr_bias_volt = ttk.Entry(config_frame, width=8)
         self.lcr_bias_volt.grid(row=0, column=3, padx=6, sticky='w')
         self.lcr_bias_volt.insert(0, "0.0")
+        add_tooltip(self.lcr_bias_volt,
+                    "Steady DC voltage held across the DUT during the AC "
+                    "test (for C-vs-bias curves). Takes effect only while "
+                    "'Bias ON' is ticked, pushed on Apply.")
         self.lcr_bias_on = tk.BooleanVar(value=False)
-        ttk.Checkbutton(config_frame, text="Bias ON",
-                        variable=self.lcr_bias_on).grid(
+        add_tooltip(ttk.Checkbutton(config_frame, text="Bias ON",
+                                    variable=self.lcr_bias_on),
+                    "Switch the internal DC bias source on/off "
+                    "(applied on Apply Configuration).").grid(
             row=0, column=4, columnspan=2, sticky='w')
 
         ttk.Label(config_frame, text="Speed:").grid(
@@ -732,20 +788,39 @@ ANALYSIS:
                                       values=list(BK894.APERTURE_SPEEDS))
         self.lcr_speed.set('MED')
         self.lcr_speed.grid(row=1, column=3, padx=6, sticky='w')
+        add_tooltip(self.lcr_speed,
+                    "Measurement aperture (integration time per reading): "
+                    "SLOW = most accurate, quietest D readings; FAST = "
+                    "quickest updates; MED is the everyday default.")
         ttk.Label(config_frame, text="Avg:").grid(row=1, column=4, sticky='e')
         self.lcr_avg = ttk.Entry(config_frame, width=5)
         self.lcr_avg.grid(row=1, column=5, padx=4, sticky='w')
         self.lcr_avg.insert(0, "1")
+        add_tooltip(self.lcr_avg,
+                    "Instrument-side averaging: the meter averages this "
+                    "many raw measurements (1-256) into each reported "
+                    "reading. Higher = smoother but slower.")
 
         self.lcr_autorange = tk.BooleanVar(value=True)
-        ttk.Checkbutton(config_frame, text="Auto range",
-                        variable=self.lcr_autorange).grid(
+        add_tooltip(ttk.Checkbutton(config_frame, text="Auto range",
+                                    variable=self.lcr_autorange),
+                    "ON: the meter picks its range automatically. Turn OFF "
+                    "to hold the current range during sweeps on a fixed "
+                    "DUT (no mid-sweep range-change glitches).").grid(
             row=2, column=2, columnspan=2, sticky='w', padx=(24, 0))
-        ttk.Button(config_frame, text="Open Corr...",
-                   command=lambda: self.lcr_run_correction('open')).grid(
+        add_tooltip(
+            ttk.Button(config_frame, text="Open Correction...",
+                       command=lambda: self.lcr_run_correction('open')),
+            "Fixture de-embedding: with NOTHING connected, sweep every "
+            "test frequency and subtract the fixture's stray capacitance "
+            "from all future readings. Takes tens of seconds.").grid(
             row=2, column=4, padx=2)
-        ttk.Button(config_frame, text="Short Corr...",
-                   command=lambda: self.lcr_run_correction('short')).grid(
+        add_tooltip(
+            ttk.Button(config_frame, text="Short Correction...",
+                       command=lambda: self.lcr_run_correction('short')),
+            "Fixture de-embedding: with the terminals SHORTED, sweep and "
+            "subtract lead resistance/inductance. Takes tens of "
+            "seconds.").grid(
             row=2, column=5, padx=2)
 
         # Apply button
@@ -1312,8 +1387,9 @@ ANALYSIS:
 
     def create_scope_tab(self):
         """Create oscilloscope control tab"""
-        scope_frame = ttk.Frame(self.notebook)
-        self.notebook.add(scope_frame, text="Oscilloscope (MSO24)")
+        _tab = ScrollableTab(self.notebook)
+        self.notebook.add(_tab, text="Oscilloscope (MSO24)")
+        scope_frame = _tab.body
         
         # Connection status
         status_frame = ttk.LabelFrame(scope_frame, text="Connection", padding=10)
@@ -1347,6 +1423,8 @@ ANALYSIS:
             vscale = ttk.Entry(ch_frame, width=12)
             vscale.grid(row=1, column=1, padx=5, pady=5)
             vscale.insert(0, "1.0")
+            add_tooltip(vscale, "Vertical sensitivity: volts per grid "
+                                "division for this channel.")
             
             # Coupling
             ttk.Label(ch_frame, text="Coupling:").grid(row=1, column=2, sticky='w', padx=(20,0), pady=5)
@@ -1354,17 +1432,26 @@ ANALYSIS:
             coupling.grid(row=1, column=3, padx=5, pady=5)
             coupling['values'] = ['DC', 'AC', 'GND']
             coupling.set('DC')
+            add_tooltip(coupling, "DC = show everything; AC = block the DC "
+                                  "level (ripple on a bias); GND = flat "
+                                  "zero-reference.")
             
             # Position
             ttk.Label(ch_frame, text="Position (div):").grid(row=2, column=0, sticky='w', padx=10, pady=5)
             position = ttk.Entry(ch_frame, width=12)
             position.grid(row=2, column=1, padx=5, pady=5)
             position.insert(0, "0")
+            add_tooltip(position, "Vertical position of the trace, in "
+                                  "divisions from center.")
             
             # Trigger source option (only show on CH1-4)
             ttk.Label(ch_frame, text="Use as trigger:").grid(row=2, column=2, sticky='w', padx=(20,0), pady=5)
             trigger_var = tk.BooleanVar(value=(ch == 1))
-            ttk.Checkbutton(ch_frame, variable=trigger_var).grid(row=2, column=3, padx=5, pady=5)
+            add_tooltip(ttk.Checkbutton(ch_frame, variable=trigger_var),
+                        "Use this channel as the edge-trigger source. If "
+                        "several are ticked the lowest-numbered wins; "
+                        "takes effect on Apply All Settings.").grid(
+                row=2, column=3, padx=5, pady=5)
             
             # Apply button for this channel
             ttk.Button(ch_frame, text=f"Apply CH{ch} Config", 
@@ -1389,12 +1476,17 @@ ANALYSIS:
         self.scope_hscale = ttk.Entry(control_frame, width=15)
         self.scope_hscale.grid(row=0, column=1, padx=10, pady=5)
         self.scope_hscale.insert(0, "0.001")
+        add_tooltip(self.scope_hscale, "Timebase: seconds per grid "
+                                       "division (whole screen = 10 div).")
         
         # Trigger level
         ttk.Label(control_frame, text="Trigger Level (V):").grid(row=0, column=2, sticky='w', pady=5, padx=(20,0))
         self.scope_trig_level = ttk.Entry(control_frame, width=10)
         self.scope_trig_level.grid(row=0, column=3, padx=10, pady=5)
         self.scope_trig_level.insert(0, "0")
+        add_tooltip(self.scope_trig_level,
+                    "Voltage the trigger-source signal must cross to "
+                    "start an acquisition.")
         
         # Trigger slope
         ttk.Label(control_frame, text="Trigger Slope:").grid(row=1, column=0, sticky='w', pady=5)
@@ -1402,6 +1494,9 @@ ANALYSIS:
         self.scope_trig_slope.grid(row=1, column=1, padx=10, pady=5)
         self.scope_trig_slope['values'] = ['RISE', 'FALL']
         self.scope_trig_slope.set('RISE')
+        add_tooltip(self.scope_trig_slope,
+                    "Trigger on the rising or falling edge crossing the "
+                    "trigger level.")
         
         # Apply all button
         ttk.Button(control_frame, text="Apply All Settings", 
@@ -1461,8 +1556,9 @@ ANALYSIS:
     
     def create_sg_tab(self):
         """Create signal generator control tab"""
-        sg_frame = ttk.Frame(self.notebook)
-        self.notebook.add(sg_frame, text="Signal Gen (BK 4055B)")
+        _tab = ScrollableTab(self.notebook)
+        self.notebook.add(_tab, text="Signal Gen (BK 4055B)")
+        sg_frame = _tab.body
 
         # Connection status
         status_frame = ttk.LabelFrame(sg_frame, text="Connection", padding=10)
@@ -1520,8 +1616,9 @@ ANALYSIS:
 
     def create_logging_tab(self):
         """Create data logging tab"""
-        log_frame = ttk.Frame(self.notebook)
-        self.notebook.add(log_frame, text="Data Logging")
+        _tab = ScrollableTab(self.notebook)
+        self.notebook.add(_tab, text="Data Logging")
+        log_frame = _tab.body
         
         # Logging configuration
         config_frame = ttk.LabelFrame(log_frame, text="Logging Configuration", padding=10)
@@ -1537,6 +1634,10 @@ ANALYSIS:
         # Sample rate
         ttk.Label(config_frame, text="Sample Interval (s):").grid(row=1, column=0, sticky='w', pady=5)
         self.log_interval = ttk.Entry(config_frame, width=15)
+        add_tooltip(self.log_interval,
+                    "Seconds between samples. All ticked sources are "
+                    "sampled once per interval; each gets its own "
+                    "timestamped CSV.")
         self.log_interval.grid(row=1, column=1, sticky='w', padx=10, pady=5)
         self.log_interval.insert(0, "1.0")
         
@@ -1832,6 +1933,10 @@ ANALYSIS:
         waveform.pack(side=tk.LEFT, padx=4)
         waveform.bind('<<ComboboxSelected>>',
                       lambda e, c=ch: self._sg_waveform_changed(c))
+        add_tooltip(waveform, "Waveform type; the fields below adapt to "
+                              "it. ARB = custom waveform (design in the "
+                              "Waveform Editor, deliver via flash-drive "
+                              ".bin).")
         applied_wave = tk.Label(wrow, text='--', fg='gray', width=14, anchor='w')
         applied_wave.pack(side=tk.LEFT, padx=4)
         widgets['waveform'] = waveform
@@ -1876,6 +1981,8 @@ ANALYSIS:
                 w.pack(side=tk.LEFT, padx=4)
             applied = tk.Label(row, text='--', fg='gray', width=14, anchor='w')
             applied.pack(side=tk.LEFT, padx=4)
+            if key in SG_FIELD_TOOLTIPS:
+                add_tooltip(w, SG_FIELD_TOOLTIPS[key])
             widgets[key] = w
             widgets['rows'][key] = row
             widgets['applied'][key] = applied
@@ -1910,31 +2017,45 @@ ANALYSIS:
         burst = ttk.Frame(parent)
         burst.pack(fill='x', padx=10, pady=(0, 6))
         widgets['burst_on'] = tk.BooleanVar(value=False)
-        ttk.Checkbutton(burst, text="Burst",
-                        variable=widgets['burst_on']).pack(side=tk.LEFT)
+        add_tooltip(ttk.Checkbutton(burst, text="Burst",
+                                    variable=widgets['burst_on']),
+                    "Emit exactly N cycles per trigger, then idle -- "
+                    "bounded energy per shot, the HV-safe way to drive "
+                    "the Trek amplifier. Pushed on Apply.").pack(
+            side=tk.LEFT)
         ttk.Label(burst, text="Cycles:").pack(side=tk.LEFT, padx=(8, 2))
         w = ttk.Entry(burst, width=6)
         w.insert(0, '1')
         w.pack(side=tk.LEFT)
+        add_tooltip(w, "Cycles emitted per burst trigger (N >= 1).")
         widgets['burst_ncyc'] = w
         ttk.Label(burst, text="Trigger:").pack(side=tk.LEFT, padx=(8, 2))
         cb = ttk.Combobox(burst, width=5, state='readonly',
                           values=['MAN', 'INT', 'EXT'])
         cb.set('MAN')
         cb.pack(side=tk.LEFT)
+        add_tooltip(cb, "Burst trigger source: MAN = the Fire button (or "
+                        "front panel), INT = auto-repeat every Interval "
+                        "seconds, EXT = edge on the rear Aux In.")
         widgets['burst_trsr'] = cb
         ttk.Label(burst, text="Interval (s):").pack(side=tk.LEFT, padx=(8, 2))
         w = ttk.Entry(burst, width=7)
         w.insert(0, '1.0')
         w.pack(side=tk.LEFT)
+        add_tooltip(w, "Burst repeat interval in seconds (INT trigger "
+                       "only).")
         widgets['burst_prd'] = w
-        ttk.Button(burst, text="Fire", width=5,
-                   command=lambda c=ch: self.sg_fire_burst(c)).pack(
-            side=tk.LEFT, padx=8)
+        add_tooltip(ttk.Button(burst, text="Fire", width=5,
+                               command=lambda c=ch: self.sg_fire_burst(c)),
+                    "Send one manual burst trigger now (needs Burst ON, "
+                    "trigger MAN, output ON).").pack(side=tk.LEFT, padx=8)
         widgets['sync_on'] = tk.BooleanVar(value=False)
-        ttk.Checkbutton(burst, text="Sync out",
-                        variable=widgets['sync_on']).pack(side=tk.LEFT,
-                                                          padx=(12, 0))
+        add_tooltip(ttk.Checkbutton(burst, text="Sync out",
+                                    variable=widgets['sync_on']),
+                    "Hardware trigger edge on the rear Sync BNC every "
+                    "waveform period -- feed it to the scope's Aux In "
+                    "for rock-solid triggering on slow arbs.").pack(
+            side=tk.LEFT, padx=(12, 0))
         applied_burst = tk.Label(burst, text='--', fg='gray', anchor='w')
         applied_burst.pack(side=tk.LEFT, padx=8)
         widgets['applied']['burst'] = applied_burst
@@ -2790,8 +2911,9 @@ ANALYSIS:
     # ==================== Webcam tab ====================
     def create_webcam_tab(self):
         """USB webcam: live preview, snapshot, interval + stepped capture."""
-        tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text="Webcam")
+        _tab = ScrollableTab(self.notebook)
+        self.notebook.add(_tab, text="Webcam")
+        tab = _tab.body
 
         ok, reason = webcam.deps_available()
         if not ok:
