@@ -288,6 +288,21 @@ CONFIGURATION:
 - Voltage: AC test signal amplitude (0.01 to 2.0 V)
   - 1.0V is standard for most measurements
 
+DC BIAS, SPEED & RANGE:
+- DC Bias applies a steady voltage across the DUT during the AC test
+  (C-vs-bias derating of class-II ceramics, etc.): set the volts, tick
+  Bias ON, Apply. Untick + Apply to switch it off.
+- Speed (SLOW/MED/FAST) + Avg trade accuracy against reading rate;
+  SLOW + averaging gives the cleanest D readings
+- Auto range OFF holds the current range: no mid-sweep range-hunting
+  glitches on a fixed DUT (re-enable for unknown parts)
+
+FIXTURE CORRECTION:
+- Open Corr (fixture empty) / Short Corr (terminals shorted) sweep all
+  test frequencies and de-embed the fixture from every later reading
+- Redo the corrections whenever the fixture or leads change
+- The sweep takes tens of seconds; the meter is busy while it runs
+
 MEASUREMENTS:
 - Single Measurement: Take one reading
 - Start Continuous: Update display every 200ms
@@ -504,10 +519,47 @@ ANALYSIS:
         self.lcr_volt = ttk.Entry(config_frame, width=20)
         self.lcr_volt.grid(row=2, column=1, padx=10, pady=5)
         self.lcr_volt.insert(0, "1.0")
-        
+
+        # Bias / aperture / range / correction (issue #44) -- laid out to
+        # the RIGHT of mode/freq/volt so the tab gets no taller (issue #26).
+        ttk.Label(config_frame, text="DC Bias (V):").grid(
+            row=0, column=2, sticky='e', padx=(24, 0))
+        self.lcr_bias_volt = ttk.Entry(config_frame, width=8)
+        self.lcr_bias_volt.grid(row=0, column=3, padx=6, sticky='w')
+        self.lcr_bias_volt.insert(0, "0.0")
+        self.lcr_bias_on = tk.BooleanVar(value=False)
+        ttk.Checkbutton(config_frame, text="Bias ON",
+                        variable=self.lcr_bias_on).grid(
+            row=0, column=4, columnspan=2, sticky='w')
+
+        ttk.Label(config_frame, text="Speed:").grid(
+            row=1, column=2, sticky='e', padx=(24, 0))
+        self.lcr_speed = ttk.Combobox(config_frame, width=6, state='readonly',
+                                      values=list(BK894.APERTURE_SPEEDS))
+        self.lcr_speed.set('MED')
+        self.lcr_speed.grid(row=1, column=3, padx=6, sticky='w')
+        ttk.Label(config_frame, text="Avg:").grid(row=1, column=4, sticky='e')
+        self.lcr_avg = ttk.Entry(config_frame, width=5)
+        self.lcr_avg.grid(row=1, column=5, padx=4, sticky='w')
+        self.lcr_avg.insert(0, "1")
+
+        self.lcr_autorange = tk.BooleanVar(value=True)
+        ttk.Checkbutton(config_frame, text="Auto range",
+                        variable=self.lcr_autorange).grid(
+            row=2, column=2, columnspan=2, sticky='w', padx=(24, 0))
+        ttk.Button(config_frame, text="Open Corr...",
+                   command=lambda: self.lcr_run_correction('open')).grid(
+            row=2, column=4, padx=2)
+        ttk.Button(config_frame, text="Short Corr...",
+                   command=lambda: self.lcr_run_correction('short')).grid(
+            row=2, column=5, padx=2)
+
         # Apply button
-        ttk.Button(config_frame, text="Apply Configuration", 
+        ttk.Button(config_frame, text="Apply Configuration",
                    command=self.apply_lcr_config).grid(row=3, column=0, columnspan=2, pady=10)
+        self.lcr_corr_label = ttk.Label(config_frame, text="Correction: --")
+        self.lcr_corr_label.grid(row=3, column=2, columnspan=4, sticky='w',
+                                 padx=(24, 0))
         
         # Measurement display
         meas_frame = ttk.LabelFrame(lcr_frame, text="Current Measurement", padding=10)
@@ -1361,6 +1413,62 @@ ANALYSIS:
                 self.lcr_volt.insert(0, str(config['voltage']))
         except Exception as e:
             self.status_bar.config(text=f"Error reading config: {e}")
+            return
+        # Bias / aperture / correction read-back (issue #44) is best-effort
+        # so an older firmware can't break the basic config sync above.
+        try:
+            bias = self.lcr.get_bias()
+            self._set_entry(self.lcr_bias_volt, bias['volts'])
+            self.lcr_bias_on.set(bias['on'])
+            speed, avg = self.lcr.get_aperture()
+            if speed in BK894.APERTURE_SPEEDS:
+                self.lcr_speed.set(speed)
+            self._set_entry(self.lcr_avg, avg)
+            self.lcr_corr_label.config(
+                text=self._lcr_corr_text(self.lcr.get_correction_states()))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _lcr_corr_text(corr):
+        return (f"Correction: open {'ON' if corr['open'] else 'off'}, "
+                f"short {'ON' if corr['short'] else 'off'}")
+
+    def lcr_run_correction(self, kind):
+        """Open/short fixture correction: sweeps every test frequency, takes
+        tens of seconds -- runs off the UI thread (issues #44/#40)."""
+        if not self.lcr:
+            messagebox.showerror("Error", "LCR meter not connected")
+            return
+        prep = {
+            'open': "Remove the DUT so the fixture is OPEN "
+                    "(nothing connected).",
+            'short': "SHORT the fixture terminals together "
+                     "(shorting bar or thick wire).",
+        }[kind]
+        if not messagebox.askokcancel(
+                f"{kind.capitalize()} correction",
+                f"{prep}\n\nThe meter sweeps every test frequency -- this "
+                "takes tens of seconds and the meter is busy meanwhile. "
+                "Start now?"):
+            return
+        self.lcr_stop_continuous()
+        self.status_bar.config(text=f"Running {kind} correction sweep...")
+
+        def work():
+            self.lcr.run_correction(kind)
+            return self.lcr.get_correction_states()
+
+        def done(corr, error):
+            if error:
+                messagebox.showerror("Correction failed", str(error))
+                self.status_bar.config(text=f"{kind} correction failed")
+                return
+            self.lcr_corr_label.config(text=self._lcr_corr_text(corr))
+            self.status_bar.config(
+                text=f"{kind.capitalize()} correction swept and applied")
+
+        self._run_bg(work, done, busy='lcr-corr')
     
     def apply_lcr_config(self):
         if not self.lcr:
@@ -1371,14 +1479,24 @@ ANALYSIS:
             mode = self.lcr_mode.get()
             freq = float(self.lcr_freq.get())
             volt = float(self.lcr_volt.get())
-            
+            bias_v = float(self.lcr_bias_volt.get())
+            avg = int(self.lcr_avg.get())
+
             self.lcr.set_mode(mode)
             self.lcr.set_frequency(freq)
             self.lcr.set_voltage(volt)
+            self.lcr.set_aperture(self.lcr_speed.get() or 'MED', avg)
+            self.lcr.set_range_auto(self.lcr_autorange.get())
+            self.lcr.set_bias_voltage(bias_v)
+            self.lcr.set_bias_enabled(self.lcr_bias_on.get())
             self.lcr_applied_mode = mode.upper()
 
             time.sleep(0.3)
-            self.status_bar.config(text=f"LCR configured: {mode}, {freq} Hz, {volt} V")
+            bias_note = (f", bias {bias_v:g} V ON" if self.lcr_bias_on.get()
+                         else "")
+            self.status_bar.config(
+                text=f"LCR configured: {mode}, {freq} Hz, {volt} V"
+                     f"{bias_note}")
         except Exception as e:
             messagebox.showerror("Configuration Error", str(e))
     
