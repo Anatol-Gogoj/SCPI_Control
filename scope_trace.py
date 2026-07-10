@@ -7,7 +7,7 @@ min/max envelope (so a 10k-point record stays honest at 600 px -- glitches
 survive decimation), 'nice' axis ticks, and Save CSV from the window.
 
 The math lives in module-level functions with no Tk so it can be tested
-headless: .venv/bin/python test_scope_trace.py
+headless: .venv/bin/python tests/test_scope_trace.py
 """
 import csv
 import math

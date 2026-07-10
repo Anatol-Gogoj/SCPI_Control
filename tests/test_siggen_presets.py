@@ -2,8 +2,14 @@
 """Headless tests for SignalGenPresetStore (no instrument needed).
 
 Round-trips presets through a temp file and checks validation/corruption
-handling. Run: .venv/bin/python test_siggen_presets.py
+handling. Run: .venv/bin/python tests/test_siggen_presets.py
 """
+# Runnable from anywhere: put the repo root (one level up) on sys.path
+# so the app modules import when this file is executed directly.
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(
+    _os.path.abspath(__file__))))
 import os
 import json
 import tempfile

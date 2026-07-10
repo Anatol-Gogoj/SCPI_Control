@@ -16,6 +16,12 @@ Wire ONE sig gen output to ONE scope input, then:
 The sig gen LOAD is set to High-Z (matches the scope's 1 MOhm input); the
 output is turned off when the run finishes.
 """
+# Runnable from anywhere: put the repo root (one level up) on sys.path
+# so the app modules import when this file is executed directly.
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(
+    _os.path.abspath(__file__))))
 import sys
 import math
 import time

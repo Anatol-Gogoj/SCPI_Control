@@ -3,8 +3,14 @@
 
 Ground truth is arb_bin_reference_9step.bin -- a known-good lab file the
 4055B reads from a flash drive (9-step staircase, EasyWaveX-generated).
-Run: .venv/bin/python test_arb_bin.py
+Run: .venv/bin/python tests/test_arb_bin.py
 """
+# Runnable from anywhere: put the repo root (one level up) on sys.path
+# so the app modules import when this file is executed directly.
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(
+    _os.path.abspath(__file__))))
 import os
 import struct
 

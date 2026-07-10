@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """Headless tests for waveform_render (no Tk, no instrument).
 
-Run: .venv/bin/python test_waveform_render.py
+Run: .venv/bin/python tests/test_waveform_render.py
 """
+# Runnable from anywhere: put the repo root (one level up) on sys.path
+# so the app modules import when this file is executed directly.
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(
+    _os.path.abspath(__file__))))
 from waveform_render import unit_waveform, scale_waveform
 
 PPP = 200  # points per period used throughout

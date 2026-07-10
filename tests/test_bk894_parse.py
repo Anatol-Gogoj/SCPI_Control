@@ -3,8 +3,14 @@
 
 Response formats were captured from the real meter (fw 1.0.5, 2026-07-10):
 :BIAS:VOLT? -> '0.00000e+00', :BIAS:STAT? -> '0', :APER? -> 'MED,1',
-:CORR:OPEN:STAT? -> '1'. Run: .venv/bin/python test_bk894_parse.py
+:CORR:OPEN:STAT? -> '1'. Run: .venv/bin/python tests/test_bk894_parse.py
 """
+# Runnable from anywhere: put the repo root (one level up) on sys.path
+# so the app modules import when this file is executed directly.
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(
+    _os.path.abspath(__file__))))
 import types
 
 from instruments import BK894

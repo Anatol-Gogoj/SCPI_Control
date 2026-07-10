@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """Headless tests for the bench-profile store (issue #47).
 
-Run: .venv/bin/python test_bench_profiles.py
+Run: .venv/bin/python tests/test_bench_profiles.py
 """
+# Runnable from anywhere: put the repo root (one level up) on sys.path
+# so the app modules import when this file is executed directly.
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(
+    _os.path.abspath(__file__))))
 import json
 import os
 import shutil

@@ -4,8 +4,14 @@
 The gold standard is easywavex_template.csv -- the lab's own EasyWaveX
 template ("It has to be in the exact waveform template otherwise the
 EasywaveX won't generate the waveform"). The round-trip test parses it and
-rebuilds it BYTE-IDENTICALLY. Run: .venv/bin/python test_easywave_export.py
+rebuilds it BYTE-IDENTICALLY. Run: .venv/bin/python tests/test_easywave_export.py
 """
+# Runnable from anywhere: put the repo root (one level up) on sys.path
+# so the app modules import when this file is executed directly.
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(
+    _os.path.abspath(__file__))))
 import os
 
 from easywave_export import (EASYWAVE_POINTS, build_easywave_csv,

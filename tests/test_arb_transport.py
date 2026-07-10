@@ -4,8 +4,14 @@
 No instrument needed -- a FakeSG captures the bytes/commands the driver would
 send. Verifies the spec-correct WVDT framing (no LENGTH/TYPE), short-buffer
 default, int16 LE payload, and the SRATE (TrueArb) command. Run:
-    .venv/bin/python test_arb_transport.py
+    .venv/bin/python tests/test_arb_transport.py
 """
+# Runnable from anywhere: put the repo root (one level up) on sys.path
+# so the app modules import when this file is executed directly.
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(
+    _os.path.abspath(__file__))))
 import struct
 import types
 

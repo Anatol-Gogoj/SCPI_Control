@@ -11,7 +11,7 @@ presets/ dir as the sig-gen presets, so on the shared-drive deployment
 they are shared between users. Writes are atomic (tmp + os.replace) so
 two users can't tear the file.
 
-Headless self-test: .venv/bin/python test_bench_profiles.py
+Headless self-test: .venv/bin/python tests/test_bench_profiles.py
 """
 import json
 import os
