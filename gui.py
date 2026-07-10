@@ -38,12 +38,13 @@ import threading
 # ---- Signal generator field rules -----------------------------------------
 # Which fields exist, what they're called, which waveforms use them, and
 # whether they're hidden behind the Advanced toggle.
-SG_FIELD_ORDER = ('freq', 'amp', 'offset', 'arb', 'duty', 'sym',
-                  'phase', 'rise', 'fall', 'delay', 'load', 'polarity')
+SG_FIELD_ORDER = ('freq', 'amp', 'offset', 'stdev', 'mean', 'arb', 'duty',
+                  'sym', 'phase', 'rise', 'fall', 'delay', 'load', 'polarity')
 
 SG_FIELD_LABELS = {
     'freq': 'Frequency (Hz):', 'amp': 'Amplitude (Vpp):',
-    'offset': 'DC Offset (V):', 'arb': 'Arb Waveform:',
+    'offset': 'DC Offset (V):', 'stdev': 'Noise Stdev (V):',
+    'mean': 'Noise Mean (V):', 'arb': 'Arb Waveform:',
     'duty': 'Duty Cycle (%):',
     'sym': 'Symmetry (%):', 'phase': 'Phase (deg):',
     'rise': 'Rise Time (s):', 'fall': 'Fall Time (s):',
@@ -51,7 +52,8 @@ SG_FIELD_LABELS = {
 }
 
 SG_FIELD_DEFAULTS = {
-    'freq': '1000', 'amp': '1.0', 'offset': '0.0', 'duty': '50',
+    'freq': '1000', 'amp': '1.0', 'offset': '0.0', 'stdev': '0.2',
+    'mean': '0.0', 'duty': '50',
     'sym': '50', 'phase': '0', 'rise': '1e-6', 'fall': '1e-6', 'delay': '0',
 }
 
@@ -60,6 +62,8 @@ SG_FIELD_WAVEFORMS = {
     'freq': _PERIODIC,
     'amp': _PERIODIC,
     'offset': _PERIODIC | {'DC'},
+    'stdev': {'NOISE'},     # issue #45: noise level was front-panel-only
+    'mean': {'NOISE'},
     'arb': {'ARB'},
     'duty': {'SQUARE', 'PULSE'},
     'sym': {'RAMP'},
@@ -73,11 +77,13 @@ SG_ADVANCED_FIELDS = {'phase', 'rise', 'fall', 'delay', 'load', 'polarity'}
 
 # field key -> BSWV SCPI parameter
 SG_BSWV_KEYS = {'freq': 'FRQ', 'amp': 'AMP', 'offset': 'OFST',
+                'stdev': 'STDEV', 'mean': 'MEAN',
                 'duty': 'DUTY', 'sym': 'SYM', 'phase': 'PHSE',
                 'rise': 'RISE', 'fall': 'FALL', 'delay': 'DLY'}
 
 # field key -> preset ChannelState key
 SG_STATE_KEYS = {'freq': 'freq_hz', 'amp': 'amp_vpp', 'offset': 'offset_v',
+                 'stdev': 'stdev_v', 'mean': 'mean_v',
                  'duty': 'duty_pct', 'sym': 'sym_pct', 'phase': 'phase_deg',
                  'rise': 'rise_s', 'fall': 'fall_s', 'delay': 'delay_s'}
 
@@ -382,7 +388,7 @@ WAVEFORMS (fields adapt to the selected type):
 - RAMP: sawtooth/triangle, sweeps; set Symmetry (%)
   (50% = triangle, 100% = rising sawtooth, 0% = falling)
 - PULSE: timing tests; Duty plus Rise/Fall/Delay (Advanced mode)
-- NOISE: broadband stimulus (level set on the front panel for now)
+- NOISE: broadband stimulus; set Noise Stdev (level) and Mean (bias)
 - DC: fixed level only (set with DC Offset)
 - ARB: arbitrary waveform - design it in the Waveform Editor, export a
   .bin to a flash drive, recall it on the 4055B (see ARBITRARY WAVEFORMS)
@@ -434,6 +440,16 @@ ARBITRARY WAVEFORMS:
   after recalling, click Apply to push those settings over USB (they
   are short commands and safe) - or dial them in on the front panel
 - "Upload && Select" (direct upload) works over LAN only (issue #20)
+
+BURST & SYNC:
+- Burst emits exactly N cycles per trigger, then the output idles -
+  bounded energy per shot, the safest way to drive the HV amplifier
+- Trigger MAN: click Fire (or use the front panel); INT: auto-repeat
+  every Interval seconds; EXT: edge on the rear Aux In
+- Workflow: configure the wave, tick Burst, Apply, Output ON, Fire
+- Sync out puts a trigger edge on the rear Sync BNC every waveform
+  period - feed it to the scope's Aux In for rock-solid triggering
+  on slow arbs
 
 BEST PRACTICES:
 - Confirm the load setting before trusting the amplitude reading
@@ -1668,6 +1684,41 @@ ANALYSIS:
         widgets['out_btn'] = out_btn
         widgets['out_btn_bg'] = out_btn.cget('bg')
 
+        # Burst & sync (issue #45): N-cycle shots are the HV-safe way to
+        # drive the Trek amp -- bounded energy per trigger. All short
+        # commands, USB-safe; pushed by Apply like everything else.
+        burst = ttk.Frame(parent)
+        burst.pack(fill='x', padx=10, pady=(0, 6))
+        widgets['burst_on'] = tk.BooleanVar(value=False)
+        ttk.Checkbutton(burst, text="Burst",
+                        variable=widgets['burst_on']).pack(side=tk.LEFT)
+        ttk.Label(burst, text="Cycles:").pack(side=tk.LEFT, padx=(8, 2))
+        w = ttk.Entry(burst, width=6)
+        w.insert(0, '1')
+        w.pack(side=tk.LEFT)
+        widgets['burst_ncyc'] = w
+        ttk.Label(burst, text="Trigger:").pack(side=tk.LEFT, padx=(8, 2))
+        cb = ttk.Combobox(burst, width=5, state='readonly',
+                          values=['MAN', 'INT', 'EXT'])
+        cb.set('MAN')
+        cb.pack(side=tk.LEFT)
+        widgets['burst_trsr'] = cb
+        ttk.Label(burst, text="Interval (s):").pack(side=tk.LEFT, padx=(8, 2))
+        w = ttk.Entry(burst, width=7)
+        w.insert(0, '1.0')
+        w.pack(side=tk.LEFT)
+        widgets['burst_prd'] = w
+        ttk.Button(burst, text="Fire", width=5,
+                   command=lambda c=ch: self.sg_fire_burst(c)).pack(
+            side=tk.LEFT, padx=8)
+        widgets['sync_on'] = tk.BooleanVar(value=False)
+        ttk.Checkbutton(burst, text="Sync out",
+                        variable=widgets['sync_on']).pack(side=tk.LEFT,
+                                                          padx=(12, 0))
+        applied_burst = tk.Label(burst, text='--', fg='gray', anchor='w')
+        applied_burst.pack(side=tk.LEFT, padx=8)
+        widgets['applied']['burst'] = applied_burst
+
         self.sg_channel_widgets[ch] = widgets
         self._sg_update_visibility(ch)
         self._sg_redraw_preview(ch)
@@ -1803,6 +1854,19 @@ ANALYSIS:
                             else outp['load'])
         if outp['polarity'] in widgets['polarity']['values']:
             widgets['polarity'].set(outp['polarity'])
+        # Burst/sync inputs (issue #45), best-effort on older firmware
+        try:
+            b = self.sg.get_burst_dict(ch)
+            widgets['burst_on'].set(b.get('STATE', 'OFF').upper() == 'ON')
+            if isinstance(b.get('TIME'), float):
+                self._set_entry(widgets['burst_ncyc'], int(b['TIME']))
+            if b.get('TRSR') in ('MAN', 'INT', 'EXT'):
+                widgets['burst_trsr'].set(b['TRSR'])
+            if isinstance(b.get('PRD'), float):
+                self._set_entry(widgets['burst_prd'], b['PRD'])
+            widgets['sync_on'].set(self.sg.get_sync(ch))
+        except Exception:
+            pass
         self._sg_update_visibility(ch)
         self._sg_redraw_preview(ch)
         self._sg_refresh_applied(ch, bswv=bswv, outp=outp)
@@ -1846,6 +1910,21 @@ ANALYSIS:
         applied['polarity'].config(text=outp['polarity'])
         widgets['output'].set(outp['state'])
         self._sg_set_output_button(ch, outp['state'])
+        # Burst/sync readout (issue #45), best-effort
+        try:
+            b = self.sg.get_burst_dict(ch)
+            if b.get('STATE', 'OFF').upper() == 'ON':
+                ncyc = b.get('TIME')
+                desc = (f"Burst ON: {ncyc:g} cyc" if isinstance(ncyc, float)
+                        else "Burst ON")
+                desc += f", {b.get('TRSR', '?')}"
+            else:
+                desc = "Burst off"
+            if self.sg.get_sync(ch):
+                desc += " | Sync ON"
+            applied['burst'].config(text=desc)
+        except Exception:
+            applied['burst'].config(text='--')
 
     def _sg_set_output_button(self, ch, on):
         widgets = self.sg_channel_widgets[ch]
@@ -1889,6 +1968,14 @@ ANALYSIS:
             self.sg.set_load_polarity(channel,
                                       load=self._sg_load_to_wire(channel),
                                       polarity=widgets['polarity'].get())
+            # Burst + sync (issue #45)
+            period = float(widgets['burst_prd'].get() or 0)
+            self.sg.set_burst(channel, widgets['burst_on'].get(),
+                              ncycles=int(float(widgets['burst_ncyc'].get()
+                                                or 1)),
+                              trigger=widgets['burst_trsr'].get() or 'MAN',
+                              period_s=period if period > 0 else None)
+            self.sg.set_sync(channel, widgets['sync_on'].get())
         except Exception as e:
             messagebox.showerror("Configuration Error", str(e))
             return
@@ -1906,6 +1993,17 @@ ANALYSIS:
             self.status_bar.config(
                 text=f"CH{channel} configured, but read-back failed ({e}) - "
                      f"use Read Instrument to refresh")
+
+    def sg_fire_burst(self, channel):
+        """Fire one manual burst (needs Burst ON, trigger MAN, output ON)."""
+        if not self.sg:
+            messagebox.showerror("Error", "Signal generator not connected")
+            return
+        try:
+            self.sg.burst_trigger(channel)
+            self.status_bar.config(text=f"CH{channel}: burst fired")
+        except Exception as e:
+            messagebox.showerror("Burst", str(e))
 
     def sg_toggle_output(self, channel):
         """Flip the channel output on/off (separate from Apply)."""
@@ -1949,6 +2047,13 @@ ANALYSIS:
                 arb = widgets['arb_name_var'].get().strip()
                 if arb:
                     state['arb_name'] = arb
+            # Burst/sync (issue #45)
+            state['burst_on'] = widgets['burst_on'].get()
+            state['burst_ncycles'] = int(self._sg_get_float(
+                ch, 'burst_ncyc', 1))
+            state['burst_trigger'] = widgets['burst_trsr'].get()
+            state['burst_period_s'] = self._sg_get_float(ch, 'burst_prd', 1.0)
+            state['sync_on'] = widgets['sync_on'].get()
             channels[ch] = state
         return channels
 
@@ -1970,6 +2075,17 @@ ANALYSIS:
                                     else state['load'])
             if state.get('polarity') in widgets['polarity']['values']:
                 widgets['polarity'].set(state['polarity'])
+            if 'burst_on' in state:
+                widgets['burst_on'].set(bool(state['burst_on']))
+            if 'burst_ncycles' in state:
+                self._set_entry(widgets['burst_ncyc'],
+                                int(state['burst_ncycles']))
+            if state.get('burst_trigger') in ('MAN', 'INT', 'EXT'):
+                widgets['burst_trsr'].set(state['burst_trigger'])
+            if 'burst_period_s' in state:
+                self._set_entry(widgets['burst_prd'], state['burst_period_s'])
+            if 'sync_on' in state:
+                widgets['sync_on'].set(bool(state['sync_on']))
             if state.get('arb_name'):
                 widgets['arb_name_var'].set(state['arb_name'])
                 # Stage library samples for the preview (best-effort); the

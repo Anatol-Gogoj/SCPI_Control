@@ -171,6 +171,70 @@ def test_select_arb_and_arwv_parse():
     assert sg.get_arb_dict(2) == {'index': None, 'name': 'stairs'}
 
 
+def test_burst_dict_off():
+    # bench-captured off form (2026-07-10)
+    sg = FakeSG(outp='C1:BTWV STATE,OFF')
+    assert sg.get_burst_dict(1) == {'STATE': 'OFF'}
+
+
+def test_burst_dict_on_with_units():
+    sg = FakeSG(outp='C2:BTWV STATE,ON,GATE_NCYC,NCYC,TRSR,MAN,TIME,5,'
+                     'PRD,0.01S,DLAY,2.4e-07S')
+    d = sg.get_burst_dict(2)
+    assert d['STATE'] == 'ON'
+    assert d['GATE_NCYC'] == 'NCYC'
+    assert d['TRSR'] == 'MAN'
+    assert d['TIME'] == 5.0
+    assert d['PRD'] == 0.01
+    assert d['DLAY'] == 2.4e-07
+
+
+def test_set_burst_commands_short_and_ordered():
+    sg = FakeSG()
+    sg.set_burst(1, True, ncycles=5, trigger='INT', period_s=0.25)
+    assert sg.sent == ['C1:BTWV STATE,ON', 'C1:BTWV GATE_NCYC,NCYC',
+                       'C1:BTWV TIME,5', 'C1:BTWV TRSR,INT',
+                       'C1:BTWV PRD,0.25']
+    for cmd in sg.sent:
+        assert len(cmd.encode()) <= BK4055B.USB_MAX_CMD, cmd
+    sg = FakeSG()
+    sg.set_burst(2, False)
+    assert sg.sent == ['C2:BTWV STATE,OFF']
+    sg = FakeSG()
+    sg.set_burst(1, True, ncycles=3, trigger='MAN', period_s=1.0)
+    assert not any('PRD' in c for c in sg.sent), \
+        "PRD only applies to the INT trigger"
+
+
+def test_set_burst_validation():
+    sg = FakeSG()
+    for bad in (lambda: sg.set_burst(1, True, ncycles=0),
+                lambda: sg.set_burst(1, True, trigger='BOGUS')):
+        try:
+            bad()
+            assert False, "must raise ValueError"
+        except ValueError:
+            pass
+    assert sg.sent == [], "nothing may be sent on invalid input"
+
+
+def test_burst_trigger():
+    sg = FakeSG()
+    sg.burst_trigger(1)
+    assert sg.sent == ['C1:BTWV MTRIG']
+
+
+def test_sync_parse_and_set():
+    assert FakeSG(outp='C1:SYNC OFF').get_sync(1) is False
+    assert FakeSG(outp='C1:SYNC ON').get_sync(1) is True
+    # extra fields after the state must be tolerated
+    assert FakeSG(outp='C1:SYNC ON,LOAD,HZ').get_sync(1) is True
+    sg = FakeSG()
+    sg.set_sync(1, True)
+    sg.set_sync(2, False)
+    assert sg.sent == ['C1:SYNC ON', 'C2:SYNC OFF']
+
+
 if __name__ == '__main__':
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     for t in tests:

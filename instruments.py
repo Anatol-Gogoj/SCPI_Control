@@ -648,6 +648,65 @@ class BK4055B(VisaInstrument):
             'polarity': pairs.get('PLRT', 'NOR'),
         }
 
+    # -- Burst / sync output (issue #45; short commands, USB-safe) ---------
+    # Response forms bench-captured 2026-07-10 (fw 1.01.01.33R3):
+    #   C1:BTWV? -> 'C1:BTWV STATE,OFF'      C1:SYNC? -> 'C1:SYNC OFF'
+
+    _BTWV_NUMERIC = {'TIME', 'PRD', 'DLAY'}
+
+    def set_burst(self, channel, on, ncycles=1, trigger='MAN', period_s=None):
+        """Configure N-cycle burst on a channel.
+
+        Each trigger emits exactly `ncycles` cycles of the channel's basic
+        wave and then idles -- bounded energy per shot, the safest way to
+        exercise a high-voltage amplifier. trigger: 'MAN' (fire via
+        burst_trigger() / front panel), 'INT' (auto-repeat every `period_s`
+        seconds), 'EXT' (rear Aux In). Sent as separate short messages,
+        each far under the 52-byte USB cap.
+        """
+        if not on:
+            self.write(f'C{channel}:BTWV STATE,OFF')
+            return
+        trigger = trigger.upper()
+        if trigger not in ('MAN', 'INT', 'EXT'):
+            raise ValueError("Burst trigger must be MAN, INT or EXT")
+        if int(ncycles) < 1:
+            raise ValueError("Burst cycle count must be >= 1")
+        self.write(f'C{channel}:BTWV STATE,ON')
+        self.write(f'C{channel}:BTWV GATE_NCYC,NCYC')
+        self.write(f'C{channel}:BTWV TIME,{int(ncycles)}')
+        self.write(f'C{channel}:BTWV TRSR,{trigger}')
+        if trigger == 'INT' and period_s:
+            self.write(f'C{channel}:BTWV PRD,{period_s:g}')
+
+    def burst_trigger(self, channel):
+        """Fire one manual burst (burst must be ON with trigger MAN)."""
+        self.write(f'C{channel}:BTWV MTRIG')
+
+    def get_burst_dict(self, channel):
+        """Parse BTWV? -> dict, e.g. {'STATE': 'ON', 'TRSR': 'MAN',
+        'TIME': 5.0}. Burst off replies just 'C1:BTWV STATE,OFF'."""
+        raw = self.ask(f'C{channel}:BTWV?')
+        body = raw.split(' ', 1)[1] if ' ' in raw else raw
+        tokens = [t for t in body.split(',') if t != '']
+        out = {}
+        for key, value in zip(tokens[0::2], tokens[1::2]):
+            key = key.upper()
+            out[key] = (self._strip_unit(value)
+                        if key in self._BTWV_NUMERIC else value)
+        return out
+
+    def set_sync(self, channel, on):
+        """Sync/marker output for the channel (rear Aux/Sync BNC): one
+        hardware edge per waveform period -- scope trigger for slow arbs."""
+        self.write(f'C{channel}:SYNC {"ON" if on else "OFF"}')
+
+    def get_sync(self, channel):
+        """-> bool from 'C1:SYNC ON'/'C1:SYNC OFF' (extra fields tolerated)."""
+        raw = self.ask(f'C{channel}:SYNC?')
+        body = raw.split(' ', 1)[1] if ' ' in raw else raw
+        return body.split(',')[0].strip().upper() == 'ON'
+
     # -- arbitrary waveforms -------------------------------------------------
 
     ARB_MAX_POINTS = 16384      # editor design cap / DDS table depth
