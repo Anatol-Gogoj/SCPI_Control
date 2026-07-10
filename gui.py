@@ -110,6 +110,9 @@ class InstrumentControlGUI:
         self.sg = None
         self.recording = False
         self.record_thread = None
+        # Keys of background instrument operations in flight (issue #40) --
+        # guards against double-starting a connect/capture from the UI.
+        self._bg_busy = set()
 
         # LCR sweep state (worker thread + thread-safe UI queue)
         self.sweeping = False
@@ -169,27 +172,100 @@ class InstrumentControlGUI:
             pass
         self.root.destroy()
 
-    def auto_connect(self):
-        """Attempt to connect to instruments on startup"""
-        try:
-            self.lcr = BK894()
-            self.lcr_status.config(text=f"Connected: {self.lcr.idn}", fg="green")
-            self.update_lcr_config()
-        except Exception as e:
-            self.lcr_status.config(text=f"Not connected: {e}", fg="red")
-        
-        try:
-            self.scope = TekMSO24()
-            self.scope_status.config(text=f"Connected: {self.scope.idn}", fg="green")
-        except Exception as e:
-            self.scope_status.config(text=f"Not connected: {e}", fg="red")
+    # ---- Background instrument I/O (issue #40) ---------------------------
+    # VISA opens and long transfers used to run on the Tk main thread, so a
+    # powered-off or slow instrument froze the whole window. _run_bg moves
+    # the blocking call to a daemon thread and marshals the completion back
+    # onto the main thread; ALL Tk work stays in the `done` callback.
 
-        try:
-            self.sg = BK4055B()
-            self.sg_status.config(text=f"Connected: {self.sg.idn}", fg="green")
-            self.update_sg_config()
-        except Exception as e:
-            self.sg_status.config(text=f"Not connected: {e}", fg="red")
+    def _run_bg(self, work, done, busy=None):
+        """Run `work` (blocking, NO Tk calls) in a daemon thread, then call
+        `done(result, error)` on the Tk main thread. `busy` is an optional
+        exclusion key: while an operation with the same key is in flight,
+        further requests are refused with a status-bar note."""
+        if busy is not None:
+            if busy in self._bg_busy:
+                self.status_bar.config(
+                    text=f"Still working on the previous {busy} operation...")
+                return
+            self._bg_busy.add(busy)
+
+        def runner():
+            result, error = None, None
+            try:
+                result = work()
+            except Exception as e:
+                error = e
+
+            def finish():
+                if busy is not None:
+                    self._bg_busy.discard(busy)
+                done(result, error)
+            self.root.after(0, finish)
+
+        threading.Thread(target=runner, daemon=True).start()
+
+    def auto_connect(self):
+        """Connect to all instruments in the background at startup."""
+        for label in (self.lcr_status, self.scope_status, self.sg_status):
+            label.config(text="Connecting...", fg="#b36b00")
+
+        def work():
+            # One serial worker on purpose: the drivers share a process-wide
+            # pyvisa-py ResourceManager, which is not re-entrant.
+            results = {}
+            for key, cls in (('lcr', BK894), ('scope', TekMSO24),
+                             ('sg', BK4055B)):
+                try:
+                    results[key] = cls()
+                except Exception as e:
+                    results[key] = e
+            return results
+
+        self._run_bg(work, self._auto_connect_done, busy='connect')
+
+    def _auto_connect_done(self, results, error):
+        if error:   # work() catches per-instrument; this is belt-and-braces
+            self.status_bar.config(text=f"Auto-connect failed: {error}")
+            return
+        for key, label, sync in (
+                ('lcr', self.lcr_status, self.update_lcr_config),
+                ('scope', self.scope_status, None),
+                ('sg', self.sg_status, self.update_sg_config)):
+            inst = results.get(key)
+            if isinstance(inst, Exception) or inst is None:
+                label.config(text=f"Not connected: {inst}", fg="red")
+                continue
+            setattr(self, key, inst)
+            label.config(text=f"Connected: {inst.idn}", fg="green")
+            if sync:
+                sync()   # reads config; catches its own errors
+
+    def _reconnect(self, key, cls, label, sync=None):
+        """Close + reopen one instrument off the UI thread (issue #40)."""
+        old = getattr(self, key)
+        setattr(self, key, None)   # nothing may use the handle meanwhile
+        label.config(text="Connecting...", fg="#b36b00")
+
+        def work():
+            if old:
+                try:
+                    old.close()
+                except Exception:
+                    pass
+            return cls()
+
+        def done(inst, error):
+            if error:
+                label.config(text=f"Error: {error}", fg="red")
+                messagebox.showerror("Connection Error", str(error))
+                return
+            setattr(self, key, inst)
+            label.config(text=f"Connected: {inst.idn}", fg="green")
+            if sync:
+                sync()
+
+        self._run_bg(work, done, busy='connect')
     
     def show_lcr_tips(self):
         """Show LCR meter tips"""
@@ -1266,16 +1342,9 @@ ANALYSIS:
     
     # LCR methods
     def reconnect_lcr(self):
-        try:
-            if self.lcr:
-                self.lcr.close()
-            self.lcr = BK894()
-            self.lcr_status.config(text=f"Connected: {self.lcr.idn}", fg="green")
-            self.update_lcr_config()
-        except Exception as e:
-            self.lcr_status.config(text=f"Error: {e}", fg="red")
-            messagebox.showerror("Connection Error", str(e))
-    
+        self._reconnect('lcr', BK894, self.lcr_status,
+                        sync=self.update_lcr_config)
+
     def update_lcr_config(self):
         """Read current config from instrument"""
         if not self.lcr:
@@ -1353,14 +1422,7 @@ ANALYSIS:
     
     # Scope methods
     def reconnect_scope(self):
-        try:
-            if self.scope:
-                self.scope.close()
-            self.scope = TekMSO24()
-            self.scope_status.config(text=f"Connected: {self.scope.idn}", fg="green")
-        except Exception as e:
-            self.scope_status.config(text=f"Error: {e}", fg="red")
-            messagebox.showerror("Connection Error", str(e))
+        self._reconnect('scope', TekMSO24, self.scope_status)
     
     def toggle_channel(self, channel, enable_var):
         """Enable/disable a channel"""
@@ -1593,15 +1655,8 @@ ANALYSIS:
         return f'{ohms:g}'
 
     def reconnect_sg(self):
-        try:
-            if self.sg:
-                self.sg.close()
-            self.sg = BK4055B()
-            self.sg_status.config(text=f"Connected: {self.sg.idn}", fg="green")
-            self.update_sg_config()
-        except Exception as e:
-            self.sg_status.config(text=f"Error: {e}", fg="red")
-            messagebox.showerror("Connection Error", str(e))
+        self._reconnect('sg', BK4055B, self.sg_status,
+                        sync=self.update_sg_config)
 
     def update_sg_config(self):
         """Read current config from the generator: populate the inputs, the
@@ -1944,13 +1999,16 @@ ANALYSIS:
         if not self.scope:
             messagebox.showerror("Error", "Oscilloscope not connected")
             return
-        try:
-            self.status_bar.config(text="Running AutoSet...")
-            self.root.update()
-            self.scope.autoset()
-            self.status_bar.config(text="AutoSet complete")
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
+        self.status_bar.config(text="Running AutoSet...")
+
+        def done(_result, error):
+            if error:
+                messagebox.showerror("Error", str(error))
+                self.status_bar.config(text="AutoSet failed")
+            else:
+                self.status_bar.config(text="AutoSet complete")
+
+        self._run_bg(self.scope.autoset, done, busy='scope-io')
     
     def scope_get_measurements(self, channel):
         """Get measurements for a specific channel"""
