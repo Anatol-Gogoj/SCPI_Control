@@ -17,7 +17,7 @@ A version readout is shown in the footer. Instrument drivers live in
 instruments.py; signal-gen presets in siggen_presets.py.
 """
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
+from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
 import csv
 import os
 import queue
@@ -25,6 +25,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+from bench_profiles import BenchProfileStore
 from instruments import BK894, TekMSO24, BK4055B
 import lcr_format
 import scope_trace
@@ -104,9 +105,16 @@ class InstrumentControlGUI:
         # correction) and the footer version readout (issues #26/#27).
         self.root.geometry("1320x800")
 
-        # Menu bar: Tools -> Update Software
+        # Menu bar: Tools -> bench profiles + Update Software
         menubar = tk.Menu(self.root)
         tools_menu = tk.Menu(menubar, tearoff=0)
+        tools_menu.add_command(label="Save Bench Profile…",
+                               command=self.save_bench_profile)
+        tools_menu.add_command(label="Load Bench Profile…",
+                               command=self.load_bench_profile)
+        tools_menu.add_command(label="Delete Bench Profile…",
+                               command=self.delete_bench_profile)
+        tools_menu.add_separator()
         tools_menu.add_command(label="Update Software…",
                                command=self.open_update_software)
         menubar.add_cascade(label="Tools", menu=tools_menu)
@@ -131,6 +139,7 @@ class InstrumentControlGUI:
         # Signal-generator state
         self.sg_channel_widgets = {}
         self.sg_presets = SignalGenPresetStore()
+        self.bench_profiles = BenchProfileStore()
 
         # Webcam state (worker thread + thread-safe UI queue, like the sweep)
         self.cam = None
@@ -228,6 +237,153 @@ class InstrumentControlGUI:
             else:
                 self.status_bar.config(text=ok_text)
         self._run_bg(work, done, busy=busy)
+
+    # ---- Bench profiles (issue #47) --------------------------------------
+    # A profile is a widget-level snapshot of the whole bench (LCR, scope,
+    # both sig-gen channels). Entry values are stored as their raw strings
+    # so Save never fails on a half-typed field; Load writes them back and
+    # pushes the config to whichever instruments are connected (outputs
+    # are never switched by a profile load).
+
+    def _collect_bench_profile(self):
+        scope_channels = {}
+        for ch in range(1, 5):
+            w = self.channel_widgets[ch]
+            scope_channels[ch] = {
+                'enable': w['enable'].get(),
+                'vscale': w['vscale'].get(),
+                'position': w['position'].get(),
+                'coupling': w['coupling'].get(),
+                'trigger': w['trigger'].get(),
+            }
+        return {
+            'version': 1,
+            'lcr': {
+                'mode': self.lcr_mode.get(),
+                'freq_hz': self.lcr_freq.get(),
+                'volt_v': self.lcr_volt.get(),
+                'bias_v': self.lcr_bias_volt.get(),
+                'bias_on': self.lcr_bias_on.get(),
+                'speed': self.lcr_speed.get(),
+                'avg': self.lcr_avg.get(),
+                'autorange': self.lcr_autorange.get(),
+            },
+            'scope': {
+                'channels': scope_channels,
+                'hscale': self.scope_hscale.get(),
+                'trig_level': self.scope_trig_level.get(),
+                'trig_slope': self.scope_trig_slope.get(),
+            },
+            'siggen': self._sg_collect_state(),
+        }
+
+    def _apply_bench_profile(self, p):
+        lcr = p.get('lcr') or {}
+        if lcr:
+            if lcr.get('mode') in BK894.MODES:
+                self.lcr_mode.set(lcr['mode'])
+            for key, widget in (('freq_hz', self.lcr_freq),
+                                ('volt_v', self.lcr_volt),
+                                ('bias_v', self.lcr_bias_volt),
+                                ('avg', self.lcr_avg)):
+                if lcr.get(key) is not None:
+                    self._set_entry(widget, lcr[key])
+            if lcr.get('speed') in BK894.APERTURE_SPEEDS:
+                self.lcr_speed.set(lcr['speed'])
+            self.lcr_bias_on.set(bool(lcr.get('bias_on')))
+            self.lcr_autorange.set(bool(lcr.get('autorange', True)))
+        scope = p.get('scope') or {}
+        chans = scope.get('channels') or {}
+        for ch in range(1, 5):
+            s = chans.get(str(ch)) or chans.get(ch)   # JSON stringifies keys
+            if not s:
+                continue
+            w = self.channel_widgets[ch]
+            w['enable'].set(bool(s.get('enable')))
+            w['trigger'].set(bool(s.get('trigger')))
+            for key in ('vscale', 'position'):
+                if s.get(key) is not None:
+                    self._set_entry(w[key], s[key])
+            if s.get('coupling'):
+                w['coupling'].set(s['coupling'])
+        for key, widget in (('hscale', self.scope_hscale),
+                            ('trig_level', self.scope_trig_level)):
+            if scope.get(key) is not None:
+                self._set_entry(widget, scope[key])
+        if scope.get('trig_slope'):
+            self.scope_trig_slope.set(scope['trig_slope'])
+        # Push to whatever is connected; each apply guards itself and runs
+        # in the background under its own busy key.
+        if self.lcr and lcr:
+            self.apply_lcr_config()
+        if self.scope and scope:
+            self.apply_all_scope_config()
+        if p.get('siggen'):
+            self._sg_apply_state(p['siggen'])
+
+    def save_bench_profile(self):
+        name = simpledialog.askstring("Save Bench Profile",
+                                      "Profile name:", parent=self.root)
+        if not name or not name.strip():
+            return
+        name = name.strip()
+        if name in self.bench_profiles.names() and not messagebox.askyesno(
+                "Save Bench Profile", f"Overwrite profile '{name}'?"):
+            return
+        try:
+            self.bench_profiles.save(name, self._collect_bench_profile())
+        except Exception as e:
+            messagebox.showerror("Save Bench Profile", str(e))
+            return
+        self.status_bar.config(text=f"Bench profile saved: {name}")
+
+    def load_bench_profile(self):
+        def action(name):
+            try:
+                profile = self.bench_profiles.load(name)
+            except Exception as e:
+                messagebox.showerror("Load Bench Profile", str(e))
+                return
+            self._apply_bench_profile(profile)
+            self.status_bar.config(
+                text=f"Bench profile '{name}' loaded -- pushed to every "
+                     "connected instrument (outputs untouched)")
+        self._bench_profile_pick("Load Bench Profile", action)
+
+    def delete_bench_profile(self):
+        def action(name):
+            if not messagebox.askyesno("Delete Bench Profile",
+                                       f"Delete profile '{name}'?"):
+                return
+            self.bench_profiles.delete(name)
+            self.status_bar.config(text=f"Bench profile deleted: {name}")
+        self._bench_profile_pick("Delete Bench Profile", action)
+
+    def _bench_profile_pick(self, title, action):
+        names = self.bench_profiles.names()
+        if not names:
+            messagebox.showinfo(title, "No bench profiles saved yet -- use "
+                                       "Tools > Save Bench Profile first.")
+            return
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.transient(self.root)
+        win.resizable(False, False)
+        ttk.Label(win, text="Profile:").pack(padx=12, pady=(12, 4),
+                                             anchor='w')
+        var = tk.StringVar(value=names[0])
+        ttk.Combobox(win, state='readonly', values=names, textvariable=var,
+                     width=30).pack(padx=12, pady=4)
+        btns = ttk.Frame(win)
+        btns.pack(pady=10)
+
+        def ok():
+            win.destroy()
+            action(var.get())
+        ttk.Button(btns, text="OK", command=ok).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Cancel",
+                   command=win.destroy).pack(side=tk.LEFT, padx=4)
+        win.grab_set()
 
     def auto_connect(self):
         """Connect to all instruments in the background at startup."""
