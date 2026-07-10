@@ -93,6 +93,12 @@ For a headless smoke test of the transport stack:
 
 This lists all PyVISA-visible USB-TMC resources, then instantiates each known class and prints its `*IDN?` response.
 
+## Running on Windows
+
+Instrument control is **Linux-only** (the pyvisa-py/libusb/udev stack lives on the bench box), but the app itself is cross-platform: on Windows the instrument tabs are view/edit-only (a note says so; presets and bench profiles can still be prepared and are shared via the ShareDrive), while **Battery Data** and **Webcam** are fully functional.
+
+Windows lab PCs with the ShareDrive mapped launch via **`_software\Launch_SCPI_Control_Windows.bat`** (double-click; reference copy in `deploy/`). First run needs Python 3.10+ installed and internet — it creates a local venv and installs the requirements (the share's `pylibs` are Linux binaries); later runs sync only when the version stamp changes, exactly like the Linux local-cache launcher.
+
 ## Repository layout & tests
 
 - Repo root: the application modules only (`gui.py`, `instruments.py`, the arb/export/format/profile libraries, `version.py`).

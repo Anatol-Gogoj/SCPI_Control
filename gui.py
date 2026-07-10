@@ -121,6 +121,18 @@ SG_ARB_ENABLED = True
 
 SG_LOAD_HIGHZ = 'High-Z'   # UI label for the SCPI 'HZ' (high impedance) token
 
+# Instrument I/O works only on the Linux bench box (pyvisa-py drives the
+# USB-TMC boxes via libusb with a udev/blacklist setup that exists only
+# there). On Windows/macOS the app still runs: Battery Data and Webcam
+# are fully functional, and every instrument tab stays editable so
+# presets/bench profiles can be prepared -- only connecting is locked out.
+INSTRUMENTS_SUPPORTED = sys.platform.startswith('linux')
+NOT_LINUX_SHORT = "Linux bench only -- view/edit (presets OK)"
+NOT_LINUX_NOTE = ("Instrument control needs the Linux bench PC "
+                  f"(this is {sys.platform}). Battery Data and Webcam are "
+                  "fully functional here, and instrument settings can "
+                  "still be edited and saved as presets/profiles.")
+
 class InstrumentControlGUI:
     def __init__(self, root):
         self.root = root
@@ -139,8 +151,10 @@ class InstrumentControlGUI:
         tools_menu.add_command(label="Delete Bench Profile…",
                                command=self.delete_bench_profile)
         tools_menu.add_separator()
-        tools_menu.add_command(label="Update Software…",
-                               command=self.open_update_software)
+        tools_menu.add_command(
+            label="Update Software…",
+            command=self.open_update_software,
+            state=('normal' if INSTRUMENTS_SUPPORTED else 'disabled'))
         menubar.add_cascade(label="Tools", menu=tools_menu)
         self.root.config(menu=menubar)
         self._updating = False
@@ -412,6 +426,14 @@ class InstrumentControlGUI:
 
     def auto_connect(self):
         """Connect to all instruments in the background at startup."""
+        if not INSTRUMENTS_SUPPORTED:
+            for label in (self.lcr_status, self.scope_status,
+                          self.sg_status):
+                label.config(text=NOT_LINUX_SHORT, fg="#8a5a00")
+            self.status_bar.config(
+                text="Non-Linux platform: instrument tabs are view/edit "
+                     "only; Battery Data and Webcam are fully available")
+            return
         for label in (self.lcr_status, self.scope_status, self.sg_status):
             label.config(text="Connecting...", fg="#b36b00")
 
@@ -448,6 +470,9 @@ class InstrumentControlGUI:
 
     def _reconnect(self, key, cls, label, sync=None):
         """Close + reopen one instrument off the UI thread (issue #40)."""
+        if not INSTRUMENTS_SUPPORTED:
+            messagebox.showinfo("Linux only", NOT_LINUX_NOTE)
+            return
         old = getattr(self, key)
         setattr(self, key, None)   # nothing may use the handle meanwhile
         label.config(text="Connecting...", fg="#b36b00")
