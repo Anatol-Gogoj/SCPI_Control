@@ -477,6 +477,11 @@ FILE FORMAT:
 - Filename includes timestamp: lcr_20260206_143052.csv
 - LCR columns: Timestamp, Mode, Frequency, Primary, Secondary, Status
 - Scope columns: Timestamp, Frequency, Period, Mean, Pk-Pk, RMS, Amplitude
+- SigGen columns: Timestamp, Waveform, Frequency, Amplitude, Offset,
+  Stdev, Mean, Output - the STIMULUS that was driving the DUT, so a
+  swept run records cause and effect in the same session
+- A source that errors 5 times in a row is dropped from the run with
+  one notice (no endless error spam); logging stops if all sources die
 
 USAGE:
 - Start Logging: Begin recording to CSV files
@@ -1379,6 +1384,18 @@ ANALYSIS:
             var = tk.BooleanVar(value=(ch == 1))
             ttk.Checkbutton(scope_frame, text=f"CH{ch}", variable=var).pack(anchor='w')
             self.log_scope_channels[ch] = var
+
+        # Sig-gen stimulus channels (issue #46): record what was DRIVING
+        # the DUT alongside the measured response.
+        sg_frame = ttk.LabelFrame(instr_frame, text="Sig Gen (stimulus)",
+                                  padding=5)
+        sg_frame.pack(anchor='w', pady=5)
+        self.log_sg_channels = {}
+        for ch in (1, 2):
+            var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(sg_frame, text=f"CH{ch}",
+                            variable=var).pack(anchor='w')
+            self.log_sg_channels[ch] = var
         
         # Control buttons
         button_frame = ttk.Frame(config_frame)
@@ -2344,6 +2361,9 @@ ANALYSIS:
         for ch in range(1, 5):
             if self.log_scope_channels[ch].get():
                 (selected if self.scope else missing).append(f'Scope CH{ch}')
+        for ch in (1, 2):
+            if self.log_sg_channels[ch].get():
+                (selected if self.sg else missing).append(f'SigGen CH{ch}')
         if missing:
             self.log_message("Skipping (not connected): " + ", ".join(missing))
         if not selected:
@@ -2392,71 +2412,103 @@ ANALYSIS:
         self.log_stop_btn.config(state='disabled')
         self.log_message("Logging stopped")
     
+    # consecutive per-source errors before that source is dropped from a run
+    _LOG_MAX_FAILS = 5
+
     def logging_loop(self, interval):
         """Background logging thread. `interval` (s) is validated by
-        start_logging before this thread launches."""
+        start_logging before this thread launches.
+
+        Every source carries a consecutive-failure counter (issue #46):
+        after _LOG_MAX_FAILS misses in a row it is dropped from the run
+        with a single notice instead of spamming one error per tick
+        forever; when the last source dies, logging stops itself.
+        """
         import os
 
         log_path = self.log_dir.get()
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        files, writers, fails = {}, {}, {}
 
-        # Create CSV files with timestamps
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        lcr_file = None
-        lcr_writer = None
-        
-        scope_files = {}
-        scope_writers = {}
-        
+        def _open(key, filename, header):
+            path = os.path.join(log_path, filename)
+            files[key] = open(path, 'w', newline='')
+            writers[key] = csv.writer(files[key])
+            writers[key].writerow(header)
+            fails[key] = 0
+            self.log_message(f"{key} log: {path}")
+
         if self.log_lcr.get() and self.lcr:
-            lcr_filename = os.path.join(log_path, f"lcr_{timestamp}.csv")
-            lcr_file = open(lcr_filename, 'w', newline='')
-            lcr_writer = csv.writer(lcr_file)
-            lcr_writer.writerow(['Timestamp', 'Mode', 'Frequency (Hz)', 'Primary', 'Secondary', 'Status'])
-            self.log_message(f"LCR log: {lcr_filename}")
-        
-        # Create separate file for each scope channel
+            _open('LCR', f"lcr_{stamp}.csv",
+                  ['Timestamp', 'Mode', 'Frequency (Hz)', 'Primary',
+                   'Secondary', 'Status'])
         for ch in range(1, 5):
             if self.log_scope_channels[ch].get() and self.scope:
-                scope_filename = os.path.join(log_path, f"scope_ch{ch}_{timestamp}.csv")
-                scope_files[ch] = open(scope_filename, 'w', newline='')
-                scope_writers[ch] = csv.writer(scope_files[ch])
-                scope_writers[ch].writerow(['Timestamp', 'Frequency (Hz)', 'Period (s)', 'Mean (V)', 
-                                           'Pk-Pk (V)', 'RMS (V)', 'Amplitude (V)'])
-                self.log_message(f"Scope CH{ch} log: {scope_filename}")
-        
+                _open(f'Scope CH{ch}', f"scope_ch{ch}_{stamp}.csv",
+                      ['Timestamp', 'Frequency (Hz)', 'Period (s)',
+                       'Mean (V)', 'Pk-Pk (V)', 'RMS (V)', 'Amplitude (V)'])
+        # Sig-gen STIMULUS channels (issue #46): what was driving the DUT,
+        # in the same run as the measured response. Short queries, USB-safe.
+        for ch in (1, 2):
+            if self.log_sg_channels[ch].get() and self.sg:
+                _open(f'SigGen CH{ch}', f"siggen_ch{ch}_{stamp}.csv",
+                      ['Timestamp', 'Waveform', 'Frequency (Hz)',
+                       'Amplitude (Vpp)', 'Offset (V)', 'Stdev (V)',
+                       'Mean (V)', 'Output'])
+
+        def _sample(key, fn):
+            """One source sample; drops the source after repeated errors."""
+            if key not in writers:
+                return
+            try:
+                fn(writers[key])
+                files[key].flush()
+                fails[key] = 0
+            except Exception as e:
+                fails[key] += 1
+                if fails[key] >= self._LOG_MAX_FAILS:
+                    self.log_message(
+                        f"{key}: {fails[key]} consecutive errors ({e}) -- "
+                        "source disabled for this run")
+                    files.pop(key).close()
+                    writers.pop(key)
+                else:
+                    self.log_message(f"{key} error: {e}")
+
+        def _lcr_row(writer):
+            config = self.lcr.get_config()
+            primary, secondary, status = self.lcr.measure()
+            writer.writerow([now, config['mode'], config['frequency'],
+                             primary, secondary, status])
+
         while self.recording:
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            
-            # Log LCR data
-            if lcr_writer and self.lcr:
-                try:
-                    config = self.lcr.get_config()
-                    primary, secondary, status = self.lcr.measure()
-                    lcr_writer.writerow([timestamp, config['mode'], config['frequency'], 
-                                        primary, secondary, status])
-                    lcr_file.flush()
-                except Exception as e:
-                    self.log_message(f"LCR error: {e}")
-            
-            # Log scope data for each enabled channel
-            for ch, writer in scope_writers.items():
-                if self.scope:
-                    try:
-                        meas = self.scope.get_all_measurements(ch)
-                        writer.writerow([timestamp, meas.get('freq'), meas.get('period'),
-                                        meas.get('mean'), meas.get('pk2pk'), 
-                                        meas.get('rms'), meas.get('amplitude')])
-                        scope_files[ch].flush()
-                    except Exception as e:
-                        self.log_message(f"Scope CH{ch} error: {e}")
-            
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            _sample('LCR', _lcr_row)
+            for ch in range(1, 5):
+                def _scope_row(writer, c=ch):
+                    meas = self.scope.get_all_measurements(c)
+                    writer.writerow([now, meas.get('freq'),
+                                     meas.get('period'), meas.get('mean'),
+                                     meas.get('pk2pk'), meas.get('rms'),
+                                     meas.get('amplitude')])
+                _sample(f'Scope CH{ch}', _scope_row)
+            for ch in (1, 2):
+                def _sg_row(writer, c=ch):
+                    bswv = self.sg.get_basic_wave_dict(c)
+                    outp = self.sg.get_output_dict(c)
+                    writer.writerow([now, bswv.get('WVTP'), bswv.get('FRQ'),
+                                     bswv.get('AMP'), bswv.get('OFST'),
+                                     bswv.get('STDEV'), bswv.get('MEAN'),
+                                     'ON' if outp['state'] else 'OFF'])
+                _sample(f'SigGen CH{ch}', _sg_row)
+            if not writers:
+                self.log_message("All logging sources failed -- stopping")
+                self.root.after(0, self._logging_failed)
+                break
             time.sleep(interval)
-        
-        # Close files
-        if lcr_file:
-            lcr_file.close()
-        for f in scope_files.values():
+
+        # Close whatever survived to the end of the run
+        for f in files.values():
             f.close()
     
     def log_message(self, message):
