@@ -240,6 +240,87 @@ class BK894(VisaInstrument):
             'voltage': float(self.ask(':VOLT?')),
         }
 
+    # -- DC bias / aperture / range / fixture correction (issue #44) ------
+    # Query forms bench-verified 2026-07-10 on this unit (fw 1.0.5):
+    #   :BIAS:VOLT? -> '0.00000e+00'   :BIAS:STAT? -> '0'
+    #   :APER?      -> 'MED,1'         :FUNC:IMP:RANG:AUTO? -> '1'
+    #   :CORR:OPEN:STAT? / :CORR:SHOR:STAT? -> '1'
+    # NOTE this meter answers *OPC? with '0' immediately (non-standard), so
+    # completion of a long operation is detected by issuing the next query
+    # with a long timeout instead.
+
+    APERTURE_SPEEDS = ('SLOW', 'MED', 'FAST')
+
+    def set_bias_voltage(self, volts):
+        """Set the internal DC bias level (takes effect while bias is ON).
+
+        The 894 clamps to its supported bias range; read get_bias() back to
+        see what it accepted (same approach as the AC level).
+        """
+        if not -5.0 <= volts <= 5.0:
+            raise ValueError("Bias must be within +/-5 V")
+        self.write(f':BIAS:VOLT {volts}')
+
+    def set_bias_enabled(self, on):
+        """Switch the internal DC bias source on/off."""
+        self.write(f':BIAS:STAT {1 if on else 0}')
+
+    def get_bias(self):
+        """-> {'volts': float, 'on': bool}."""
+        return {'volts': float(self.ask(':BIAS:VOLT?')),
+                'on': self.ask(':BIAS:STAT?').strip() in ('1', 'ON')}
+
+    @staticmethod
+    def parse_aperture(raw):
+        """':APER?' response 'MED,1' -> ('MED', 1)."""
+        parts = [p.strip() for p in raw.split(',')]
+        speed = parts[0].upper()
+        avg = int(parts[1]) if len(parts) > 1 and parts[1] else 1
+        return speed, avg
+
+    def set_aperture(self, speed, avg=1):
+        """Measurement speed SLOW/MED/FAST + averaging count (1..256)."""
+        speed = speed.upper()
+        if speed not in self.APERTURE_SPEEDS:
+            raise ValueError(f"Speed must be one of {self.APERTURE_SPEEDS}")
+        if not 1 <= int(avg) <= 256:
+            raise ValueError("Averaging count must be 1 to 256")
+        self.write(f':APER {speed},{int(avg)}')
+
+    def get_aperture(self):
+        """-> ('MED', 1)-style (speed, averaging count) tuple."""
+        return self.parse_aperture(self.ask(':APER?'))
+
+    def set_range_auto(self, on):
+        """Auto-ranging on/off. Hold the range (off) for glitch-free sweeps
+        on a fixed DUT; remember to re-enable for unknown parts."""
+        self.write(f':FUNC:IMP:RANG:AUTO {1 if on else 0}')
+
+    def get_correction_states(self):
+        """-> {'open': bool, 'short': bool} -- whether each correction is
+        currently being APPLIED to measurements."""
+        return {'open': self.ask(':CORR:OPEN:STAT?').strip() in ('1', 'ON'),
+                'short': self.ask(':CORR:SHOR:STAT?').strip() in ('1', 'ON')}
+
+    def run_correction(self, kind):
+        """Run an open or short fixture-correction sweep, then enable it.
+
+        kind: 'open' (fixture must be EMPTY) or 'short' (terminals must be
+        SHORTED with a shorting bar/wire). The meter sweeps every test
+        frequency, which takes tens of seconds and blocks its front panel;
+        the follow-up state query is issued with a long timeout and returns
+        only when the sweep is done. Call from a worker thread.
+        """
+        base = {'open': ':CORR:OPEN', 'short': ':CORR:SHOR'}[kind]
+        old_to = self.inst.timeout
+        self.inst.timeout = max(old_to or 0, 90000)
+        try:
+            self.write(base)
+            self.ask(f'{base}:STAT?')      # answers once the sweep finishes
+            self.write(f'{base}:STAT 1')   # apply the fresh correction
+        finally:
+            self.inst.timeout = old_to
+
 
 # --------------------------------------------------------------------------
 # Tektronix MSO24 Oscilloscope (USB-TMC)
