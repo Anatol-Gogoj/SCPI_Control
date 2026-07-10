@@ -2031,20 +2031,70 @@ ANALYSIS:
     
     def start_logging(self):
         import os
-        
-        # Create log directory if needed
+
+        # Validate BEFORE latching the buttons: a bad interval or an empty
+        # source list used to kill the worker thread silently while the UI
+        # stayed stuck in the "logging" state (issue #39).
+        raw = self.log_interval.get()
+        try:
+            interval = float(raw)
+        except (TypeError, ValueError):
+            messagebox.showerror(
+                "Logging", f"Invalid interval: {raw!r} -- enter seconds "
+                "(e.g. 1.0)")
+            return
+        if interval <= 0:
+            messagebox.showerror("Logging",
+                                 "Interval must be greater than 0 seconds")
+            return
+
+        selected, missing = [], []
+        if self.log_lcr.get():
+            (selected if self.lcr else missing).append('LCR')
+        for ch in range(1, 5):
+            if self.log_scope_channels[ch].get():
+                (selected if self.scope else missing).append(f'Scope CH{ch}')
+        if missing:
+            self.log_message("Skipping (not connected): " + ", ".join(missing))
+        if not selected:
+            messagebox.showerror(
+                "Logging",
+                "Nothing to log: tick at least one instrument that is "
+                "connected (check the tab's connection status / Reconnect).")
+            return
+
         log_path = self.log_dir.get()
-        os.makedirs(log_path, exist_ok=True)
-        
+        try:
+            os.makedirs(log_path, exist_ok=True)
+        except OSError as e:
+            messagebox.showerror("Logging",
+                                 f"Cannot create log directory:\n{e}")
+            return
+
         self.recording = True
         self.log_start_btn.config(state='disabled')
         self.log_stop_btn.config(state='normal')
-        
-        # Start logging thread
-        self.record_thread = threading.Thread(target=self.logging_loop, daemon=True)
+
+        # Start logging thread (interval passed in -- already validated)
+        self.record_thread = threading.Thread(
+            target=self._logging_worker, args=(interval,), daemon=True)
         self.record_thread.start()
-        
-        self.log_message("Logging started")
+
+        self.log_message(f"Logging started ({', '.join(selected)} "
+                         f"every {interval:g} s)")
+
+    def _logging_worker(self, interval):
+        """Run logging_loop and never die silently: a fatal error reports to
+        the log widget and resets the Start/Stop buttons (issue #39)."""
+        try:
+            self.logging_loop(interval)
+        except Exception as e:
+            self.log_message(f"Logging stopped by error: {e}")
+            self.root.after(0, self._logging_failed)
+
+    def _logging_failed(self):
+        if self.recording:
+            self.stop_logging()
     
     def stop_logging(self):
         self.recording = False
@@ -2052,13 +2102,13 @@ ANALYSIS:
         self.log_stop_btn.config(state='disabled')
         self.log_message("Logging stopped")
     
-    def logging_loop(self):
-        """Background logging thread"""
+    def logging_loop(self, interval):
+        """Background logging thread. `interval` (s) is validated by
+        start_logging before this thread launches."""
         import os
-        
+
         log_path = self.log_dir.get()
-        interval = float(self.log_interval.get())
-        
+
         # Create CSV files with timestamps
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
