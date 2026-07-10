@@ -100,7 +100,9 @@ class InstrumentControlGUI:
     def __init__(self, root):
         self.root = root
         self.root.title(f"Lab Instrument Control  —  {version_string()}")
-        self.root.geometry("1000x750")
+        # Wide enough for the LCR tab's right-hand column (bias/speed/
+        # correction) and the footer version readout (issues #26/#27).
+        self.root.geometry("1320x800")
 
         # Menu bar: Tools -> Update Software
         menubar = tk.Menu(self.root)

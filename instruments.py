@@ -194,6 +194,12 @@ class BK894(VisaInstrument):
         'CPQ':  'Capacitance + Q Factor',
         'CPG':  'Capacitance + Conductance',
         'CPRP': 'Capacitance + Parallel Resistance',
+        # Series-capacitance pairs: the bench meter reported itself in
+        # 'csrs' on 2026-07-10, so these exist on this unit and were
+        # missing here (readouts fell back to bare numbers).
+        'CSD':  'Capacitance (series) + Dissipation',
+        'CSQ':  'Capacitance (series) + Q Factor',
+        'CSRS': 'Capacitance (series) + Series Resistance',
         'LSRS': 'Inductance (series) + Resistance (series)',
         'LSRD': 'Inductance (series) + Resistance (DC)',
         'LPRS': 'Inductance (parallel) + Resistance (series)',
