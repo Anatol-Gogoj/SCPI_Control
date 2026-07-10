@@ -186,6 +186,7 @@ class InstrumentControlGUI:
         self.create_scope_tab()
         self.create_sg_tab()
         self.create_logging_tab()
+        self.create_battery_tab()
         self.create_webcam_tab()
         
         # Footer: status bar (left, stretches) + version readout (right)
@@ -2907,6 +2908,28 @@ ANALYSIS:
             self.log_text.config(state='disabled')
         
         self.root.after(0, update)
+
+    # ==================== Battery Data tab ====================
+    def create_battery_tab(self):
+        """Battery-cycler post-processing (issue #31): the lab's standalone
+        BatteryProcessing tool embedded as a tab. Degrades to an install
+        hint when pandas/matplotlib/openpyxl are missing (webcam pattern).
+        Not an instrument -- pure file post-processing, no VISA."""
+        _tab = ScrollableTab(self.notebook)
+        self.notebook.add(_tab, text="Battery Data")
+        import battery_process
+        ok, reason = battery_process.deps_available()
+        if not ok:
+            tk.Label(_tab.body, text=(
+                "Battery processing needs pandas, matplotlib and openpyxl.\n\n"
+                f"({reason})\n\n"
+                "Install on the bench, then relaunch:\n"
+                "    .venv/bin/pip install pandas matplotlib openpyxl"),
+                justify=tk.LEFT, fg="#8a5a00").pack(padx=20, pady=20,
+                                                    anchor="w")
+            return
+        from battery_tab import BatteryPane
+        BatteryPane(_tab.body).pack(fill="both", expand=True)
 
     # ==================== Webcam tab ====================
     def create_webcam_tab(self):

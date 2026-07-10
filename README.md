@@ -117,6 +117,15 @@ The **Webcam** tab provides live preview plus snapshot, interval, and stepped ca
 
 Capture needs `opencv-python-headless`, `Pillow`, and `numpy` (in `requirements.txt`); the tab degrades to an install hint if they're missing. Capture logic lives in `webcam.py` (device probing, focus metric, filename/step planning are pure and headless-tested in `tests/test_webcam.py`); the Tk tab is in `gui.py`.
 
+## Battery Data tab
+
+Post-processes battery-cycler exports (`.xls`/`.xlsx` from the Chinese-language tester) — **not an instrument tab**, pure file processing. Adapted from the lab's standalone tool ([Pingwinos40/BatteryProcessing](https://github.com/Pingwinos40/BatteryProcessing)) with identical output (parity verified byte-for-byte against the original on a real 60k-row export):
+
+- **Load** skips the Info/Cycle sheets, concatenates the Detail sheets, and translates Mandarin headers + status labels (both proper UTF-8 and GBK-garbled forms).
+- **Export Processed CSV**, **Batch Plot** (per-cycle V-t and V-Q PNGs at 300 dpi), and **Custom Plot** (any axes, cycle filter, line/scatter, color-by-status, embedded preview).
+
+Processing lives in `battery_process.py` (pure, headless-tested in `tests/test_battery_process.py`); the tab is `battery_tab.py`. Needs `pandas`, `matplotlib`, `openpyxl` (in `requirements.txt`); the tab degrades to an install hint without them.
+
 ## Adding a new instrument
 
 1. Look up its USB VID/PID (`lsusb` or `dmesg`).
