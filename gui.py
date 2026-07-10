@@ -185,16 +185,20 @@ class InstrumentControlGUI:
     # the blocking call to a daemon thread and marshals the completion back
     # onto the main thread; ALL Tk work stays in the `done` callback.
 
-    def _run_bg(self, work, done, busy=None):
+    def _run_bg(self, work, done, busy=None, quiet=False):
         """Run `work` (blocking, NO Tk calls) in a daemon thread, then call
         `done(result, error)` on the Tk main thread. `busy` is an optional
         exclusion key: while an operation with the same key is in flight,
-        further requests are refused with a status-bar note."""
+        further requests are refused (with a status-bar note unless `quiet`
+        -- periodic pollers pass quiet=True and just skip the tick).
+        Returns True if the work was started."""
         if busy is not None:
             if busy in self._bg_busy:
-                self.status_bar.config(
-                    text=f"Still working on the previous {busy} operation...")
-                return
+                if not quiet:
+                    self.status_bar.config(
+                        text=f"Still working on the previous {busy} "
+                             "operation...")
+                return False
             self._bg_busy.add(busy)
 
         def runner():
@@ -211,6 +215,17 @@ class InstrumentControlGUI:
             self.root.after(0, finish)
 
         threading.Thread(target=runner, daemon=True).start()
+        return True
+
+    def _bg_simple(self, work, ok_text, busy, err_title="Error"):
+        """_run_bg for fire-and-forget commands: status text on success,
+        one error dialog on failure."""
+        def done(_result, error):
+            if error:
+                messagebox.showerror(err_title, str(error))
+            else:
+                self.status_bar.config(text=ok_text)
+        self._run_bg(work, done, busy=busy)
 
     def auto_connect(self):
         """Connect to all instruments in the background at startup."""
@@ -1435,32 +1450,39 @@ ANALYSIS:
         """Read current config from instrument"""
         if not self.lcr:
             return
-        try:
-            config = self.lcr.get_config()
+        def work():
+            data = {'config': self.lcr.get_config()}
+            # Bias / aperture / correction (issue #44) are best-effort so an
+            # older firmware can't break the basic config sync.
+            try:
+                data['bias'] = self.lcr.get_bias()
+                data['aperture'] = self.lcr.get_aperture()
+                data['corr'] = self.lcr.get_correction_states()
+            except Exception:
+                pass
+            return data
+
+        def done(data, error):
+            if error:
+                self.status_bar.config(text=f"Error reading config: {error}")
+                return
+            config = data['config']
             self.lcr_mode.set(config['mode'].upper())
             self.lcr_applied_mode = config['mode'].upper()
-            self.lcr_freq.delete(0, tk.END)
-            self.lcr_freq.insert(0, str(int(config['frequency'])))
+            self._set_entry(self.lcr_freq, int(config['frequency']))
             if 'voltage' in config:
-                self.lcr_volt.delete(0, tk.END)
-                self.lcr_volt.insert(0, str(config['voltage']))
-        except Exception as e:
-            self.status_bar.config(text=f"Error reading config: {e}")
-            return
-        # Bias / aperture / correction read-back (issue #44) is best-effort
-        # so an older firmware can't break the basic config sync above.
-        try:
-            bias = self.lcr.get_bias()
-            self._set_entry(self.lcr_bias_volt, bias['volts'])
-            self.lcr_bias_on.set(bias['on'])
-            speed, avg = self.lcr.get_aperture()
-            if speed in BK894.APERTURE_SPEEDS:
-                self.lcr_speed.set(speed)
-            self._set_entry(self.lcr_avg, avg)
-            self.lcr_corr_label.config(
-                text=self._lcr_corr_text(self.lcr.get_correction_states()))
-        except Exception:
-            pass
+                self._set_entry(self.lcr_volt, config['voltage'])
+            if 'bias' in data:
+                self._set_entry(self.lcr_bias_volt, data['bias']['volts'])
+                self.lcr_bias_on.set(data['bias']['on'])
+                speed, avg = data['aperture']
+                if speed in BK894.APERTURE_SPEEDS:
+                    self.lcr_speed.set(speed)
+                self._set_entry(self.lcr_avg, avg)
+                self.lcr_corr_label.config(
+                    text=self._lcr_corr_text(data['corr']))
+
+        self._run_bg(work, done, busy='lcr-io', quiet=True)
 
     @staticmethod
     def _lcr_corr_text(corr):
@@ -1508,68 +1530,86 @@ ANALYSIS:
             messagebox.showerror("Error", "LCR meter not connected")
             return
         
+        # Widget reads + validation on the main thread; VISA in a worker
         try:
             mode = self.lcr_mode.get()
             freq = float(self.lcr_freq.get())
             volt = float(self.lcr_volt.get())
             bias_v = float(self.lcr_bias_volt.get())
             avg = int(self.lcr_avg.get())
+        except (TypeError, ValueError) as e:
+            messagebox.showerror("Configuration Error", str(e))
+            return
+        speed = self.lcr_speed.get() or 'MED'
+        bias_on = self.lcr_bias_on.get()
+        autorange = self.lcr_autorange.get()
 
+        def work():
             self.lcr.set_mode(mode)
             self.lcr.set_frequency(freq)
             self.lcr.set_voltage(volt)
-            self.lcr.set_aperture(self.lcr_speed.get() or 'MED', avg)
-            self.lcr.set_range_auto(self.lcr_autorange.get())
+            self.lcr.set_aperture(speed, avg)
+            self.lcr.set_range_auto(autorange)
             self.lcr.set_bias_voltage(bias_v)
-            self.lcr.set_bias_enabled(self.lcr_bias_on.get())
-            self.lcr_applied_mode = mode.upper()
-
+            self.lcr.set_bias_enabled(bias_on)
             time.sleep(0.3)
-            bias_note = (f", bias {bias_v:g} V ON" if self.lcr_bias_on.get()
-                         else "")
+
+        def done(_result, error):
+            if error:
+                messagebox.showerror("Configuration Error", str(error))
+                return
+            self.lcr_applied_mode = mode.upper()
+            bias_note = f", bias {bias_v:g} V ON" if bias_on else ""
             self.status_bar.config(
                 text=f"LCR configured: {mode}, {freq} Hz, {volt} V"
                      f"{bias_note}")
-        except Exception as e:
-            messagebox.showerror("Configuration Error", str(e))
+
+        self._run_bg(work, done, busy='lcr-io')
     
-    def lcr_single_measurement(self):
+    def lcr_single_measurement(self, from_continuous=False):
         if not self.lcr:
-            messagebox.showerror("Error", "LCR meter not connected")
-            return
-        
-        try:
-            primary, secondary, status = self.lcr.measure()
-        except Exception as e:
-            # In continuous mode this used to re-raise every 200 ms and
-            # stack a modal dialog per tick (issue #38): stop polling FIRST
-            # so exactly one dialog appears.
-            was_continuous = self.lcr_continuous
-            self.lcr_stop_continuous()
-            if was_continuous:
-                self.status_bar.config(
-                    text=f"Continuous LCR read stopped: {e}")
-            messagebox.showerror("Measurement Error", str(e))
+            if not from_continuous:
+                messagebox.showerror("Error", "LCR meter not connected")
             return
 
-        # Label by the mode the instrument is actually in, not whatever the
-        # dropdown was flipped to since the last Apply (issue #38).
-        mode = self.lcr_applied_mode or self.lcr_mode.get()
-        p_str, s_str = lcr_format.format_measurement(mode, primary, secondary)
-        self.lcr_primary_label.config(text=f"Primary: {p_str}")
-        self.lcr_secondary_label.config(text=f"Secondary: {s_str}")
-        self.lcr_status_label.config(text=f"Status: {'OK' if status == 0 else 'Error'}")
-    
+        def done(result, error):
+            if error:
+                # In continuous mode this used to re-raise every 200 ms and
+                # stack a modal dialog per tick (issue #38): stop polling
+                # FIRST so exactly one dialog appears.
+                was_continuous = self.lcr_continuous
+                self.lcr_stop_continuous()
+                if was_continuous:
+                    self.status_bar.config(
+                        text=f"Continuous LCR read stopped: {error}")
+                messagebox.showerror("Measurement Error", str(error))
+                return
+            primary, secondary, status = result
+            # Label by the mode the instrument is actually in, not whatever
+            # the dropdown was flipped to since the last Apply (issue #38).
+            mode = self.lcr_applied_mode or self.lcr_mode.get()
+            p_str, s_str = lcr_format.format_measurement(mode, primary,
+                                                         secondary)
+            self.lcr_primary_label.config(text=f"Primary: {p_str}")
+            self.lcr_secondary_label.config(text=f"Secondary: {s_str}")
+            self.lcr_status_label.config(
+                text=f"Status: {'OK' if status == 0 else 'Error'}")
+
+        # Continuous ticks skip silently while a previous read (or an LCR
+        # apply/config read) is still in flight -- natural rate limiting.
+        self._run_bg(lambda: self.lcr.measure(), done, busy='lcr-io',
+                     quiet=from_continuous)
+
     def lcr_start_continuous(self):
         self.lcr_continuous = True
         self.lcr_continuous_measurement()
-    
+
     def lcr_stop_continuous(self):
         self.lcr_continuous = False
-    
+
     def lcr_continuous_measurement(self):
         if self.lcr_continuous and self.lcr:
-            self.lcr_single_measurement()
+            self.lcr_single_measurement(from_continuous=True)
             self.root.after(200, self.lcr_continuous_measurement)
     
     # Scope methods
@@ -1580,31 +1620,36 @@ ANALYSIS:
         """Enable/disable a channel"""
         if not self.scope:
             return
-        try:
-            self.scope.set_channel_enable(channel, enable_var.get())
-            state = "enabled" if enable_var.get() else "disabled"
-            self.status_bar.config(text=f"CH{channel} {state}")
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
-    
+        on = enable_var.get()
+        self._bg_simple(
+            lambda: self.scope.set_channel_enable(channel, on),
+            f"CH{channel} {'enabled' if on else 'disabled'}",
+            busy='scope-io')
+
     def apply_channel_config(self, channel):
         """Apply configuration for a specific channel"""
         if not self.scope:
             messagebox.showerror("Error", "Oscilloscope not connected")
             return
-        
+        widgets = self.channel_widgets[channel]
         try:
-            widgets = self.channel_widgets[channel]
             vscale = float(widgets['vscale'].get())
-            coupling = widgets['coupling'].get()
             position = float(widgets['position'].get())
-            
-            self.scope.set_channel_enable(channel, widgets['enable'].get())
-            self.scope.set_vertical(channel, scale=vscale, position=position, coupling=coupling)
-            
-            self.status_bar.config(text=f"CH{channel} configured: {vscale}V/div, {coupling} coupling")
-        except Exception as e:
+        except (TypeError, ValueError) as e:
             messagebox.showerror("Configuration Error", str(e))
+            return
+        coupling = widgets['coupling'].get()
+        enable = widgets['enable'].get()
+
+        def work():
+            self.scope.set_channel_enable(channel, enable)
+            self.scope.set_vertical(channel, scale=vscale, position=position,
+                                    coupling=coupling)
+
+        self._bg_simple(
+            work,
+            f"CH{channel} configured: {vscale}V/div, {coupling} coupling",
+            busy='scope-io', err_title="Configuration Error")
 
     # Signal generator methods
     def _sg_build_channel_panel(self, parent, ch):
@@ -1845,22 +1890,59 @@ ANALYSIS:
         self._reconnect('sg', BK4055B, self.sg_status,
                         sync=self.update_sg_config)
 
-    def update_sg_config(self):
-        """Read current config from the generator: populate the inputs, the
-        applied readouts, and the output button."""
-        if not self.sg:
-            return
-        for ch in (1, 2):
-            try:
-                self._sg_read_channel(ch)
-            except Exception as e:
-                self.status_bar.config(text=f"Error reading CH{ch} config: {e}")
+    # The SG read paths are split into a VISA half (fetch -- worker thread)
+    # and a widget half (populate/show -- main thread) so nothing blocks
+    # the UI (issue #40).
 
-    def _sg_read_channel(self, ch):
-        """Pull one channel's actual state from the instrument into the
-        inputs, applied readouts, and output button."""
-        bswv = self.sg.get_basic_wave_dict(ch)
-        outp = self.sg.get_output_dict(ch)
+    def _sg_fetch_channel(self, ch, bswv=None, outp=None):
+        """VISA half: everything about one channel, from a worker thread."""
+        data = {'bswv': bswv or self.sg.get_basic_wave_dict(ch),
+                'outp': outp or self.sg.get_output_dict(ch),
+                'burst': None, 'sync': None, 'arb': None}
+        try:   # burst/sync best-effort on older firmware (issue #45)
+            data['burst'] = self.sg.get_burst_dict(ch)
+            data['sync'] = self.sg.get_sync(ch)
+        except Exception:
+            pass
+        if data['bswv'].get('WVTP') == 'ARB':
+            try:
+                data['arb'] = self.sg.get_arb_dict(ch)['name']
+            except Exception:
+                pass
+        return data
+
+    def _sg_show_applied(self, ch, data):
+        """Widget half of the applied readouts -- main thread only."""
+        bswv, outp = data['bswv'], data['outp']
+        widgets = self.sg_channel_widgets[ch]
+        applied = widgets['applied']
+        applied['waveform'].config(text=str(bswv.get('WVTP', '--')))
+        for key, bk in SG_BSWV_KEYS.items():
+            applied[key].config(text=str(bswv[bk]) if bk in bswv else '--')
+        applied['arb'].config(text=data['arb'] or '--')
+        applied['load'].config(text=SG_LOAD_HIGHZ if outp['load'] == 'HZ'
+                               else outp['load'])
+        applied['polarity'].config(text=outp['polarity'])
+        widgets['output'].set(outp['state'])
+        self._sg_set_output_button(ch, outp['state'])
+        b = data['burst']
+        if b is None:
+            applied['burst'].config(text='--')
+        else:
+            if b.get('STATE', 'OFF').upper() == 'ON':
+                ncyc = b.get('TIME')
+                desc = (f"Burst ON: {ncyc:g} cyc" if isinstance(ncyc, float)
+                        else "Burst ON")
+                desc += f", {b.get('TRSR', '?')}"
+            else:
+                desc = "Burst off"
+            if data['sync']:
+                desc += " | Sync ON"
+            applied['burst'].config(text=desc)
+
+    def _sg_populate_inputs(self, ch, data):
+        """Write fetched state into the INPUT widgets, then the readouts."""
+        bswv, outp = data['bswv'], data['outp']
         widgets = self.sg_channel_widgets[ch]
         if bswv.get('WVTP') in BK4055B.WAVEFORMS:
             widgets['waveform'].set(bswv['WVTP'])
@@ -1871,9 +1953,8 @@ ANALYSIS:
                             else outp['load'])
         if outp['polarity'] in widgets['polarity']['values']:
             widgets['polarity'].set(outp['polarity'])
-        # Burst/sync inputs (issue #45), best-effort on older firmware
-        try:
-            b = self.sg.get_burst_dict(ch)
+        b = data['burst']
+        if b is not None:
             widgets['burst_on'].set(b.get('STATE', 'OFF').upper() == 'ON')
             if isinstance(b.get('TIME'), float):
                 self._set_entry(widgets['burst_ncyc'], int(b['TIME']))
@@ -1881,12 +1962,32 @@ ANALYSIS:
                 widgets['burst_trsr'].set(b['TRSR'])
             if isinstance(b.get('PRD'), float):
                 self._set_entry(widgets['burst_prd'], b['PRD'])
-            widgets['sync_on'].set(self.sg.get_sync(ch))
-        except Exception:
-            pass
+            widgets['sync_on'].set(bool(data['sync']))
         self._sg_update_visibility(ch)
         self._sg_redraw_preview(ch)
-        self._sg_refresh_applied(ch, bswv=bswv, outp=outp)
+        self._sg_show_applied(ch, data)
+
+    def update_sg_config(self):
+        """Read both channels from the generator in the background."""
+        if not self.sg:
+            return
+
+        def work():
+            return {ch: self._sg_fetch_channel(ch) for ch in (1, 2)}
+
+        def done(data, error):
+            if error:
+                self.status_bar.config(
+                    text=f"Error reading SG config: {error}")
+                return
+            for ch, d in data.items():
+                try:
+                    self._sg_populate_inputs(ch, d)
+                except Exception as e:
+                    self.status_bar.config(
+                        text=f"Error reading CH{ch} config: {e}")
+
+        self._run_bg(work, done, busy='sg-io', quiet=True)
 
     def sg_read_instrument(self, ch):
         """Read Instrument button: sync the GUI to the box's actual state
@@ -1894,54 +1995,22 @@ ANALYSIS:
         if not self.sg:
             messagebox.showerror("Error", "Signal generator not connected")
             return
-        try:
-            self._sg_read_channel(ch)
+
+        def done(data, error):
+            if error:
+                messagebox.showerror("Read Error", str(error))
+                return
+            self._sg_populate_inputs(ch, data)
             self.status_bar.config(text=f"CH{ch} read from instrument")
-        except Exception as e:
-            messagebox.showerror("Read Error", str(e))
+
+        self._run_bg(lambda: self._sg_fetch_channel(ch), done, busy='sg-io')
 
     def _sg_refresh_applied(self, ch, bswv=None, outp=None):
-        """Update the gray applied-value readouts (and output button) from the
-        instrument's actual state."""
+        """Synchronous fetch+show; kept for callers already off the main
+        thread's hot path (arb editor's LAN upload)."""
         if not self.sg:
             return
-        if bswv is None:
-            bswv = self.sg.get_basic_wave_dict(ch)
-        if outp is None:
-            outp = self.sg.get_output_dict(ch)
-        widgets = self.sg_channel_widgets[ch]
-        applied = widgets['applied']
-        applied['waveform'].config(text=str(bswv.get('WVTP', '--')))
-        for key, bk in SG_BSWV_KEYS.items():
-            applied[key].config(text=str(bswv[bk]) if bk in bswv else '--')
-        if bswv.get('WVTP') == 'ARB':
-            try:
-                arb = self.sg.get_arb_dict(ch)
-                applied['arb'].config(text=arb['name'] or '--')
-            except Exception:
-                applied['arb'].config(text='--')
-        else:
-            applied['arb'].config(text='--')
-        applied['load'].config(text=SG_LOAD_HIGHZ if outp['load'] == 'HZ'
-                               else outp['load'])
-        applied['polarity'].config(text=outp['polarity'])
-        widgets['output'].set(outp['state'])
-        self._sg_set_output_button(ch, outp['state'])
-        # Burst/sync readout (issue #45), best-effort
-        try:
-            b = self.sg.get_burst_dict(ch)
-            if b.get('STATE', 'OFF').upper() == 'ON':
-                ncyc = b.get('TIME')
-                desc = (f"Burst ON: {ncyc:g} cyc" if isinstance(ncyc, float)
-                        else "Burst ON")
-                desc += f", {b.get('TRSR', '?')}"
-            else:
-                desc = "Burst off"
-            if self.sg.get_sync(ch):
-                desc += " | Sync ON"
-            applied['burst'].config(text=desc)
-        except Exception:
-            applied['burst'].config(text='--')
+        self._sg_show_applied(ch, self._sg_fetch_channel(ch, bswv, outp))
 
     def _sg_set_output_button(self, ch, on):
         widgets = self.sg_channel_widgets[ch]
@@ -1955,15 +2024,23 @@ ANALYSIS:
                                       activebackground=widgets['out_btn_bg'],
                                       activeforeground='black')
 
-    def apply_sg_channel(self, channel):
+    def apply_sg_channel(self, channel, _then=None):
         """Push the channel CONFIGURATION (waveform parameters + load/polarity)
-        to the instrument. Does NOT touch the output on/off state."""
+        to the instrument. Does NOT touch the output on/off state.
+
+        Widget reads + validation happen here on the main thread; the VISA
+        pushes and the read-back run in a worker (issue #40). `_then` is an
+        optional main-thread callback fired when this apply finishes (used
+        by preset loads to chain CH2 behind CH1 under the shared busy key).
+        """
         if not self.sg:
             messagebox.showerror("Error", "Signal generator not connected")
+            if _then:
+                _then()
             return
+        widgets = self.sg_channel_widgets[channel]
+        wave = widgets['waveform'].get()
         try:
-            widgets = self.sg_channel_widgets[channel]
-            wave = widgets['waveform'].get()
             params = {'WVTP': wave}
             for key, bk in SG_BSWV_KEYS.items():
                 waves = SG_FIELD_WAVEFORMS[key]
@@ -1974,69 +2051,93 @@ ANALYSIS:
                     raise ValueError(f"{SG_FIELD_LABELS[key][:-1]} must be "
                                      f"between 0 and 100, got {value:g}")
                 params[bk] = value
-            self.sg.set_basic_wave(channel, **params)
-            if wave == 'ARB' and SG_ARB_ENABLED:
-                arb = widgets['arb_name_var'].get().strip()
-                if arb:
-                    # Select by name; the waveform must already be in the
-                    # instrument (recalled from a flash-drive .bin on the
-                    # front USB port, or uploaded over LAN)
-                    self.sg.select_arb(channel, arb)
-            self.sg.set_load_polarity(channel,
-                                      load=self._sg_load_to_wire(channel),
-                                      polarity=widgets['polarity'].get())
-            # Burst + sync (issue #45)
-            period = float(widgets['burst_prd'].get() or 0)
-            self.sg.set_burst(channel, widgets['burst_on'].get(),
-                              ncycles=int(float(widgets['burst_ncyc'].get()
-                                                or 1)),
-                              trigger=widgets['burst_trsr'].get() or 'MAN',
-                              period_s=period if period > 0 else None)
-            self.sg.set_sync(channel, widgets['sync_on'].get())
+            burst_period = float(widgets['burst_prd'].get() or 0)
+            burst_ncyc = int(float(widgets['burst_ncyc'].get() or 1))
         except Exception as e:
             messagebox.showerror("Configuration Error", str(e))
+            if _then:
+                _then()
             return
+        arb = (widgets['arb_name_var'].get().strip()
+               if wave == 'ARB' and SG_ARB_ENABLED else '')
+        load = self._sg_load_to_wire(channel)
+        polarity = widgets['polarity'].get()
+        burst_on = widgets['burst_on'].get()
+        burst_trsr = widgets['burst_trsr'].get() or 'MAN'
+        sync_on = widgets['sync_on'].get()
 
-        # Read-back is best-effort: the configuration above already landed,
-        # so a slow/timed-out query must not be reported as a config error.
-        try:
-            time.sleep(0.2)  # let the box settle before querying
-            self._sg_refresh_applied(channel)
-            self.status_bar.config(
-                text=f"CH{channel} configured: {wave} "
-                     f"(output {'ON' if widgets['output'].get() else 'OFF'} - "
-                     f"use the Output button to switch)")
-        except Exception as e:
-            self.status_bar.config(
-                text=f"CH{channel} configured, but read-back failed ({e}) - "
-                     f"use Read Instrument to refresh")
+        def work():
+            self.sg.set_basic_wave(channel, **params)
+            if arb:
+                # Select by name; the waveform must already be in the
+                # instrument (recalled from a flash-drive .bin on the
+                # front USB port, or uploaded over LAN)
+                self.sg.select_arb(channel, arb)
+            self.sg.set_load_polarity(channel, load=load, polarity=polarity)
+            # Burst + sync (issue #45)
+            self.sg.set_burst(channel, burst_on, ncycles=burst_ncyc,
+                              trigger=burst_trsr,
+                              period_s=burst_period if burst_period > 0
+                              else None)
+            self.sg.set_sync(channel, sync_on)
+            # Read-back is best-effort: the configuration above already
+            # landed, so a slow query must not be reported as a config error.
+            time.sleep(0.2)
+            try:
+                return self._sg_fetch_channel(channel)
+            except Exception:
+                return None
+
+        def done(data, error):
+            try:
+                if error:
+                    messagebox.showerror("Configuration Error", str(error))
+                    return
+                if data is not None:
+                    self._sg_show_applied(channel, data)
+                    self.status_bar.config(
+                        text=f"CH{channel} configured: {wave} (output "
+                             f"{'ON' if widgets['output'].get() else 'OFF'}"
+                             " - use the Output button to switch)")
+                else:
+                    self.status_bar.config(
+                        text=f"CH{channel} configured, but read-back failed"
+                             " - use Read Instrument to refresh")
+            finally:
+                if _then:
+                    _then()
+
+        if not self._run_bg(work, done, busy='sg-io') and _then:
+            _then()
 
     def sg_fire_burst(self, channel):
         """Fire one manual burst (needs Burst ON, trigger MAN, output ON)."""
         if not self.sg:
             messagebox.showerror("Error", "Signal generator not connected")
             return
-        try:
-            self.sg.burst_trigger(channel)
-            self.status_bar.config(text=f"CH{channel}: burst fired")
-        except Exception as e:
-            messagebox.showerror("Burst", str(e))
+        self._bg_simple(lambda: self.sg.burst_trigger(channel),
+                        f"CH{channel}: burst fired", busy='sg-io',
+                        err_title="Burst")
 
     def sg_toggle_output(self, channel):
         """Flip the channel output on/off (separate from Apply)."""
         if not self.sg:
             messagebox.showerror("Error", "Signal generator not connected")
             return
-        try:
-            widgets = self.sg_channel_widgets[channel]
-            new_state = not widgets['output'].get()
-            self.sg.set_output(channel, new_state)
+        widgets = self.sg_channel_widgets[channel]
+        new_state = not widgets['output'].get()
+
+        def done(_result, error):
+            if error:
+                messagebox.showerror("Error", str(error))
+                return
             widgets['output'].set(new_state)
             self._sg_set_output_button(channel, new_state)
             self.status_bar.config(
                 text=f"CH{channel} output {'ON' if new_state else 'OFF'}")
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
+
+        self._run_bg(lambda: self.sg.set_output(channel, new_state), done,
+                     busy='sg-io')
 
     def _sg_collect_state(self):
         """Read both channels' widgets into a {1|2 -> ChannelState} mapping."""
@@ -2115,8 +2216,17 @@ ANALYSIS:
                     widgets['arb_samples'] = None
             self._sg_update_visibility(ch)
             self._sg_redraw_preview(ch)
-            if self.sg:
-                self.apply_sg_channel(ch)
+        # The applies run in the background under one shared busy key, so
+        # firing both at once would drop CH2 -- chain it behind CH1 instead.
+        if self.sg:
+            to_apply = [ch for ch in (1, 2)
+                        if channels.get(str(ch)) or channels.get(ch)]
+
+            def chain(idx=0):
+                if idx < len(to_apply):
+                    self.apply_sg_channel(to_apply[idx],
+                                          _then=lambda: chain(idx + 1))
+            chain()
 
     def sg_open_arb_dialog(self, ch):
         """Open the interactive arbitrary-waveform editor for a channel."""
@@ -2187,65 +2297,61 @@ ANALYSIS:
             messagebox.showerror("Error", "Oscilloscope not connected")
             return
         
+        # Collect + validate everything on the main thread first
         try:
-            # Apply all channel configs
+            channels = []
             for ch in range(1, 5):
                 widgets = self.channel_widgets[ch]
-                vscale = float(widgets['vscale'].get())
-                coupling = widgets['coupling'].get()
-                position = float(widgets['position'].get())
-                
-                self.scope.set_channel_enable(ch, widgets['enable'].get())
-                self.scope.set_vertical(ch, scale=vscale, position=position, coupling=coupling)
-            
-            # Apply horizontal
+                channels.append((ch, widgets['enable'].get(),
+                                 float(widgets['vscale'].get()),
+                                 float(widgets['position'].get()),
+                                 widgets['coupling'].get()))
             hscale = float(self.scope_hscale.get())
-            self.scope.set_horizontal(scale=hscale)
-            
-            # Apply trigger (find which channel is selected as trigger)
-            trig_source = 'CH1'
-            for ch in range(1, 5):
-                if self.channel_widgets[ch]['trigger'].get():
-                    trig_source = f'CH{ch}'
-                    break
-            
             trig_level = float(self.scope_trig_level.get())
-            trig_slope = self.scope_trig_slope.get()
-            self.scope.set_trigger_edge(source=trig_source, level=trig_level, slope=trig_slope)
-            
-            self.status_bar.config(text=f"All settings applied. Trigger: {trig_source} @ {trig_level}V")
-        except Exception as e:
+        except (TypeError, ValueError) as e:
             messagebox.showerror("Configuration Error", str(e))
-    
+            return
+        trig_source = 'CH1'
+        for ch in range(1, 5):
+            if self.channel_widgets[ch]['trigger'].get():
+                trig_source = f'CH{ch}'
+                break
+        trig_slope = self.scope_trig_slope.get()
+
+        def work():
+            for ch, enable, vscale, position, coupling in channels:
+                self.scope.set_channel_enable(ch, enable)
+                self.scope.set_vertical(ch, scale=vscale, position=position,
+                                        coupling=coupling)
+            self.scope.set_horizontal(scale=hscale)
+            self.scope.set_trigger_edge(source=trig_source, level=trig_level,
+                                        slope=trig_slope)
+
+        self._bg_simple(
+            work,
+            f"All settings applied. Trigger: {trig_source} @ {trig_level}V",
+            busy='scope-io', err_title="Configuration Error")
+
     def scope_single(self):
         if not self.scope:
             messagebox.showerror("Error", "Oscilloscope not connected")
             return
-        try:
-            self.scope.single()
-            self.status_bar.config(text="Single acquisition armed")
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
-    
+        self._bg_simple(lambda: self.scope.single(),
+                        "Single acquisition armed", busy='scope-io')
+
     def scope_run(self):
         if not self.scope:
             messagebox.showerror("Error", "Oscilloscope not connected")
             return
-        try:
-            self.scope.run()
-            self.status_bar.config(text="Scope running")
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
-    
+        self._bg_simple(lambda: self.scope.run(), "Scope running",
+                        busy='scope-io')
+
     def scope_stop(self):
         if not self.scope:
             messagebox.showerror("Error", "Oscilloscope not connected")
             return
-        try:
-            self.scope.stop()
-            self.status_bar.config(text="Scope stopped")
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
+        self._bg_simple(lambda: self.scope.stop(), "Scope stopped",
+                        busy='scope-io')
     
     def scope_autoset(self):
         if not self.scope:
@@ -2268,9 +2374,10 @@ ANALYSIS:
             messagebox.showerror("Error", "Oscilloscope not connected")
             return
         
-        try:
-            meas = self.scope.get_all_measurements(channel)
-
+        def done(meas, error):
+            if error:
+                messagebox.showerror("Measurement Error", str(error))
+                return
             # measurement dict key -> label widget key (they differ for
             # freq/pk2pk, which is why those never displayed before)
             label_map = {'freq': 'frequency', 'period': 'period', 'mean': 'mean',
@@ -2304,10 +2411,11 @@ ANALYSIS:
                         self.scope_meas_labels[channel][label_key].config(
                             text=f"{key.capitalize()}: No signal"
                         )
-            
+
             self.status_bar.config(text=f"CH{channel} measurements updated")
-        except Exception as e:
-            messagebox.showerror("Measurement Error", str(e))
+
+        self._run_bg(lambda: self.scope.get_all_measurements(channel), done,
+                     busy='scope-io')
     
     def scope_capture_waveform(self, channel):
         """Fetch a channel's sample record off the UI thread, then show it
