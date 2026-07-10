@@ -35,7 +35,7 @@ the Trek output):
     phase     = 0
 `suggest_header` computes these defaults from the samples + duration.
 
-Headless self-test: .venv/bin/python test_easywave_export.py
+Headless self-test: .venv/bin/python tests/test_easywave_export.py
 """
 
 EASYWAVE_POINTS = 16384

@@ -16,7 +16,7 @@ This replaces the whole editor -> CSV -> EasyWaveX -> .bin -> flash-drive
 chain with editor -> .bin -> flash drive. Same scaling as the (LAN-only)
 WVDT upload path, so a wave plays identically whichever route it takes.
 
-Headless self-test: .venv/bin/python test_arb_bin.py
+Headless self-test: .venv/bin/python tests/test_arb_bin.py
 """
 import getpass
 import os

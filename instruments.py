@@ -144,7 +144,7 @@ class VisaInstrument:
         single USBTMC transfer longer than one 64-byte USB packet hard-wedges
         the firmware (bench-verified 2026-07-02, even for pure-ASCII queries);
         only a front-panel power cycle recovers it. Kept solely so
-        ``test_arb_usb_probe.py`` can demonstrate the wedge. For real uploads
+        ``bench/test_arb_usb_probe.py`` can demonstrate the wedge. For real uploads
         use ``write_raw_single_packet``.
         """
         try:
@@ -781,7 +781,7 @@ class BK4055B(VisaInstrument):
         terminator.
 
         Split out from upload_arb so it can be unit-tested headless and verified
-        with ``test_arb_scope.py --readback`` without driving the bus.
+        with ``bench/test_arb_scope.py --readback`` without driving the bus.
         """
         clean = re.sub(r'[^A-Za-z0-9_]', '_', str(name))[:16]
         if not clean:

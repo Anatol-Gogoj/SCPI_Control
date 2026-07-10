@@ -3,8 +3,14 @@
 
 Also demonstrates *why* shape comparison is needed: a sine and a square share
 frequency, Vpp and mean, yet correlation and the harmonic spectrum separate
-them clearly. Run: .venv/bin/python test_arb_compare.py
+them clearly. Run: .venv/bin/python tests/test_arb_compare.py
 """
+# Runnable from anywhere: put the repo root (one level up) on sys.path
+# so the app modules import when this file is executed directly.
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(
+    _os.path.abspath(__file__))))
 import math
 import random
 

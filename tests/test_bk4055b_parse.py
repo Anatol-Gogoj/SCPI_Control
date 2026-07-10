@@ -2,8 +2,14 @@
 """Headless tests for the BK4055B response parsers (no instrument needed).
 
 Feeds captured BSWV?/OUTP? response strings into the parsers and asserts the
-resulting dicts/bytes. Run: .venv/bin/python test_bk4055b_parse.py
+resulting dicts/bytes. Run: .venv/bin/python tests/test_bk4055b_parse.py
 """
+# Runnable from anywhere: put the repo root (one level up) on sys.path
+# so the app modules import when this file is executed directly.
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(
+    _os.path.abspath(__file__))))
 import struct
 import types
 

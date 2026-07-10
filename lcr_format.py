@@ -7,7 +7,7 @@ rather than the mode actually applied (issue #38). This module knows, per
 measurement mode, what the primary/secondary quantities are and formats both
 with auto-scaled SI prefixes.
 
-Headless self-test: .venv/bin/python test_lcr_format.py
+Headless self-test: .venv/bin/python tests/test_lcr_format.py
 """
 
 # mode -> (primary unit, secondary name, secondary unit)

@@ -17,6 +17,12 @@ Stages (aliveness-checked after each; stops at first wedge):
 
     .venv/bin/python test_arb_usb_probe.py --sg 1
 """
+# Runnable from anywhere: put the repo root (one level up) on sys.path
+# so the app modules import when this file is executed directly.
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(
+    _os.path.abspath(__file__))))
 import sys
 import math
 import time
