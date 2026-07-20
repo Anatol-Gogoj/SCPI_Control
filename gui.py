@@ -120,6 +120,8 @@ SG_STATE_KEYS = {'freq': 'freq_hz', 'amp': 'amp_vpp', 'offset': 'offset_v',
 # LAN. Flip to False to hide the ARB waveform + Waveform Editor again.
 SG_ARB_ENABLED = True
 
+PREVIEW_MAX_HEIGHT = 520   # webcam preview height budget (px)
+
 SG_LOAD_HIGHZ = 'High-Z'   # UI label for the SCPI 'HZ' (high impedance) token
 
 # Instrument I/O works only on the Linux bench box (pyvisa-py drives the
@@ -3010,6 +3012,35 @@ ANALYSIS:
         ttk.Checkbutton(top, text="Show focus score",
                         variable=self.cam_focus_var).pack(side=tk.LEFT, padx=8)
 
+        # --- sensor controls (industrial cameras) ---
+        # The DFK 37BUX250's own auto-exposure never converges over UVC: at
+        # its defaults every frame is pure black, which reads as "the camera
+        # is broken". These make the exposure reachable.
+        sens = ttk.Frame(tab, padding=(8, 0))
+        sens.pack(fill='x')
+        ttk.Label(sens, text="Exposure:").pack(side=tk.LEFT)
+        self.cam_exposure = ttk.Entry(sens, width=8)
+        self.cam_exposure.pack(side=tk.LEFT, padx=4)
+        add_tooltip(self.cam_exposure,
+                    "Exposure time in 100 microsecond units (50 = 5 ms). "
+                    "Longer = brighter but slower and more motion blur.")
+        ttk.Label(sens, text="Gain:").pack(side=tk.LEFT, padx=(8, 0))
+        self.cam_gain = ttk.Entry(sens, width=6)
+        self.cam_gain.pack(side=tk.LEFT, padx=4)
+        add_tooltip(self.cam_gain,
+                    "Sensor gain. Raise it only after exposure runs out - "
+                    "gain amplifies noise as well as signal.")
+        add_tooltip(ttk.Button(sens, text="Apply",
+                               command=self.cam_apply_controls),
+                    "Send exposure/gain to the camera (switches it to "
+                    "manual exposure).").pack(side=tk.LEFT, padx=4)
+        add_tooltip(ttk.Button(sens, text="Auto-expose",
+                               command=self.cam_auto_expose),
+                    "Try a range of exposures and keep the one that gives a "
+                    "mid-grey image. Takes a few seconds.").pack(side=tk.LEFT)
+        self.cam_sensor_status = ttk.Label(sens, text="", foreground="gray")
+        self.cam_sensor_status.pack(side=tk.LEFT, padx=10)
+
         # --- preview image ---
         self.cam_view = tk.Label(tab, bg='black', width=80, height=24,
                                  anchor='center',
@@ -3088,6 +3119,7 @@ ANALYSIS:
         self.cam_combo['values'] = vals
         if vals and not self.cam_index_var.get():
             self.cam_index_var.set(vals[0])
+        self.cam_sync_controls()
         # status_bar may not exist yet during initial tab construction.
         if hasattr(self, 'status_bar'):
             self.status_bar.config(
@@ -3106,6 +3138,102 @@ ANALYSIS:
             self.cam.close()
         self.cam = webcam.Camera(idx).open()
         return self.cam
+
+    def _cam_device(self):
+        """/dev/videoN for the selected camera, or None."""
+        idx = self.cam_index_var.get().strip()
+        if not idx.isdigit():
+            return None
+        device = f"/dev/video{idx}"
+        return device if os.path.exists(device) else None
+
+    def cam_sync_controls(self):
+        """Read exposure/gain off the camera into the entry boxes."""
+        device = self._cam_device()
+        if not device or not webcam.v4l2_available():
+            return
+        exp = webcam.get_control(device, 'exposure_time_absolute')
+        gain = webcam.get_control(device, 'gain')
+        if exp is not None:
+            self._set_entry(self.cam_exposure, exp)
+        if gain is not None:
+            self._set_entry(self.cam_gain, gain)
+
+    def cam_apply_controls(self):
+        device = self._cam_device()
+        if not device:
+            messagebox.showerror("Camera", "Select a camera first.")
+            return
+        if not webcam.v4l2_available():
+            messagebox.showerror(
+                "Camera", "v4l2-ctl is not installed, so sensor controls "
+                          "are unavailable.\n\nInstall with: "
+                          "sudo dnf install v4l-utils")
+            return
+        try:
+            exposure = int(float(self.cam_exposure.get()))
+            gain = int(float(self.cam_gain.get()))
+        except (TypeError, ValueError) as e:
+            messagebox.showerror("Camera", f"Exposure/gain must be numbers: {e}")
+            return
+
+        def work():
+            webcam.set_manual_exposure(device, exposure=exposure, gain=gain)
+            return (webcam.get_control(device, 'exposure_time_absolute'),
+                    webcam.get_control(device, 'gain'))
+
+        def done(values, error):
+            if error:
+                messagebox.showerror("Camera", str(error))
+                return
+            exp, g = values
+            self.cam_sensor_status.config(
+                text=f"applied: exposure {exp}, gain {g}")
+            self.status_bar.config(text=f"Camera: exposure {exp}, gain {g}")
+
+        self._run_bg(work, done, busy='camera-ctrl')
+
+    def cam_auto_expose(self):
+        """Search for a usable exposure (the camera's own AE stays black)."""
+        device = self._cam_device()
+        if not device or not webcam.v4l2_available():
+            messagebox.showerror("Camera", "No camera / v4l2-ctl available.")
+            return
+        fourcc = webcam.bayer_format(device)
+        if not fourcc:
+            messagebox.showinfo(
+                "Auto-expose",
+                "This camera is not a raw-Bayer device, so it is driven by "
+                "OpenCV and exposes its own automatic exposure.")
+            return
+        was_previewing = self.cam_previewing
+        if was_previewing:
+            self.cam_stop_preview()      # the search needs the device free
+        self.cam_sensor_status.config(text="searching for an exposure...")
+
+        def work():
+            size = webcam.choose_size(webcam.parse_frame_sizes(
+                webcam._v4l2('--list-formats-ext', device=device), fourcc))
+            w, h = size or (640, 480)
+            return webcam.auto_exposure(device, fourcc, w, h)
+
+        def done(result, error):
+            if error:
+                self.cam_sensor_status.config(text="auto-expose failed")
+                messagebox.showerror("Auto-expose", str(error))
+                return
+            exp, mean = result
+            if exp is None:
+                self.cam_sensor_status.config(text="auto-expose found nothing")
+            else:
+                self._set_entry(self.cam_exposure, exp)
+                self.cam_sync_controls()
+                self.cam_sensor_status.config(
+                    text=f"exposure {exp} (mean level {mean:.0f})")
+            if was_previewing:
+                self.cam_start_preview()
+
+        self._run_bg(work, done, busy='camera-ctrl')
 
     def cam_toggle_preview(self):
         if self.cam_previewing:
@@ -3149,10 +3277,12 @@ ANALYSIS:
         focus-score overlay)."""
         from PIL import Image, ImageTk
         img = Image.fromarray(rgb)
-        # Fit within the current view size, keeping aspect ratio.
+        # Fit the width of the view, but use a FIXED height budget: the
+        # label sizes itself to whatever image we put in it, so deriving the
+        # height from the label collapses the preview to a thin strip once
+        # the tab became scrollable (the canvas grants no spare height).
         maxw = max(self.cam_view.winfo_width() - 4, 320)
-        maxh = max(self.cam_view.winfo_height() - 4, 240)
-        img.thumbnail((maxw, maxh))
+        img.thumbnail((maxw, PREVIEW_MAX_HEIGHT))
         photo = ImageTk.PhotoImage(img)
         text = ''
         if self.cam_focus_var.get():
@@ -3160,8 +3290,12 @@ ANALYSIS:
                 text = f"focus {webcam.focus_score(rgb):.0f}"
             except Exception:
                 text = ''
+        # width/height on a Label are TEXT units while it shows text but
+        # PIXELS once it shows an image -- the placeholder's height=24 was
+        # therefore pinning the live preview to a 24 px strip. Zero means
+        # "size to the image".
         self.cam_view.config(image=photo, text=text, compound='center',
-                             fg='lime')
+                             fg='lime', width=0, height=0)
         self.cam_photo = photo            # keep a ref
 
     def _cam_save_frame(self, frame, value=None):
