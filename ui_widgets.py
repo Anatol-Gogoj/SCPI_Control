@@ -73,6 +73,64 @@ def add_tooltip(widget, text):
     return widget
 
 
+class SplashScreen(tk.Toplevel):
+    """Borderless "starting up" window shown while the tabs are built.
+
+    Building the six tabs takes ~2.6 s on the bench PC (measured), during
+    which nothing appeared on screen at all -- a user double-clicking the
+    desktop icon had no idea anything was happening. This paints
+    immediately and reports each phase, then goes away.
+    """
+
+    W, H = 460, 170
+
+    def __init__(self, root, version_text=''):
+        super().__init__(root)
+        self.overrideredirect(True)          # no title bar / decorations
+        self.configure(bg='#1f3a5f')
+        # centre on screen (the main window is not sized yet)
+        x = (self.winfo_screenwidth() - self.W) // 2
+        y = (self.winfo_screenheight() - self.H) // 3
+        self.geometry(f'{self.W}x{self.H}+{x}+{y}')
+
+        frame = tk.Frame(self, bg='#1f3a5f', padx=24, pady=18)
+        frame.pack(fill='both', expand=True)
+        tk.Label(frame, text='SCPI Control', bg='#1f3a5f', fg='white',
+                 font=('TkDefaultFont', 17, 'bold')).pack(anchor='w')
+        tk.Label(frame, text='Lab instrument multitool', bg='#1f3a5f',
+                 fg='#b8c7dc', font=('TkDefaultFont', 10)).pack(anchor='w')
+
+        self._status = tk.Label(frame, text='Starting...', bg='#1f3a5f',
+                                fg='#e6edf5', font=('TkDefaultFont', 10),
+                                anchor='w')
+        self._status.pack(anchor='w', pady=(14, 4), fill='x')
+        self._bar = ttk.Progressbar(frame, mode='indeterminate', length=400)
+        self._bar.pack(fill='x')
+        self._bar.start(12)
+        if version_text:
+            tk.Label(frame, text=version_text, bg='#1f3a5f', fg='#8fa4bd',
+                     font=('TkDefaultFont', 8)).pack(anchor='e',
+                                                     pady=(8, 0))
+        self.update_idletasks()
+        self.update()                         # paint before the slow work
+
+    def set_status(self, text):
+        """Update the phase line and repaint (called from the build loop)."""
+        try:
+            self._status.config(text=text)
+            self.update_idletasks()
+            self.update()
+        except tk.TclError:                   # already closed
+            pass
+
+    def close(self):
+        try:
+            self._bar.stop()
+            self.destroy()
+        except tk.TclError:
+            pass
+
+
 class ScrollableTab(ttk.Frame):
     """Notebook tab with a vertical scrollbar when content doesn't fit.
 

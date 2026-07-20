@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  Launch the SCPI_Control GUI from the shared drive -- via a LOCAL CACHE.
+#  Any user on this machine (e.g. robotincubator) can run it:
+#
+#      bash /mnt/shareDrive/_software/launch_gui.sh
+#
+#  Why the cache: cold CIFS imports cost ~70 s (pylibs is ~700 small files
+#  read over SMB on the first launch after login/boot -- GitHub issue #41).
+#  The app + deps are mirrored to a per-user local cache and Python runs
+#  from local disk. Only ONE share file (version.py) is read per launch to
+#  decide whether to re-sync; update_software.sh stamps a fresh git hash on
+#  every deploy, so a stamp match means the cache is current.
+#
+#  The working directory stays on the SHARE app dir so the relative
+#  presets/ path keeps presets shared between users.
+# ============================================================================
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+APP="$HERE/SCPI_Control"
+LIBS="$HERE/pylibs"
+CACHE="${SCPI_CACHE:-$HOME/.cache/scpi_control}"
+
+# System interpreter (on local disk, so it can be executed -- a venv python
+# on the CIFS share cannot). Override with SCPI_PYTHON=/path/to/python.
+PY="${SCPI_PYTHON:-/usr/bin/python3.11}"
+command -v "$PY" >/dev/null 2>&1 || PY=python3.11
+
+if [ ! -f "$APP/gui.py" ]; then
+  echo "error: $APP/gui.py not found -- run update_software.sh first." >&2
+  exit 1
+fi
+
+# --- refresh the local cache when the share's version stamp changed --------
+stamp() { grep -m1 '^__version__' "$1" 2>/dev/null || echo none; }
+share_stamp="$(stamp "$APP/version.py")"
+cache_stamp="$(stamp "$CACHE/SCPI_Control/version.py")"
+
+RUN_APP="$CACHE/SCPI_Control"
+RUN_LIBS="$CACHE/pylibs"
+if [ "$share_stamp" != "$cache_stamp" ] || [ ! -f "$RUN_APP/gui.py" ]; then
+  echo "Updating local cache $CACHE ($share_stamp)..."
+  # The desktop icon gives no feedback, and this copy takes ~25 s the first
+  # time after a deploy. Say so, or it just looks like nothing happened.
+  notify-send -t 40000 "SCPI Control" \
+    "New version found - updating this PC's local copy. The window will open in about half a minute." 2>/dev/null || true
+  if ! mkdir -p "$CACHE" ||
+     ! rsync -a --delete --exclude presets/ "$APP/" "$RUN_APP/" ||
+     ! rsync -a --delete "$LIBS/" "$RUN_LIBS/"; then
+    echo "warning: cache sync failed -- running directly from the share." >&2
+    RUN_APP="$APP"; RUN_LIBS="$LIBS"
+  fi
+fi
+
+# cd into the SHARE app dir so gui.py's relative presets/ path resolves to
+# the shared presets folder (presets stay shared between all users).
+cd "$APP"
+exec env PYTHONPATH="$RUN_LIBS${PYTHONPATH:+:$PYTHONPATH}" "$PY" "$RUN_APP/gui.py" "$@"
