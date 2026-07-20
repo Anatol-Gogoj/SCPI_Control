@@ -31,7 +31,7 @@ from instruments import BK894, TekMSO24, BK4055B
 import lcr_format
 import scope_trace
 from siggen_presets import SignalGenPresetStore
-from ui_widgets import ScrollableTab, add_tooltip
+from ui_widgets import ScrollableTab, SplashScreen, add_tooltip
 from arb_editor import ArbWaveformEditor
 from waveform_render import unit_waveform, scale_waveform
 from version import version_string
@@ -135,7 +135,10 @@ NOT_LINUX_NOTE = ("Instrument control needs the Linux bench PC "
                   "still be edited and saved as presets/profiles.")
 
 class InstrumentControlGUI:
-    def __init__(self, root):
+    def __init__(self, root, progress=None):
+        # `progress` is an optional callable(str) used by the splash screen
+        # to report what is being built (tab construction takes ~2.6 s).
+        self._progress = progress or (lambda _text: None)
         self.root = root
         self.root.title(f"Lab Instrument Control  —  {version_string()}")
         # Wide enough for the LCR tab's right-hand column (bias/speed/
@@ -196,13 +199,15 @@ class InstrumentControlGUI:
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill='both', expand=True, padx=10, pady=10)
         
-        # Create tabs
-        self.create_lcr_tab()
-        self.create_scope_tab()
-        self.create_sg_tab()
-        self.create_logging_tab()
-        self.create_battery_tab()
-        self.create_webcam_tab()
+        # Create tabs (reporting each one; this is the slow part of start-up)
+        for label, build in (("LCR meter", self.create_lcr_tab),
+                             ("oscilloscope", self.create_scope_tab),
+                             ("signal generator", self.create_sg_tab),
+                             ("data logging", self.create_logging_tab),
+                             ("battery data", self.create_battery_tab),
+                             ("webcam", self.create_webcam_tab)):
+            self._progress(f"Loading {label}...")
+            build()
         
         # Footer: status bar (left, stretches) + version readout (right)
         footer = tk.Frame(root)
@@ -216,7 +221,8 @@ class InstrumentControlGUI:
         # Clean up the camera (and any capture loop) on window close.
         self.root.protocol('WM_DELETE_WINDOW', self._on_app_close)
 
-        # Auto-connect on startup
+        # Auto-connect on startup (in the background -- issue #40)
+        self._progress("Looking for instruments...")
         self.root.after(100, self.auto_connect)
 
     def _on_app_close(self):
@@ -3362,5 +3368,16 @@ ANALYSIS:
 
 if __name__ == "__main__":
     root = tk.Tk()
-    app = InstrumentControlGUI(root)
+    # Show a splash immediately: building the tabs takes a couple of seconds
+    # and the desktop icon gives no feedback of its own.
+    root.withdraw()
+    try:
+        splash = SplashScreen(root, version_string())
+    except tk.TclError:
+        splash = None
+    app = InstrumentControlGUI(
+        root, progress=splash.set_status if splash else None)
+    if splash:
+        splash.close()
+    root.deiconify()
     root.mainloop()
