@@ -26,6 +26,7 @@ import json
 from datetime import datetime, timezone
 
 from instruments import BK4055B
+import presets_path
 
 SCHEMA_VERSION = 1
 DEFAULT_PATH = 'presets/siggen_presets.json'
@@ -164,15 +165,21 @@ class SignalGenPresetStore:
         self._data = {'version': SCHEMA_VERSION, 'presets': {}}
         self.load()
 
+    @property
+    def _root(self):
+        """Configured presets directory; the fallback mirrors its layout."""
+        return os.path.dirname(self.path) or '.'
+
     # -- persistence -------------------------------------------------------
     def load(self):
         """(Re)load from disk. Missing file -> empty store; malformed file is
         moved aside to ``<path>.corrupt`` and an empty store is started."""
-        if not os.path.exists(self.path):
+        path = presets_path.readable_path(self.path, self._root)
+        if not os.path.exists(path):
             self._data = {'version': SCHEMA_VERSION, 'presets': {}}
             return self._data
         try:
-            with open(self.path, 'r') as f:
+            with open(path, 'r') as f:
                 data = json.load(f)
             if not isinstance(data, dict) or not isinstance(data.get('presets'), dict):
                 raise ValueError("missing 'presets' object")
@@ -182,7 +189,7 @@ class SignalGenPresetStore:
             }
         except (json.JSONDecodeError, ValueError, OSError):
             try:
-                os.replace(self.path, self.path + '.corrupt')
+                os.replace(path, path + '.corrupt')
             except OSError:
                 pass
             self._data = {'version': SCHEMA_VERSION, 'presets': {}}
@@ -190,13 +197,14 @@ class SignalGenPresetStore:
 
     def _save(self):
         """Atomically persist: write a temp file then os.replace onto path."""
-        directory = os.path.dirname(self.path)
+        path = presets_path.writable_path(self.path, root=self._root)
+        directory = os.path.dirname(path)
         if directory:
             os.makedirs(directory, exist_ok=True)
-        tmp = self.path + '.tmp'
+        tmp = path + '.tmp'
         with open(tmp, 'w') as f:
             json.dump(self._data, f, indent=2)
-        os.replace(tmp, self.path)
+        os.replace(tmp, path)
 
     # -- queries -----------------------------------------------------------
     def names(self):
@@ -249,17 +257,20 @@ class SignalGenPresetStore:
     def arb_dir(self, path):
         self._arb_dir = path
 
-    def _arb_path(self, name):
-        return os.path.join(self.arb_dir, f'{sanitize_arb_name(name)}.csv')
+    def _arb_path(self, name, directory=None):
+        d = self.arb_dir if directory is None else directory
+        return os.path.join(d, f'{sanitize_arb_name(name)}.csv')
 
-    def _arb_recipe_path(self, name):
-        return os.path.join(self.arb_dir, f'{sanitize_arb_name(name)}.recipe.json')
+    def _arb_recipe_path(self, name, directory=None):
+        d = self.arb_dir if directory is None else directory
+        return os.path.join(d, f'{sanitize_arb_name(name)}.recipe.json')
 
     def arb_names(self):
         """Sorted names of saved arb waveforms."""
-        if not os.path.isdir(self.arb_dir):
+        directory = presets_path.listable_dir(self.arb_dir, self._root)
+        if not os.path.isdir(directory):
             return []
-        return sorted(os.path.splitext(f)[0] for f in os.listdir(self.arb_dir)
+        return sorted(os.path.splitext(f)[0] for f in os.listdir(directory)
                       if f.endswith('.csv'))
 
     def save_arb(self, name, samples, recipe=None):
@@ -272,16 +283,18 @@ class SignalGenPresetStore:
         if not samples:
             raise ValueError("samples must be non-empty")
         clean = sanitize_arb_name(name)
-        os.makedirs(self.arb_dir, exist_ok=True)
-        tmp = self._arb_path(clean) + '.tmp'
+        directory = presets_path.writable_path(self.arb_dir, is_dir=True,
+                                               root=self._root)
+        os.makedirs(directory, exist_ok=True)
+        tmp = self._arb_path(clean, directory) + '.tmp'
         with open(tmp, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['value'])
             for s in samples:
                 writer.writerow([f'{float(s):.6g}'])
-        os.replace(tmp, self._arb_path(clean))
+        os.replace(tmp, self._arb_path(clean, directory))
 
-        recipe_path = self._arb_recipe_path(clean)
+        recipe_path = self._arb_recipe_path(clean, directory)
         if recipe is not None:
             rtmp = recipe_path + '.tmp'
             with open(rtmp, 'w') as f:
@@ -293,11 +306,13 @@ class SignalGenPresetStore:
 
     def load_arb(self, name):
         """Load samples for a saved arb. Raises FileNotFoundError/ValueError."""
-        return arb_from_csv(self._arb_path(name))
+        return arb_from_csv(
+            presets_path.readable_path(self._arb_path(name), self._root))
 
     def load_arb_recipe(self, name):
         """Return the saved editor recipe for an arb, or None if there isn't one."""
-        path = self._arb_recipe_path(name)
+        path = presets_path.readable_path(self._arb_recipe_path(name),
+                                          self._root)
         if not os.path.exists(path):
             return None
         with open(path) as f:
@@ -305,11 +320,12 @@ class SignalGenPresetStore:
 
     def delete_arb(self, name):
         """Delete a saved arb (and its recipe sidecar). Returns True if it existed."""
-        path = self._arb_path(name)
+        path = presets_path.readable_path(self._arb_path(name), self._root)
         existed = os.path.exists(path)
         if existed:
             os.remove(path)
-        recipe_path = self._arb_recipe_path(name)
+        recipe_path = presets_path.readable_path(
+            self._arb_recipe_path(name), self._root)
         if os.path.exists(recipe_path):
             os.remove(recipe_path)
         return existed

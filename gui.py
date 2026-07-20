@@ -26,6 +26,7 @@ import sys
 import time
 from datetime import datetime
 from bench_profiles import BenchProfileStore
+import presets_path
 from instruments import BK894, TekMSO24, BK4055B
 import lcr_format
 import scope_trace
@@ -277,6 +278,16 @@ class InstrumentControlGUI:
                 self.status_bar.config(text=ok_text)
         self._run_bg(work, done, busy=busy)
 
+    @staticmethod
+    def _preset_note(text):
+        """Append 'the share was down, saved locally' to a status message
+        when the last write fell back (presets_path)."""
+        note = presets_path.fallback_note()
+        if not note:
+            return text
+        presets_path.clear_note()
+        return f"{text} -- {note}"
+
     # ---- Bench profiles (issue #47) --------------------------------------
     # A profile is a widget-level snapshot of the whole bench (LCR, scope,
     # both sig-gen channels). Entry values are stored as their raw strings
@@ -374,7 +385,8 @@ class InstrumentControlGUI:
         except Exception as e:
             messagebox.showerror("Save Bench Profile", str(e))
             return
-        self.status_bar.config(text=f"Bench profile saved: {name}")
+        self.status_bar.config(
+            text=self._preset_note(f"Bench profile saved: {name}"))
 
     def load_bench_profile(self):
         def action(name):
@@ -2564,7 +2576,8 @@ ANALYSIS:
             self.sg_presets.save(name, self._sg_collect_state())
             self.sg_refresh_presets()
             self.sg_preset_select.set(name)
-            self.status_bar.config(text=f"Preset saved: {name}")
+            self.status_bar.config(
+                text=self._preset_note(f"Preset saved: {name}"))
         except Exception as e:
             messagebox.showerror("Save Error", str(e))
 

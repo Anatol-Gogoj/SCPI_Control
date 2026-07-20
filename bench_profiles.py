@@ -16,6 +16,8 @@ Headless self-test: .venv/bin/python tests/test_bench_profiles.py
 import json
 import os
 
+import presets_path
+
 
 class BenchProfileStore:
     def __init__(self, path=None):
@@ -25,20 +27,23 @@ class BenchProfileStore:
         """The whole file as a dict; missing/corrupt files read as empty
         (a broken JSON must never brick every profile operation)."""
         try:
-            with open(self.path) as f:
+            with open(presets_path.readable_path(
+                    self.path, os.path.dirname(self.path) or '.')) as f:
                 data = json.load(f)
             return data if isinstance(data, dict) else {}
         except (OSError, ValueError):
             return {}
 
     def _save_all(self, data):
-        parent = os.path.dirname(self.path)
+        path = presets_path.writable_path(
+            self.path, root=os.path.dirname(self.path) or '.')
+        parent = os.path.dirname(path)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        tmp = self.path + '.tmp'
+        tmp = path + '.tmp'
         with open(tmp, 'w') as f:
             json.dump(data, f, indent=2, sort_keys=True)
-        os.replace(tmp, self.path)
+        os.replace(tmp, path)
 
     def names(self):
         return sorted(self._load_all())
