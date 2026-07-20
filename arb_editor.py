@@ -661,9 +661,20 @@ class ArbWaveformEditor(tk.Toplevel):
             self._lib_refresh()
             self.lib_select.set(clean)
             self._dirty = False
-            self.app.status_bar.config(text=f"Arb saved to library: {clean}")
+            import presets_path
+            note = presets_path.fallback_note()
+            if note:
+                presets_path.clear_note()
+            self.app.status_bar.config(
+                text=f"Arb saved to library: {clean}"
+                     + (f" -- {note}" if note else ""))
         except Exception as e:
-            messagebox.showerror("Save error", str(e), parent=self)
+            # The window (or the whole app) may already be gone -- a failing
+            # error dialog must not become a second traceback (2026-07-20).
+            try:
+                messagebox.showerror("Save error", str(e), parent=self)
+            except tk.TclError:
+                self.app.status_bar.config(text=f"Arb save failed: {e}")
 
     def load_from_library(self):
         name = self.lib_select.get()
