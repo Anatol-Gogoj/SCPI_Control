@@ -1,4 +1,8 @@
-python-usbtmc==0.8
+# Instrument transport. pyusb is what pyvisa-py uses to reach the USB-TMC
+# boxes, so it is needed on the Linux bench even though no module here
+# imports it directly. (python-usbtmc was dropped 2026-07-20: nothing has
+# imported it since the move to pyvisa-py, and its legacy setup.py build
+# breaks pip installs on Windows.)
 pyusb==1.3.1
 PyVISA==1.16.1
 PyVISA-py==0.8.1
