@@ -103,6 +103,23 @@ def test_frame_bytes_matches_geometry():
     assert not cam.is_open
 
 
+
+def test_parse_level_list():
+    assert webcam.parse_level_list('0.2, 0.4, 0.6') == [0.2, 0.4, 0.6]
+    assert webcam.parse_level_list('0.2 0.4 0.6') == [0.2, 0.4, 0.6]
+    assert webcam.parse_level_list('1.9, 0.5\t2.3') == [1.9, 0.5, 2.3]
+    assert webcam.parse_level_list('-1, 0, 1') == [-1.0, 0.0, 1.0]
+    assert webcam.parse_level_list('') is None
+    assert webcam.parse_level_list('   ') is None
+    assert webcam.parse_level_list(None) is None
+    for bad in ('1, two, 3', 'abc'):
+        try:
+            webcam.parse_level_list(bad)
+            assert False, f"{bad!r} must raise"
+        except ValueError:
+            pass
+
+
 def _run():
     fns = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     for fn in fns:

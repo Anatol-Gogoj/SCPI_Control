@@ -41,8 +41,16 @@ RUN_APP="$CACHE/SCPI_Control"
 RUN_LIBS="$CACHE/pylibs"
 if [ "$share_stamp" != "$cache_stamp" ] || [ ! -f "$RUN_APP/gui.py" ]; then
   echo "Updating local cache $CACHE ($share_stamp)..."
-  # The desktop icon gives no feedback, and this copy takes ~25 s the first
-  # time after a deploy. Say so, or it just looks like nothing happened.
+  # This copy takes ~25 s after a deploy and happens BEFORE python starts,
+  # so the app's own splash cannot cover it. Show a small Tk "updating"
+  # window for the duration (system python3.11 + tkinter are always
+  # present; no GTK/a11y bus needed, unlike zenity). notify-send is a
+  # best-effort extra for headless/again-later cases.
+  SPLASH_PID=""
+  if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && [ -f "$HERE/update_splash.py" ]; then
+    "$PY" "$HERE/update_splash.py" >/dev/null 2>&1 &
+    SPLASH_PID=$!
+  fi
   notify-send -t 40000 "SCPI Control" \
     "New version found - updating this PC's local copy. The window will open in about half a minute." 2>/dev/null || true
   if ! mkdir -p "$CACHE" ||
@@ -51,6 +59,7 @@ if [ "$share_stamp" != "$cache_stamp" ] || [ ! -f "$RUN_APP/gui.py" ]; then
     echo "warning: cache sync failed -- running directly from the share." >&2
     RUN_APP="$APP"; RUN_LIBS="$LIBS"
   fi
+  [ -n "$SPLASH_PID" ] && kill "$SPLASH_PID" 2>/dev/null || true
 fi
 
 # cd into the SHARE app dir so gui.py's relative presets/ path resolves to
