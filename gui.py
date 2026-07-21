@@ -228,7 +228,9 @@ class InstrumentControlGUI:
         self.root.after(100, self.auto_connect)
 
     def _on_app_close(self):
-        """Release the webcam and stop capture loops before exiting."""
+        """Safety shutdown on window close (user request 2026-07-20: the
+        sig gen used to keep DRIVING after the app was closed). Best-effort
+        per output -- a dead instrument must never block exit."""
         try:
             self.cam_seq_running = False
             self.cam_stop_preview()
@@ -236,6 +238,17 @@ class InstrumentControlGUI:
                 self.cam.close()
         except Exception:
             pass
+        if self.sg:
+            for ch in (1, 2):
+                try:
+                    self.sg.set_output(ch, False)
+                except Exception:
+                    pass
+        if self.lcr:
+            try:
+                self.lcr.set_bias_enabled(False)
+            except Exception:
+                pass
         self.root.destroy()
 
     # ---- Background instrument I/O (issue #40) ---------------------------
@@ -3003,14 +3016,29 @@ ANALYSIS:
         self.cam_combo = ttk.Combobox(top, width=8, state='readonly',
                                       textvariable=self.cam_index_var)
         self.cam_combo.pack(side=tk.LEFT, padx=4)
-        ttk.Button(top, text="Refresh", command=self.cam_refresh_devices).pack(side=tk.LEFT)
+        add_tooltip(self.cam_combo,
+                    "Video device number (/dev/videoN). Industrial cameras "
+                    "often expose two nodes -- the lower one is the image.")
+        add_tooltip(ttk.Button(top, text="Refresh",
+                               command=self.cam_refresh_devices),
+                    "Rescan for cameras after plugging/unplugging."
+                    ).pack(side=tk.LEFT)
         self.cam_preview_btn = ttk.Button(top, text="Start Preview",
                                           command=self.cam_toggle_preview)
         self.cam_preview_btn.pack(side=tk.LEFT, padx=8)
-        ttk.Button(top, text="Snapshot", command=self.cam_snapshot).pack(side=tk.LEFT)
+        add_tooltip(self.cam_preview_btn,
+                    "Live view of the selected camera (~a few fps for the "
+                    "industrial camera).")
+        add_tooltip(ttk.Button(top, text="Snapshot",
+                               command=self.cam_snapshot),
+                    "Save the current preview frame as a timestamped PNG in "
+                    "the folder below.").pack(side=tk.LEFT)
         self.cam_focus_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(top, text="Show focus score",
-                        variable=self.cam_focus_var).pack(side=tk.LEFT, padx=8)
+        add_tooltip(ttk.Checkbutton(top, text="Show focus score",
+                                    variable=self.cam_focus_var),
+                    "Overlay a live sharpness number on the preview -- "
+                    "higher = better focus; peak it while turning the "
+                    "lens.").pack(side=tk.LEFT, padx=8)
 
         # --- sensor controls (industrial cameras) ---
         # The DFK 37BUX250's own auto-exposure never converges over UVC: at
@@ -3053,58 +3081,101 @@ ANALYSIS:
         ttk.Label(out, text="Save to:").pack(side=tk.LEFT)
         default_dir = os.path.join(os.path.expanduser('~'), 'captures')
         self.cam_dir_var = tk.StringVar(value=default_dir)
-        ttk.Entry(out, textvariable=self.cam_dir_var, width=44).pack(
-            side=tk.LEFT, padx=4)
+        add_tooltip(ttk.Entry(out, textvariable=self.cam_dir_var, width=44),
+                    "Folder every snapshot/interval/sweep image is saved "
+                    "into.").pack(side=tk.LEFT, padx=4)
         ttk.Button(out, text="Browse", command=self._cam_browse_dir).pack(side=tk.LEFT)
         ttk.Label(out, text="Prefix:").pack(side=tk.LEFT, padx=(10, 0))
         self.cam_prefix_var = tk.StringVar(value='cap')
-        ttk.Entry(out, textvariable=self.cam_prefix_var, width=12).pack(
-            side=tk.LEFT, padx=4)
+        add_tooltip(ttk.Entry(out, textvariable=self.cam_prefix_var,
+                              width=12),
+                    "Start of every saved filename, e.g. cap_0003_1.90V_"
+                    "20260720-1030.png").pack(side=tk.LEFT, padx=4)
 
         # --- interval capture ---
         iv = ttk.LabelFrame(tab, text="Interval capture", padding=8)
         iv.pack(fill='x', padx=8, pady=4)
         ttk.Label(iv, text="Every").pack(side=tk.LEFT)
         self.cam_interval_var = tk.StringVar(value='5')
-        ttk.Entry(iv, textvariable=self.cam_interval_var, width=7).pack(side=tk.LEFT, padx=4)
+        add_tooltip(ttk.Entry(iv, textvariable=self.cam_interval_var,
+                              width=7),
+                    "Seconds between automatic snapshots.").pack(
+            side=tk.LEFT, padx=4)
         ttk.Label(iv, text="s,  count (0 = until stopped):").pack(side=tk.LEFT)
         self.cam_count_var = tk.StringVar(value='0')
-        ttk.Entry(iv, textvariable=self.cam_count_var, width=7).pack(side=tk.LEFT, padx=4)
+        add_tooltip(ttk.Entry(iv, textvariable=self.cam_count_var, width=7),
+                    "Stop after this many shots; 0 keeps going until you "
+                    "press Stop.").pack(side=tk.LEFT, padx=4)
         self.cam_interval_btn = ttk.Button(iv, text="Start interval",
                                            command=self.cam_toggle_interval)
         self.cam_interval_btn.pack(side=tk.LEFT, padx=8)
 
         # --- stepped (voltage) capture via the signal generator ---
-        st = ttk.LabelFrame(tab, text="Stepped capture (sig-gen sweep)", padding=8)
+        st = ttk.LabelFrame(
+            tab, text="Stepped capture: set CH n to each voltage "
+                      "\u2192 wait \u2192 photo", padding=8)
         st.pack(fill='x', padx=8, pady=4)
         ttk.Label(st, text="SG CH").grid(row=0, column=0, sticky='w')
         self.cam_sg_ch = ttk.Combobox(st, width=4, state='readonly', values=['1', '2'])
         self.cam_sg_ch.set('1')
         self.cam_sg_ch.grid(row=0, column=1, padx=2)
+        add_tooltip(self.cam_sg_ch,
+                    "Signal-generator channel driving the device under the "
+                    "camera. Turn its Output ON first (Signal Gen tab).")
         ttk.Label(st, text="param").grid(row=0, column=2, sticky='w', padx=(8, 0))
         self.cam_sg_param = ttk.Combobox(st, width=12, state='readonly',
                                          values=['DC offset (V)', 'Amplitude (Vpp)'])
         self.cam_sg_param.set('DC offset (V)')
         self.cam_sg_param.grid(row=0, column=3, padx=2)
+        add_tooltip(self.cam_sg_param,
+                    "Which setting each level is written to. DC offset = a "
+                    "software staircase of steady voltages (most level-vs-"
+                    "image experiments); Amplitude = resize the running "
+                    "waveform instead.")
         ttk.Label(st, text="start").grid(row=1, column=0, sticky='w')
         self.cam_step_start = tk.StringVar(value='0')
-        ttk.Entry(st, textvariable=self.cam_step_start, width=7).grid(row=1, column=1)
+        add_tooltip(ttk.Entry(st, textvariable=self.cam_step_start, width=7),
+                    "First level in volts.").grid(row=1, column=1)
         ttk.Label(st, text="stop").grid(row=1, column=2, sticky='w', padx=(8, 0))
         self.cam_step_stop = tk.StringVar(value='5')
-        ttk.Entry(st, textvariable=self.cam_step_stop, width=7).grid(row=1, column=3)
+        add_tooltip(ttk.Entry(st, textvariable=self.cam_step_stop, width=7),
+                    "Last level in volts (included when it lands on a "
+                    "step).").grid(row=1, column=3)
         ttk.Label(st, text="step").grid(row=1, column=4, sticky='w', padx=(8, 0))
         self.cam_step_step = tk.StringVar(value='1')
-        ttk.Entry(st, textvariable=self.cam_step_step, width=7).grid(row=1, column=5)
+        add_tooltip(ttk.Entry(st, textvariable=self.cam_step_step, width=7),
+                    "Increment between levels, e.g. 0.2 -> 0.2, 0.4, 0.6 V. "
+                    "Negative steps sweep downward.").grid(row=1, column=5)
         ttk.Label(st, text="dwell s").grid(row=1, column=6, sticky='w', padx=(8, 0))
         self.cam_step_dwell = tk.StringVar(value='1.0')
-        ttk.Entry(st, textvariable=self.cam_step_dwell, width=7).grid(row=1, column=7)
+        add_tooltip(ttk.Entry(st, textvariable=self.cam_step_dwell, width=7),
+                    "Settle time in seconds between setting a level and "
+                    "taking the photo (0.25 = quarter second).").grid(
+            row=1, column=7)
+        ttk.Label(st, text="levels").grid(row=2, column=0, sticky='w')
+        self.cam_step_levels = tk.StringVar(value='')
+        add_tooltip(ttk.Entry(st, textvariable=self.cam_step_levels, width=30),
+                    "Optional explicit voltage list, e.g. 0.2, 0.4, 0.9, 1.9 "
+                    "-- overrides start/stop/step when filled. Use it for "
+                    "uneven spacing or a handful of specific levels.").grid(
+            row=2, column=1, columnspan=5, sticky='w', padx=2, pady=(4, 0))
+        ttk.Label(st, text="(overrides start/stop/step)",
+                  foreground='gray').grid(row=2, column=6, columnspan=2,
+                                          sticky='w', pady=(4, 0))
         self.cam_seq_focus = tk.BooleanVar(value=True)
-        ttk.Checkbutton(st, text="log focus CSV", variable=self.cam_seq_focus).grid(
+        add_tooltip(ttk.Checkbutton(st, text="log focus CSV",
+                                    variable=self.cam_seq_focus),
+                    "Also write <prefix>_focus.csv: one row per level with "
+                    "the image file and its sharpness score.").grid(
             row=0, column=4, columnspan=2, sticky='w', padx=(8, 0))
         self.cam_seq_btn = ttk.Button(st, text="Run sweep", command=self.cam_toggle_sequence)
         self.cam_seq_btn.grid(row=0, column=6, columnspan=2, padx=8)
+        add_tooltip(self.cam_seq_btn,
+                    "For each level: write it to the chosen channel, wait "
+                    "the dwell, save a photo (filename carries the level). "
+                    "Click again to stop.")
         self.cam_seq_status = ttk.Label(st, text="", foreground='gray')
-        self.cam_seq_status.grid(row=2, column=0, columnspan=8, sticky='w', pady=(4, 0))
+        self.cam_seq_status.grid(row=3, column=0, columnspan=8, sticky='w', pady=(4, 0))
 
         self.cam_refresh_devices()
 
@@ -3207,9 +3278,20 @@ ANALYSIS:
                 "OpenCV and exposes its own automatic exposure.")
             return
         was_previewing = self.cam_previewing
-        if was_previewing:
-            self.cam_stop_preview()      # the search needs the device free
-        self.cam_sensor_status.config(text="searching for an exposure...")
+        # The search must OWN the device. Stopping the preview tick is not
+        # enough: the streaming backend keeps /dev/videoN busy, every probe
+        # grab then fails with EBUSY, and the search reported "found
+        # nothing" while the preview made it look like it was still looking
+        # (user report 2026-07-20).
+        self.cam_stop_preview()
+        if self.cam is not None:
+            try:
+                self.cam.close()
+            except Exception:
+                pass
+            self.cam = None
+        self.cam_sensor_status.config(text="auto exposure is checking...",
+                                      foreground='#b36b00')
 
         def work():
             size = webcam.choose_size(webcam.parse_frame_sizes(
@@ -3218,20 +3300,27 @@ ANALYSIS:
             return webcam.auto_exposure(device, fourcc, w, h)
 
         def done(result, error):
-            if error:
-                self.cam_sensor_status.config(text="auto-expose failed")
-                messagebox.showerror("Auto-expose", str(error))
-                return
-            exp, mean = result
-            if exp is None:
-                self.cam_sensor_status.config(text="auto-expose found nothing")
-            else:
-                self._set_entry(self.cam_exposure, exp)
-                self.cam_sync_controls()
-                self.cam_sensor_status.config(
-                    text=f"exposure {exp} (mean level {mean:.0f})")
-            if was_previewing:
-                self.cam_start_preview()
+            try:
+                if error:
+                    self.cam_sensor_status.config(text="auto-expose failed",
+                                                  foreground='red')
+                    messagebox.showerror("Auto-expose", str(error))
+                    return
+                exp, mean = result
+                if exp is None:
+                    self.cam_sensor_status.config(
+                        text="auto-expose could not settle -- check lens cap"
+                             " / lighting, or set exposure by hand",
+                        foreground='red')
+                else:
+                    self._set_entry(self.cam_exposure, exp)
+                    self.cam_sync_controls()
+                    self.cam_sensor_status.config(
+                        text=f"exposure {exp} (mean level {mean:.0f})",
+                        foreground='gray')
+            finally:
+                if was_previewing:
+                    self.cam_start_preview()
 
         self._run_bg(work, done, busy='camera-ctrl')
 
@@ -3384,9 +3473,11 @@ ANALYSIS:
             messagebox.showerror("Stepped capture", "Signal generator not connected")
             return
         try:
-            values = webcam.frange(self.cam_step_start.get(),
-                                   self.cam_step_stop.get(),
-                                   self.cam_step_step.get())
+            values = webcam.parse_level_list(self.cam_step_levels.get())
+            if values is None:
+                values = webcam.frange(self.cam_step_start.get(),
+                                       self.cam_step_stop.get(),
+                                       self.cam_step_step.get())
             dwell = float(self.cam_step_dwell.get())
             if dwell < 0:
                 raise ValueError("dwell must be >= 0")

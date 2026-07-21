@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""Tiny 'updating...' window shown by launch_gui.sh during the cache sync.
+
+The ~25 s local-cache re-sync happens in bash BEFORE the app's own Python
+splash can appear, so a user double-clicking the icon after a deploy saw
+nothing for half a minute. The launcher runs this in the background for
+the duration of the sync, then kills it. Uses only tkinter from the
+system python3.11 (always present on the bench; no GTK / a11y bus needed,
+unlike zenity).
+"""
+import tkinter as tk
+
+W, H = 460, 150
+root = tk.Tk()
+root.overrideredirect(True)
+root.configure(bg='#1f3a5f')
+x = (root.winfo_screenwidth() - W) // 2
+y = (root.winfo_screenheight() - H) // 3
+root.geometry(f'{W}x{H}+{x}+{y}')
+
+frame = tk.Frame(root, bg='#1f3a5f', padx=24, pady=18)
+frame.pack(fill='both', expand=True)
+tk.Label(frame, text='SCPI Control', bg='#1f3a5f', fg='white',
+         font=('TkDefaultFont', 17, 'bold')).pack(anchor='w')
+tk.Label(frame, text='Updating this PC to the latest version...',
+         bg='#1f3a5f', fg='#e6edf5',
+         font=('TkDefaultFont', 11)).pack(anchor='w', pady=(12, 2))
+tk.Label(frame, text='The app will open in about half a minute.',
+         bg='#1f3a5f', fg='#b8c7dc',
+         font=('TkDefaultFont', 9)).pack(anchor='w')
+
+bar = tk.Frame(frame, bg='#0d1b2e', height=10)
+bar.pack(fill='x', pady=(14, 0))
+chip = tk.Frame(bar, bg='#4a90d9', width=90, height=10)
+chip.place(x=0, y=0)
+
+
+def bounce(pos=0, direction=6):
+    width = bar.winfo_width() or (W - 48)
+    pos += direction
+    if pos <= 0 or pos + 90 >= width:
+        direction = -direction
+        pos = max(0, min(pos, width - 90))
+    chip.place(x=pos, y=0)
+    root.after(30, bounce, pos, direction)
+
+
+root.after(30, bounce)
+root.mainloop()

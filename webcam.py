@@ -110,6 +110,24 @@ def frange(start, stop, step):
     return [start + i * step for i in range(n + 1)]
 
 
+def parse_level_list(text):
+    """'0.2, 0.4 0.6' -> [0.2, 0.4, 0.6]; empty/None -> None; junk raises.
+
+    Commas and/or whitespace separate values (so a spreadsheet row pastes
+    straight in). None means "no explicit list" -- callers fall back to
+    start/stop/step.
+    """
+    if not text or not text.strip():
+        return None
+    parts = [p for chunk in text.split(',') for p in chunk.split()]
+    try:
+        values = [float(p) for p in parts]
+    except ValueError:
+        raise ValueError(
+            f"Levels must be numbers separated by commas/spaces, got: {text!r}")
+    return values or None
+
+
 def capture_filename(prefix, index, value=None, ext='png', ts=None):
     """Build a capture filename: '<prefix>_<NNNN>[_<ts>][_<value>V].<ext>'.
 
