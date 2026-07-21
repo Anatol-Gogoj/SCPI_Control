@@ -128,11 +128,13 @@ def parse_level_list(text):
     return values or None
 
 
-def capture_filename(prefix, index, value=None, ext='png', ts=None):
-    """Build a capture filename: '<prefix>_<NNNN>[_<ts>][_<value>V].<ext>'.
+def capture_filename(prefix, index, value=None, ext='png', ts=None,
+                     unit='V'):
+    """Build a capture filename: '<prefix>_<NNNN>[_<ts>][_<value><unit>].<ext>'.
 
-    value (e.g. a step voltage) is rendered filename-safe (sign as 'm', decimal
-    point as 'p'): -2.5 -> 'm2p5V'. ts is an optional datetime.
+    value is rendered filename-safe (sign as 'm', decimal point as 'p') with
+    `unit` appended: (-2.5, 'V') -> 'm2p5V', (30, 's') -> '30s'. ts is an
+    optional datetime.
     """
     safe_prefix = ''.join(c if (c.isalnum() or c in '-_') else '_'
                           for c in str(prefix)) or 'cap'
@@ -140,9 +142,31 @@ def capture_filename(prefix, index, value=None, ext='png', ts=None):
     if ts is not None:
         parts.append(ts.strftime('%Y%m%d-%H%M%S'))
     if value is not None:
-        v = f"{float(value):g}V".replace('-', 'm').replace('.', 'p')
+        v = f"{float(value):g}{unit}".replace('-', 'm').replace('.', 'p')
         parts.append(v)
     return "_".join(parts) + "." + str(ext).lstrip('.')
+
+
+def timed_delays(explicit=None, start=None, interval=None, count=None):
+    """Resolve a capture schedule to a sorted, unique list of delays (s).
+
+    An explicit list (parsed by parse_level_list) wins; otherwise build a
+    regular schedule start, start+interval, ... (count points). Negative
+    delays are rejected -- a delay is time after the t=0 trigger.
+    """
+    values = parse_level_list(explicit) if explicit else None
+    if values is None:
+        start = float(start if start not in (None, '') else 0)
+        interval = float(interval if interval not in (None, '') else 0)
+        count = int(float(count if count not in (None, '') else 0))
+        if count < 1:
+            raise ValueError("count must be >= 1")
+        if count > 1 and interval <= 0:
+            raise ValueError("interval must be > 0 for more than one shot")
+        values = [start + i * interval for i in range(count)]
+    if any(v < 0 for v in values):
+        raise ValueError("delays must be >= 0 (time after the trigger)")
+    return sorted(set(values))
 
 
 # -- V4L2 / Bayer support --------------------------------------------------
@@ -312,6 +336,62 @@ def auto_exposure(device, fourcc, width, height, target=128,
     if best[0] is not None:
         set_control(device, 'exposure_time_absolute', best[0])
     return best[0], best[1]
+
+
+# -- one-shot capture (timed / stepped) ------------------------------------
+# A continuously running stream consumed LAZILY (the timed/stepped workers
+# sleep seconds between shots) goes stale -- v4l2-ctl blocks on the full
+# pipe, so a read returns an old frame, and reads are gated to the stream's
+# frame period. A fresh, frame-aligned one-shot grab is ~90 ms on the bench
+# camera (measured 2026-07-20) and always current, which is what phase-
+# accurate capture needs. The device must be free (no preview stream open).
+
+def resolve_camera(index):
+    """Describe how to one-shot grab camera `index`, probed once.
+
+    -> {'kind': 'bayer', 'device', 'fourcc', 'w', 'h'} for a Bayer-only
+    device, else {'kind': 'cv2', 'index'} for an ordinary webcam.
+    """
+    device = f'/dev/video{index}'
+    if v4l2_available() and os.path.exists(device):
+        fourcc = bayer_format(device)
+        if fourcc:
+            w, h = choose_size(parse_frame_sizes(
+                _v4l2('--list-formats-ext', device=device), fourcc)) \
+                or (640, 480)
+            return {'kind': 'bayer', 'device': device, 'fourcc': fourcc,
+                    'w': w, 'h': h}
+    return {'kind': 'cv2', 'index': int(index)}
+
+
+def oneshot_rgb(spec, count=2):
+    """One fresh RGB frame from a resolve_camera() spec, or None.
+
+    Opens and closes the capture each call, so nothing has to stay warm and
+    no frame can be stale. `count` frames are streamed and the last kept
+    (the first settles after any control change).
+    """
+    import cv2
+    import numpy as np
+    if spec.get('kind') == 'bayer':
+        data = grab_raw(spec['device'], spec['fourcc'], spec['w'], spec['h'],
+                        count=count)
+        if not data:
+            return None
+        raw = np.frombuffer(data, dtype=np.uint8).reshape(spec['h'], spec['w'])
+        code = getattr(cv2, BAYER_CV_CODE.get(spec['fourcc'],
+                                              'COLOR_BayerBG2BGR'))
+        return cv2.cvtColor(cv2.cvtColor(raw, code), cv2.COLOR_BGR2RGB)
+    cap = cv2.VideoCapture(spec['index'])
+    try:
+        if not cap.isOpened():
+            return None
+        for _ in range(max(1, count)):
+            cap.grab()          # flush any buffered frames -> fresh
+        ok, frame = cap.read()
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if ok else None
+    finally:
+        cap.release()
 
 
 class V4L2BayerCamera:

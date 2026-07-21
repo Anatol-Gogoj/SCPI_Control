@@ -120,6 +120,31 @@ def test_parse_level_list():
             pass
 
 
+
+def test_timed_delays_explicit_wins():
+    # explicit list overrides the regular schedule, sorted + de-duped
+    assert webcam.timed_delays(explicit='300, 150, 600, 150',
+                               start=0, interval=60, count=99) == [150.0, 300.0, 600.0]
+    assert webcam.timed_delays(explicit='0, 30, 90') == [0.0, 30.0, 90.0]
+
+
+def test_timed_delays_regular_schedule():
+    assert webcam.timed_delays(start=0, interval=60, count=4) == [0.0, 60.0, 120.0, 180.0]
+    assert webcam.timed_delays(explicit='', start=150, interval=150, count=3) == [150.0, 300.0, 450.0]
+    # a single shot needs no interval
+    assert webcam.timed_delays(start=90, interval=0, count=1) == [90.0]
+
+
+def test_timed_delays_rejects_bad_input():
+    for kw in (dict(start=0, interval=0, count=0),      # zero shots
+               dict(start=0, interval=0, count=5),      # >1 shot needs interval
+               dict(explicit='-5, 10')):                 # negative delay
+        try:
+            webcam.timed_delays(**kw)
+            assert False, f"{kw} must raise"
+        except ValueError:
+            pass
+
 def _run():
     fns = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     for fn in fns:

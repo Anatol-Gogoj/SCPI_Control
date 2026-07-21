@@ -3177,6 +3177,75 @@ ANALYSIS:
         self.cam_seq_status = ttk.Label(st, text="", foreground='gray')
         self.cam_seq_status.grid(row=3, column=0, columnspan=8, sticky='w', pady=(4, 0))
 
+        # --- waveform-synced timed capture (Approach A) ---
+        # Photograph at chosen DELAYS after a t=0 trigger, while the real
+        # waveform runs -- for a slow ramp/hold arb where you want the DUT
+        # imaged at specific points of the cycle. The delay IS the phase
+        # knob (no waveform math, so nothing to bog down the GUI).
+        tm = ttk.LabelFrame(
+            tab, text="Waveform-synced capture: start \u2192 photo at each "
+                      "delay (for slow ramp/hold runs)", padding=8)
+        tm.pack(fill='x', padx=8, pady=4)
+        ttk.Label(tm, text="t=0").grid(row=0, column=0, sticky='w')
+        self.cam_tm_trigger = ttk.Combobox(
+            tm, width=22, state='readonly',
+            values=['on Start click', 'CH1 burst trigger',
+                    'CH2 burst trigger'])
+        self.cam_tm_trigger.set('on Start click')
+        self.cam_tm_trigger.grid(row=0, column=1, columnspan=3, sticky='w',
+                                 padx=2)
+        add_tooltip(self.cam_tm_trigger,
+                    "How the clock starts. 'on Start click' = the timer "
+                    "begins when you press Start -- start your waveform at "
+                    "the same moment. 'CHn burst trigger' = the GUI fires "
+                    "that channel's manual burst to define t=0 precisely "
+                    "(arm the channel in Burst / MAN first).")
+        ttk.Label(tm, text="delays (s)").grid(row=1, column=0, sticky='w')
+        self.cam_tm_delays = tk.StringVar(value='')
+        add_tooltip(ttk.Entry(tm, textvariable=self.cam_tm_delays, width=34),
+                    "Explicit list of seconds after t=0 to shoot, e.g. "
+                    "150, 300, 450, 600. Overrides the regular schedule "
+                    "below. Great for a ramp/hold run: one delay per hold."
+                    ).grid(row=1, column=1, columnspan=5, sticky='w', padx=2)
+        ttk.Label(tm, text="or every").grid(row=2, column=0, sticky='w')
+        self.cam_tm_interval = tk.StringVar(value='60')
+        add_tooltip(ttk.Entry(tm, textvariable=self.cam_tm_interval, width=7),
+                    "Seconds between shots for the regular schedule.").grid(
+            row=2, column=1, sticky='w')
+        ttk.Label(tm, text="s,").grid(row=2, column=2, sticky='w')
+        self.cam_tm_count = tk.StringVar(value='10')
+        add_tooltip(ttk.Entry(tm, textvariable=self.cam_tm_count, width=6),
+                    "How many shots in the regular schedule.").grid(
+            row=2, column=3, sticky='w')
+        ttk.Label(tm, text="shots, first at").grid(row=2, column=4, sticky='w')
+        self.cam_tm_start = tk.StringVar(value='0')
+        add_tooltip(ttk.Entry(tm, textvariable=self.cam_tm_start, width=6),
+                    "Delay of the first shot (s).").grid(row=2, column=5,
+                                                         sticky='w')
+        ttk.Label(tm, text="s").grid(row=2, column=6, sticky='w')
+        self.cam_tm_focus = tk.BooleanVar(value=True)
+        add_tooltip(ttk.Checkbutton(tm, text="log focus CSV",
+                                    variable=self.cam_tm_focus),
+                    "Also write <prefix>_timed_focus.csv: one row per shot "
+                    "with the delay, file and sharpness score.").grid(
+            row=0, column=4, columnspan=2, sticky='w', padx=(8, 0))
+        self.cam_tm_btn = ttk.Button(tm, text="Start timed capture",
+                                     command=self.cam_toggle_timed)
+        self.cam_tm_btn.grid(row=0, column=6, columnspan=2, padx=8)
+        add_tooltip(self.cam_tm_btn,
+                    "Begin: (optionally fire the burst trigger,) then save a "
+                    "photo at each delay. Filenames carry the delay, e.g. "
+                    "cap_0002_..._300s.png. Click again to stop.")
+        tk.Label(tm, fg='gray', justify=tk.LEFT, wraplength=560,
+                 text="The ~5 ms exposure is tiny next to a slow waveform, so "
+                      "each shot effectively freezes the instant at its "
+                      "delay. Alignment is as good as the trigger (a few tens "
+                      "of ms) -- fine for multi-second holds.").grid(
+            row=3, column=0, columnspan=8, sticky='w', pady=(4, 0))
+        self.cam_tm_status = ttk.Label(tm, text="", foreground='gray')
+        self.cam_tm_status.grid(row=4, column=0, columnspan=8, sticky='w',
+                                pady=(2, 0))
+
         self.cam_refresh_devices()
 
     def _cam_browse_dir(self):
@@ -3387,13 +3456,22 @@ ANALYSIS:
                              fg='lime', width=0, height=0)
         self.cam_photo = photo            # keep a ref
 
-    def _cam_save_frame(self, frame, value=None):
-        """Save a frame to the output folder; returns the path or None."""
+    def _cam_save_frame(self, frame, value=None, unit='V',
+                        folder=None, prefix=None):
+        """Save a frame to the output folder; returns the path or None.
+
+        folder/prefix may be passed in (captured on the main thread) so a
+        worker thread never reads a Tk StringVar -- that raises "main thread
+        is not in main loop". Main-thread callers can omit them.
+        """
         import cv2
-        folder = self.cam_dir_var.get().strip() or '.'
-        fname = webcam.capture_filename(self.cam_prefix_var.get().strip() or 'cap',
+        if folder is None:
+            folder = self.cam_dir_var.get().strip() or '.'
+        if prefix is None:
+            prefix = self.cam_prefix_var.get().strip() or 'cap'
+        fname = webcam.capture_filename(prefix,
                                         self.cam_capture_index, value=value,
-                                        ts=datetime.now())
+                                        unit=unit, ts=datetime.now())
         path = os.path.join(folder, fname)
         os.makedirs(folder, exist_ok=True)
         bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
@@ -3434,6 +3512,131 @@ ANALYSIS:
         self.cam_interval_btn.config(text="Stop interval")
         self.status_bar.config(text="Interval capture running")
         self._cam_interval_tick(int(interval * 1000))
+
+    # ---- waveform-synced timed capture (Approach A) ---------------------
+    def cam_toggle_timed(self):
+        if self.cam_seq_running:
+            self.cam_seq_running = False
+            self.cam_tm_status.config(text="Stopping\u2026", foreground='orange')
+        else:
+            self._cam_start_timed()
+
+    def _cam_start_timed(self):
+        if self.cam_seq_running:
+            messagebox.showinfo("Timed capture",
+                                "A capture is already running -- stop it first.")
+            return
+        try:
+            delays = webcam.timed_delays(
+                explicit=self.cam_tm_delays.get(),
+                start=self.cam_tm_start.get(),
+                interval=self.cam_tm_interval.get(),
+                count=self.cam_tm_count.get())
+        except ValueError as e:
+            messagebox.showerror("Timed capture", str(e))
+            return
+        if not delays:
+            messagebox.showerror("Timed capture", "No capture times given.")
+            return
+
+        trig = self.cam_tm_trigger.get()
+        trigger_ch = None
+        if trig.startswith('CH'):
+            trigger_ch = int(trig[2])
+            if not self.sg:
+                messagebox.showerror(
+                    "Timed capture",
+                    "Signal generator not connected, so the burst trigger "
+                    "can't fire. Pick 'on Start click' instead.")
+                return
+        idx = self.cam_index_var.get().strip()
+        if not idx.isdigit():
+            messagebox.showerror("Timed capture", "Select a camera first.")
+            return
+        # One-shot capture needs the device FREE (no preview stream open),
+        # and gives a fresh, frame-aligned frame at each delay instead of a
+        # stale one from a lazily-drained stream.
+        self.cam_stop_preview()
+        if self.cam is not None:
+            try:
+                self.cam.close()
+            except Exception:
+                pass
+            self.cam = None
+        spec = webcam.resolve_camera(int(idx))
+
+        csv_path = None
+        if self.cam_tm_focus.get():
+            csv_path = os.path.join(
+                self.cam_dir_var.get().strip() or '.',
+                f"{self.cam_prefix_var.get().strip() or 'cap'}_timed_focus.csv")
+
+        self.cam_seq_running = True
+        self._cam_active_btn = self.cam_tm_btn
+        self._cam_active_idle = "Start timed capture"
+        self._cam_active_status = self.cam_tm_status
+        self.cam_tm_btn.config(text="Stop")
+        total = delays[-1]
+        self.cam_tm_status.config(
+            text=f"Running: {len(delays)} shots over {total:g} s\u2026",
+            foreground='black')
+        while not self.cam_seq_queue.empty():
+            try:
+                self.cam_seq_queue.get_nowait()
+            except queue.Empty:
+                break
+        save_dir = self.cam_dir_var.get().strip() or '.'
+        save_prefix = self.cam_prefix_var.get().strip() or 'cap'
+        self.cam_seq_thread = threading.Thread(
+            target=self._cam_timed_worker,
+            args=(trigger_ch, delays, csv_path, save_dir, save_prefix, spec),
+            daemon=True)
+        self.cam_seq_thread.start()
+        self.root.after(50, self._drain_cam_queue)
+
+    def _cam_timed_worker(self, trigger_ch, delays, csv_path,
+                          save_dir, save_prefix, spec):
+        """Fire the camera at each delay after a t=0 trigger. No waveform
+        math -- the delay list is the phase schedule (Approach A)."""
+        rows = []
+        try:
+            if trigger_ch is not None:
+                self.sg.burst_trigger(trigger_ch)
+            t0 = time.monotonic()
+            for n, d in enumerate(delays):
+                target = t0 + d
+                # sleep in small slices so Stop stays responsive over a long
+                # run (delays can be many minutes apart)
+                while self.cam_seq_running and time.monotonic() < target:
+                    time.sleep(min(0.05, max(0, target - time.monotonic())))
+                if not self.cam_seq_running:
+                    break
+                frame = webcam.oneshot_rgb(spec)
+                path, score = None, None
+                if frame is not None:
+                    path = self._cam_save_frame(
+                        frame, value=d, unit='s',
+                        folder=save_dir, prefix=save_prefix)
+                    if csv_path is not None:
+                        try:
+                            score = webcam.focus_score(frame)
+                        except Exception:
+                            score = None
+                        rows.append((d, os.path.basename(path or ''), score))
+                self.cam_seq_queue.put(
+                    ('step', n + 1, len(delays), f"t={d:g} s", path, score))
+        except Exception as e:
+            self.cam_seq_queue.put(('error', str(e)))
+            return
+        if csv_path and rows:
+            try:
+                with open(csv_path, 'w', newline='') as f:
+                    w = csv.writer(f)
+                    w.writerow(['delay_s', 'file', 'focus_score'])
+                    w.writerows(rows)
+            except Exception:
+                pass
+        self.cam_seq_queue.put(('done', len(delays), csv_path))
 
     def _cam_stop_interval(self):
         if self.cam_interval_job is not None:
@@ -3484,13 +3687,20 @@ ANALYSIS:
         except ValueError as e:
             messagebox.showerror("Stepped capture", str(e))
             return
-        try:
-            self._cam_open_selected()
-        except Exception as e:
-            messagebox.showerror("Webcam", f"Could not open camera:\n{e}")
+        idx = self.cam_index_var.get().strip()
+        if not idx.isdigit():
+            messagebox.showerror("Stepped capture", "Select a camera first.")
             return
-        # The worker owns the camera; pause live preview to avoid double reads.
+        # Free the device for one-shot grabs (fresh frame per step, not a
+        # stale one from a lazily-drained preview stream).
         self.cam_stop_preview()
+        if self.cam is not None:
+            try:
+                self.cam.close()
+            except Exception:
+                pass
+            self.cam = None
+        spec = webcam.resolve_camera(int(idx))
         ch = int(self.cam_sg_ch.get())
         key = 'OFST' if self.cam_sg_param.get().startswith('DC') else 'AMP'
         csv_path = None
@@ -3499,6 +3709,9 @@ ANALYSIS:
                                     f"{self.cam_prefix_var.get().strip() or 'cap'}"
                                     f"_focus.csv")
         self.cam_seq_running = True
+        self._cam_active_btn = self.cam_seq_btn
+        self._cam_active_idle = "Run sweep"
+        self._cam_active_status = self.cam_seq_status
         self.cam_seq_btn.config(text="Stop sweep")
         self.cam_seq_status.config(text=f"Sweeping {len(values)} steps…",
                                    foreground='black')
@@ -3507,13 +3720,18 @@ ANALYSIS:
                 self.cam_seq_queue.get_nowait()
             except queue.Empty:
                 break
+        save_dir = self.cam_dir_var.get().strip() or '.'
+        save_prefix = self.cam_prefix_var.get().strip() or 'cap'
         self.cam_seq_thread = threading.Thread(
             target=self._cam_seq_worker,
-            args=(ch, key, values, dwell, csv_path), daemon=True)
+            args=(ch, key, values, dwell, csv_path, save_dir, save_prefix,
+                  spec),
+            daemon=True)
         self.cam_seq_thread.start()
         self.root.after(50, self._drain_cam_queue)
 
-    def _cam_seq_worker(self, ch, key, values, dwell, csv_path):
+    def _cam_seq_worker(self, ch, key, values, dwell, csv_path,
+                        save_dir, save_prefix, spec):
         """Background: set the sig-gen param, dwell, capture, optional focus."""
         rows = []
         try:
@@ -3527,17 +3745,19 @@ ANALYSIS:
                     time.sleep(min(0.05, max(0, end - time.monotonic())))
                 if not self.cam_seq_running:
                     break
-                frame = self.cam.read_rgb()
+                frame = webcam.oneshot_rgb(spec)
                 path, score = None, None
                 if frame is not None:
-                    path = self._cam_save_frame(frame, value=v)
+                    path = self._cam_save_frame(
+                        frame, value=v, folder=save_dir, prefix=save_prefix)
                     if csv_path is not None:
                         try:
                             score = webcam.focus_score(frame)
                         except Exception:
                             score = None
                         rows.append((v, os.path.basename(path or ''), score))
-                self.cam_seq_queue.put(('step', n + 1, len(values), v, path, score))
+                self.cam_seq_queue.put(
+                    ('step', n + 1, len(values), f"{v:g} V", path, score))
         except Exception as e:
             self.cam_seq_queue.put(('error', str(e)))
             return
@@ -3552,42 +3772,46 @@ ANALYSIS:
         self.cam_seq_queue.put(('done', len(values), csv_path))
 
     def _drain_cam_queue(self):
+        # Shared by the voltage sweep and the timed capture; the active
+        # button + its idle label + the status widget are set at start.
+        btn = getattr(self, '_cam_active_btn', self.cam_seq_btn)
+        idle = getattr(self, '_cam_active_idle', "Run sweep")
+        status = getattr(self, '_cam_active_status', self.cam_seq_status)
         final = False
         try:
             while True:
                 evt = self.cam_seq_queue.get_nowait()
                 kind = evt[0]
                 if kind == 'step':
-                    _, i, total, v, path, score = evt
+                    _, i, total, label, path, score = evt
                     extra = f", focus {score:.0f}" if score is not None else ""
-                    self.cam_seq_status.config(
-                        text=f"step {i}/{total}: {v:g} -> "
+                    status.config(
+                        text=f"{i}/{total}: {label} -> "
                              f"{os.path.basename(path) if path else 'no frame'}{extra}",
                         foreground='black')
                 elif kind == 'done':
                     _, total, csv_path = evt
                     self.cam_seq_running = False
-                    self.cam_seq_btn.config(text="Run sweep")
-                    msg = f"Sweep complete: {total} steps"
+                    btn.config(text=idle)
+                    msg = f"Capture complete: {total} shots"
                     if csv_path:
                         msg += f"; focus -> {os.path.basename(csv_path)}"
-                    self.cam_seq_status.config(text=msg, foreground='green')
+                    status.config(text=msg, foreground='green')
                     self.status_bar.config(text=msg)
                     final = True
                 elif kind == 'error':
                     self.cam_seq_running = False
-                    self.cam_seq_btn.config(text="Run sweep")
-                    self.cam_seq_status.config(text=f"Sweep failed: {evt[1]}",
-                                               foreground='red')
+                    btn.config(text=idle)
+                    status.config(text=f"Capture failed: {evt[1]}",
+                                  foreground='red')
                     final = True
         except queue.Empty:
             pass
         if not final and self.cam_seq_running:
             self.root.after(50, self._drain_cam_queue)
         elif not final:
-            # stopped by user
-            self.cam_seq_btn.config(text="Run sweep")
-            self.cam_seq_status.config(text="Sweep stopped", foreground='orange')
+            btn.config(text=idle)
+            status.config(text="Capture stopped", foreground='orange')
 
 
 
