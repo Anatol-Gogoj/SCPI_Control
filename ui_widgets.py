@@ -95,9 +95,11 @@ class SplashScreen(tk.Toplevel):
 
         frame = tk.Frame(self, bg='#1f3a5f', padx=24, pady=18)
         frame.pack(fill='both', expand=True)
-        tk.Label(frame, text='SCPI Control', bg='#1f3a5f', fg='white',
+        # Name transition (2026-07-20): "SCPI Control" -> "Digital
+        # Multitool", starting here on the splash. Same look, new name.
+        tk.Label(frame, text='Digital Multitool', bg='#1f3a5f', fg='white',
                  font=('TkDefaultFont', 17, 'bold')).pack(anchor='w')
-        tk.Label(frame, text='Lab instrument multitool', bg='#1f3a5f',
+        tk.Label(frame, text='Lab instrument control suite', bg='#1f3a5f',
                  fg='#b8c7dc', font=('TkDefaultFont', 10)).pack(anchor='w')
 
         self._status = tk.Label(frame, text='Starting...', bg='#1f3a5f',
