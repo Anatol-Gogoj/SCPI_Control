@@ -69,23 +69,64 @@ def list_cameras(max_index=8):
 
 # -- focus / sharpness metric ----------------------------------------------
 
-def focus_score(image):
-    """Variance-of-Laplacian sharpness score (higher = sharper/in-focus).
+# Central "area of interest" for the focus metric: a Gaussian centred on
+# the frame, sigma as a fraction of the smaller dimension. Small == strong
+# == only the very middle counts. The preview draws a green circle at
+# ~2 sigma (FOCUS_AOI_RADIUS_FRAC of the smaller dimension) to show it.
+FOCUS_AOI_SIGMA_FRAC = 0.11
+FOCUS_AOI_RADIUS_FRAC = 2.0 * FOCUS_AOI_SIGMA_FRAC
 
-    Accepts a 2-D grayscale or 3-D RGB/BGR array (or nested lists). Uses a
-    4-neighbour discrete Laplacian over the interior; the variance of the
-    result is a standard, cheap autofocus metric. Needs numpy.
+_focus_weight_cache = {}
+
+
+def _focus_weight(h, w, sigma_frac):
+    import numpy as np
+    key = (h, w, round(sigma_frac, 4))
+    W = _focus_weight_cache.get(key)
+    if W is None:
+        sigma = max(1.0, sigma_frac * min(h, w))
+        yy, xx = np.ogrid[:h, :w]
+        d2 = (yy - (h - 1) / 2.0) ** 2 + (xx - (w - 1) / 2.0) ** 2
+        W = np.exp(-d2 / (2.0 * sigma * sigma))
+        _focus_weight_cache[key] = W
+    return W
+
+
+def focus_score(image, sigma_frac=FOCUS_AOI_SIGMA_FRAC):
+    """Center-weighted, noise-robust sharpness score (higher = sharper).
+
+    Two departures from a plain variance-of-Laplacian, both fixing real
+    problems seen on the bench camera (2026-07-20):
+
+    * **Block-downsample first.** Sensor noise (bad at high gain) is
+      per-pixel and UNcorrelated, so a raw Laplacian variance rewards a
+      noisy defocused frame over a clean focused one -- the score ran
+      backwards. Averaging ~6x6 blocks cancels the uncorrelated noise but
+      keeps real, spatially-correlated edges, so higher now really means
+      sharper.
+    * **Weight by a strong central Gaussian** so the score reflects the
+      middle "area of interest" (the subject) rather than the periphery.
+
+    Accepts a 2-D grayscale or 3-D RGB/BGR array (or nested lists). numpy.
     """
     import numpy as np
     a = np.asarray(image, dtype=np.float64)
     if a.ndim == 3:
         a = a.mean(axis=2)
-    if a.ndim != 2 or a.shape[0] < 3 or a.shape[1] < 3:
-        raise ValueError("image must be at least 3x3 grayscale/colour")
+    if a.ndim != 2 or min(a.shape) < 5:
+        raise ValueError("image must be at least 5x5 grayscale/colour")
+    h, w = a.shape
+    # block-average downsample (the denoise); keep a >=8 px working image
+    k = max(1, min(round(min(h, w) / 180.0), min(h, w) // 8))
+    if k > 1:
+        h2, w2 = h // k, w // k
+        a = a[:h2 * k, :w2 * k].reshape(h2, k, w2, k).mean(axis=(1, 3))
     lap = (-4.0 * a[1:-1, 1:-1]
            + a[:-2, 1:-1] + a[2:, 1:-1]
            + a[1:-1, :-2] + a[1:-1, 2:])
-    return float(lap.var())
+    W = _focus_weight(lap.shape[0], lap.shape[1], sigma_frac)
+    wsum = W.sum()
+    return float((W * lap * lap).sum() / wsum) if wsum else 0.0
 
 
 # -- capture planning (pure) -----------------------------------------------

@@ -72,6 +72,33 @@ def test_focus_score_edges_higher_than_flat():
     assert wc.focus_score(checker) > wc.focus_score(flat)
 
 
+def test_focus_score_noise_robust():
+    # The bench bug (2026-07-20): a noisy defocused frame must NOT beat a
+    # clean focused one. Correlated edges survive block-downsampling; the
+    # per-pixel sensor noise averages away. Uses a realistic camera-scale
+    # frame (the downsample engages at >= a few hundred px).
+    import numpy as np
+    rng = np.random.RandomState(0)
+    n = 720
+    sharp = np.zeros((n, n))
+    sharp[:, n // 2:] = 255.0                       # one strong, real edge
+    noisy_flat = np.clip(128 + rng.normal(0, 18, (n, n)), 0, 255)  # noise only
+    assert wc.focus_score(sharp) > wc.focus_score(noisy_flat), \
+        "noise must not out-score a real edge"
+
+
+def test_focus_score_center_weighted():
+    # An edge in the CENTER should score higher than the same feature shoved
+    # into a corner, because the metric is weighted to the middle.
+    import numpy as np
+    n = 720
+    center = np.zeros((n, n))
+    center[n // 2 - 60:n // 2 + 60, n // 2 - 60:n // 2 + 60] = 255.0
+    corner = np.zeros((n, n))
+    corner[:120, :120] = 255.0
+    assert wc.focus_score(center) > wc.focus_score(corner)
+
+
 def test_focus_score_rejects_tiny():
     try:
         wc.focus_score([[1, 2], [3, 4]])
