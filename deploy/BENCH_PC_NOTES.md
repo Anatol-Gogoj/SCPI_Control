@@ -14,13 +14,23 @@ Desktop icon / app-grid entry → `/usr/local/bin/scpi-launch.sh` (installed by
    *reading a byte* (`head -c 1`), not `test -r`: on 2026-07-20 `test -r`
    succeeded against a dead NAS and the launch then died with "Host is down"
    without ever reaching a fallback.
-2. **This user's local cache** — `~/.cache/scpi_control`, kept up to date by
-   the share launcher. Run with the working directory at
-   `~/.local/share/scpi_control`, so `presets/` resolves to the same folder
-   the app itself falls back to (see `presets_path.py`) and work done during
-   an outage is not lost.
-3. **A developer clone** at `~/projects/SCPI_Control`, if one exists.
-4. Otherwise a visible zenity/notify error — never a silent nothing.
+2. **GitHub** — if the share is down but the internet is up, pull the latest
+   code and run it locally (`/usr/local/bin/scpi-from-github.sh`; canonical
+   copy `deploy/scpi_from_github.sh`). Gated on a quick `git ls-remote` so a
+   full internet outage falls through fast. This is the share-outage backup:
+   GitHub is over the internet, not the LAN share host, so it works when the
+   Win11 share box is down. Clones to `~/.cache/scpi_control_git` (local
+   disk — git corrupts packfiles on CIFS), reuses the existing
+   `~/.cache/scpi_control/pylibs` for deps (or builds a local venv if there
+   is none), and runs with cwd on the local presets root so presets persist.
+   Anyone can run it by hand any time: `bash ~/scpi_from_github.sh`.
+3. **This user's local cache** — `~/.cache/scpi_control`, kept up to date by
+   the share launcher (can be stale — hence GitHub is tried first). Run with
+   the working directory at `~/.local/share/scpi_control`, so `presets/`
+   resolves to the same folder the app itself falls back to (see
+   `presets_path.py`) and work done during an outage is not lost.
+4. **A developer clone** at `~/projects/SCPI_Control`, if one exists.
+5. Otherwise a visible zenity/notify error — never a silent nothing.
 
 `launch_gui.sh` itself (share-only file; reference copy: `launch_gui.sh.reference`)
 mirrors the app to the local cache **only when `version.py`'s stamp changed**,
