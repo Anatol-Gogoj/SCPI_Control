@@ -3036,9 +3036,10 @@ ANALYSIS:
         self.cam_focus_var = tk.BooleanVar(value=False)
         add_tooltip(ttk.Checkbutton(top, text="Show focus score",
                                     variable=self.cam_focus_var),
-                    "Overlay a live sharpness number on the preview -- "
-                    "higher = better focus; peak it while turning the "
-                    "lens.").pack(side=tk.LEFT, padx=8)
+                    "Overlay a live sharpness number + the green area-of-"
+                    "interest circle. The score is weighted to that central "
+                    "circle and is noise-robust: HIGHER = sharper. Turn the "
+                    "lens to maximise it.").pack(side=tk.LEFT, padx=8)
 
         # --- sensor controls (industrial cameras) ---
         # The DFK 37BUX250's own auto-exposure never converges over UVC: at
@@ -3433,7 +3434,7 @@ ANALYSIS:
     def _cam_show(self, rgb):
         """Render an RGB numpy frame into the preview label (with optional
         focus-score overlay)."""
-        from PIL import Image, ImageTk
+        from PIL import Image, ImageDraw, ImageTk
         img = Image.fromarray(rgb)
         # Fit the width of the view, but use a FIXED height budget: the
         # label sizes itself to whatever image we put in it, so deriving the
@@ -3441,19 +3442,30 @@ ANALYSIS:
         # the tab became scrollable (the canvas grants no spare height).
         maxw = max(self.cam_view.winfo_width() - 4, 320)
         img.thumbnail((maxw, PREVIEW_MAX_HEIGHT))
-        photo = ImageTk.PhotoImage(img)
-        text = ''
         if self.cam_focus_var.get():
+            # Green circle = the central "area of interest" the focus score
+            # is weighted over; score printed top-left (higher = sharper).
+            draw = ImageDraw.Draw(img)
+            tw, th = img.size
+            cx, cy = tw // 2, th // 2
+            r = int(webcam.FOCUS_AOI_RADIUS_FRAC * min(tw, th))
+            draw.ellipse([cx - r, cy - r, cx + r, cy + r],
+                         outline=(0, 255, 0), width=3)
+            draw.line([cx - 6, cy, cx + 6, cy], fill=(0, 255, 0), width=1)
+            draw.line([cx, cy - 6, cx, cy + 6], fill=(0, 255, 0), width=1)
             try:
-                text = f"focus {webcam.focus_score(rgb):.0f}"
+                score = webcam.focus_score(rgb)
+                label = f"focus {score:.0f}  (higher = sharper)"
+                draw.text((7, 5), label, fill=(0, 0, 0))
+                draw.text((6, 4), label, fill=(0, 255, 0))
             except Exception:
-                text = ''
+                pass
+        photo = ImageTk.PhotoImage(img)
         # width/height on a Label are TEXT units while it shows text but
         # PIXELS once it shows an image -- the placeholder's height=24 was
         # therefore pinning the live preview to a 24 px strip. Zero means
         # "size to the image".
-        self.cam_view.config(image=photo, text=text, compound='center',
-                             fg='lime', width=0, height=0)
+        self.cam_view.config(image=photo, text='', width=0, height=0)
         self.cam_photo = photo            # keep a ref
 
     def _cam_save_frame(self, frame, value=None, unit='V',
