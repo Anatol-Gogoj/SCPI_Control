@@ -3209,21 +3209,23 @@ ANALYSIS:
                     "below. Great for a ramp/hold run: one delay per hold."
                     ).grid(row=1, column=1, columnspan=5, sticky='w', padx=2)
         ttk.Label(tm, text="or every").grid(row=2, column=0, sticky='w')
-        self.cam_tm_interval = tk.StringVar(value='60')
+        self.cam_tm_interval = tk.StringVar(value='1')
         add_tooltip(ttk.Entry(tm, textvariable=self.cam_tm_interval, width=7),
-                    "Seconds between shots for the regular schedule.").grid(
-            row=2, column=1, sticky='w')
+                    "Interval capture: seconds between shots. Set this to "
+                    "the waveform period to catch the same phase every "
+                    "cycle.").grid(row=2, column=1, sticky='w')
         ttk.Label(tm, text="s,").grid(row=2, column=2, sticky='w')
         self.cam_tm_count = tk.StringVar(value='10')
         add_tooltip(ttk.Entry(tm, textvariable=self.cam_tm_count, width=6),
-                    "How many shots in the regular schedule.").grid(
+                    "How many shots in the interval schedule.").grid(
             row=2, column=3, sticky='w')
         ttk.Label(tm, text="shots, first at").grid(row=2, column=4, sticky='w')
         self.cam_tm_start = tk.StringVar(value='0')
         add_tooltip(ttk.Entry(tm, textvariable=self.cam_tm_start, width=6),
-                    "Delay of the first shot (s).").grid(row=2, column=5,
-                                                         sticky='w')
-        ttk.Label(tm, text="s").grid(row=2, column=6, sticky='w')
+                    "Delay of the first shot (s) -- your phase offset into "
+                    "the cycle.").grid(row=2, column=5, sticky='w')
+        ttk.Label(tm, text="s  = interval capture, synced to t=0").grid(
+            row=2, column=6, columnspan=2, sticky='w')
         self.cam_tm_focus = tk.BooleanVar(value=True)
         add_tooltip(ttk.Checkbutton(tm, text="log focus CSV",
                                     variable=self.cam_tm_focus),

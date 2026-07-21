@@ -678,12 +678,20 @@ class BK4055B(VisaInstrument):
             raise ValueError("Burst trigger must be MAN, INT or EXT")
         if int(ncycles) < 1:
             raise ValueError("Burst cycle count must be >= 1")
-        self.write(f'C{channel}:BTWV STATE,ON')
+        # Set the trigger source (and cycle count) BEFORE enabling the
+        # burst. The box defaults to an INTERNAL trigger, so enabling
+        # STATE,ON first fired one cycle immediately -- an actuator got hit
+        # on every Apply even with MAN selected (bench report 2026-07-20).
+        # Arming last, already in the requested trigger mode, avoids that.
+        self.write(f'C{channel}:BTWV TRSR,{trigger}')
         self.write(f'C{channel}:BTWV GATE_NCYC,NCYC')
         self.write(f'C{channel}:BTWV TIME,{int(ncycles)}')
-        self.write(f'C{channel}:BTWV TRSR,{trigger}')
         if trigger == 'INT' and period_s:
             self.write(f'C{channel}:BTWV PRD,{period_s:g}')
+        self.write(f'C{channel}:BTWV STATE,ON')
+        # Re-assert the source after enabling, in case this firmware only
+        # accepts TRSR once the burst state is on.
+        self.write(f'C{channel}:BTWV TRSR,{trigger}')
 
     def burst_trigger(self, channel):
         """Fire one manual burst (burst must be ON with trigger MAN)."""

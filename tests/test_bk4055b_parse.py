@@ -198,9 +198,13 @@ def test_burst_dict_on_with_units():
 def test_set_burst_commands_short_and_ordered():
     sg = FakeSG()
     sg.set_burst(1, True, ncycles=5, trigger='INT', period_s=0.25)
-    assert sg.sent == ['C1:BTWV STATE,ON', 'C1:BTWV GATE_NCYC,NCYC',
-                       'C1:BTWV TIME,5', 'C1:BTWV TRSR,INT',
-                       'C1:BTWV PRD,0.25']
+    # Trigger source is set BEFORE STATE,ON (so enabling can't auto-fire an
+    # internal trigger), and re-asserted after.
+    assert sg.sent == ['C1:BTWV TRSR,INT', 'C1:BTWV GATE_NCYC,NCYC',
+                       'C1:BTWV TIME,5', 'C1:BTWV PRD,0.25',
+                       'C1:BTWV STATE,ON', 'C1:BTWV TRSR,INT']
+    assert sg.sent.index('C1:BTWV TRSR,INT') < sg.sent.index('C1:BTWV STATE,ON'), \
+        "trigger source must be set before the burst is enabled"
     for cmd in sg.sent:
         assert len(cmd.encode()) <= BK4055B.USB_MAX_CMD, cmd
     sg = FakeSG()
