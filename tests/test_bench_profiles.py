@@ -14,7 +14,8 @@ import os
 import shutil
 import tempfile
 
-from bench_profiles import BenchProfileStore
+from bench_profiles import (BenchProfileStore, write_profile_file,
+                            read_profile_file)
 
 PROFILE = {'lcr': {'mode': 'CPD', 'freq_hz': '1000'},
            'scope': {'hscale': '1e-3'},
@@ -96,6 +97,52 @@ def test_names_sorted():
         for n in ('zeta', 'Alpha', 'mid'):
             store.save(n, PROFILE)
         assert store.names() == sorted(['zeta', 'Alpha', 'mid'])
+    finally:
+        shutil.rmtree(d)
+
+
+def test_profile_file_round_trip():
+    d = tempfile.mkdtemp(prefix='bench_prof_file_')
+    try:
+        path = os.path.join(d, 'sub', 'setup.json')
+        write_profile_file(path, PROFILE)              # makes parent dir
+        got = read_profile_file(path)
+        assert got['lcr'] == PROFILE['lcr']
+        assert got['scope'] == PROFILE['scope']
+        with open(path) as f:
+            assert json.load(f)['kind'] == 'scpi_bench_profile'
+    finally:
+        shutil.rmtree(d)
+
+
+def test_profile_file_imports_single_store():
+    d = tempfile.mkdtemp(prefix='bench_prof_file_')
+    try:
+        store = BenchProfileStore(os.path.join(d, 'store.json'))
+        store.save('only', PROFILE)
+        got = read_profile_file(os.path.join(d, 'store.json'))
+        assert got['scope'] == PROFILE['scope']
+        store.save('second', {'lcr': {'mode': 'RX'}})
+        try:
+            read_profile_file(os.path.join(d, 'store.json'))
+            assert False, "multi-profile store must raise"
+        except ValueError:
+            pass
+    finally:
+        shutil.rmtree(d)
+
+
+def test_profile_file_rejects_junk():
+    d = tempfile.mkdtemp(prefix='bench_prof_file_')
+    try:
+        p = os.path.join(d, 'junk.json')
+        with open(p, 'w') as f:
+            f.write('{"nothing": 1}')
+        try:
+            read_profile_file(p)
+            assert False, "must raise on a non-profile file"
+        except ValueError:
+            pass
     finally:
         shutil.rmtree(d)
 

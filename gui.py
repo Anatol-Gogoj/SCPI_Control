@@ -25,6 +25,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+import bench_profiles
 from bench_profiles import BenchProfileStore
 import presets_path
 from instruments import BK894, TekMSO24, BK4055B
@@ -186,6 +187,11 @@ class InstrumentControlGUI:
                                command=self.load_bench_profile)
         tools_menu.add_command(label="Delete Bench Profile…",
                                command=self.delete_bench_profile)
+        tools_menu.add_separator()
+        tools_menu.add_command(label="Save Bench Profile to File…",
+                               command=self.export_bench_profile_file)
+        tools_menu.add_command(label="Load Bench Profile from File…",
+                               command=self.import_bench_profile_file)
         tools_menu.add_separator()
         tools_menu.add_command(
             label="Update Software…",
@@ -421,6 +427,40 @@ class InstrumentControlGUI:
             self.apply_all_scope_config()
         if p.get('siggen'):
             self._sg_apply_state(p['siggen'])
+
+    def export_bench_profile_file(self):
+        """Browse to a file and save the whole current bench setup there."""
+        path = filedialog.asksaveasfilename(
+            title="Save bench profile to file", defaultextension=".json",
+            initialfile="bench_profile.json",
+            filetypes=[("Profile files", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            bench_profiles.write_profile_file(path,
+                                              self._collect_bench_profile())
+        except Exception as e:
+            messagebox.showerror("Save to File", str(e))
+            return
+        self.status_bar.config(text=f"Bench profile saved to file: {path}")
+
+    def import_bench_profile_file(self):
+        """Browse to a bench-profile file and apply it to every connected
+        instrument (outputs untouched, same as a library load)."""
+        path = filedialog.askopenfilename(
+            title="Load bench profile from file",
+            filetypes=[("Profile files", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            profile = bench_profiles.read_profile_file(path)
+        except Exception as e:
+            messagebox.showerror("Load from File", str(e))
+            return
+        self._apply_bench_profile(profile)
+        self.status_bar.config(
+            text=f"Bench profile loaded from file: {os.path.basename(path)} "
+                 "-- pushed to every connected instrument (outputs untouched)")
 
     def save_bench_profile(self):
         name = simpledialog.askstring("Save Bench Profile",

@@ -18,6 +18,48 @@ import os
 
 import presets_path
 
+PROFILE_FILE_KIND = 'scpi_bench_profile'
+
+
+def write_profile_file(path, profile):
+    """Write ONE bench profile (a dict) to a JSON file the user browsed to.
+    Atomic (tmp + os.replace). Returns the path."""
+    if not isinstance(profile, dict):
+        raise ValueError("profile must be a dict")
+    data = dict(profile)
+    data['kind'] = PROFILE_FILE_KIND
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+    return path
+
+
+def read_profile_file(path):
+    """Read a browsed bench-profile file -> the profile dict.
+
+    Accepts a single-profile file (this exporter) OR a full store file
+    (bench_profiles.json) when it holds exactly one profile. Raises
+    ValueError on a multi-profile store or a non-profile file."""
+    with open(path) as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("not a bench-profile file (expected a JSON object)")
+    if data.get('kind') == PROFILE_FILE_KIND \
+            or any(k in data for k in ('lcr', 'scope', 'siggen')):
+        return data
+    profiles = [v for v in data.values() if isinstance(v, dict)]
+    if len(profiles) == 1:
+        return profiles[0]
+    if len(profiles) > 1:
+        raise ValueError(
+            "this file holds several profiles -- export one with 'Save "
+            "Bench Profile to File'")
+    raise ValueError("no bench-profile data in this file")
+
 
 class BenchProfileStore:
     def __init__(self, path=None):
