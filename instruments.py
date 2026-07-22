@@ -973,6 +973,7 @@ class BK9174B:
         """
         self.port = port or self.DEFAULT_PORT
         self.baud = baud or self.DEFAULT_BAUD
+        self.resource = self.port      # lets the GUI label the transport
         self.idn = ''
         if transport is not None:
             self.ser = transport
