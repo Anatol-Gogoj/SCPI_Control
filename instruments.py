@@ -910,35 +910,88 @@ class BK4055B(VisaInstrument):
 # Serial-attached DC power supply (CP2102 USB-UART bridge)
 # --------------------------------------------------------------------------
 
-class SerialDCSupply:
-    """Placeholder wrapper for the CP2102-connected DC power supply.
+class BK9174B:
+    """B&K Precision 9174B dual-output, dual-range programmable DC supply.
 
-    The CP2102 USB-UART bridge (VID 0x10c4, PID 0xea60, s/n 503B22108)
-    enumerates as /dev/ttyUSB0. The supply behind it has NOT been identified
-    yet -- model, baudrate, and wire protocol are unknown. This stub provides
-    a minimal write/read/query surface and a place to wire in specifics once
-    the supply is identified.
+    Serial transport over the built-in CP2102 USB-UART bridge (VID 0x10c4,
+    PID 0xea60, s/n 503B22108) -> /dev/ttyUSB0. This is a virtual COM port,
+    NOT USB-TMC, so it does not appear in list_usb_instruments(). Transport
+    parameters are taken from B&K's own example code
+    (github.com/bkprecisioncorp/9170-and-9180_Series, stepExample9174B.py):
+    57600 baud, 8N1, CR+LF terminators.
 
-    Requires pyserial (`pip install pyserial`); imported lazily so the rest of
-    this module loads without it.
+    Two independent outputs, each dual-range:
+        <=35 V -> up to 3.0 A     (105 W)
+        35-70 V -> up to 1.5 A    (105 W)
+    apply() enforces this envelope; set_voltage/set_current guard the
+    absolute bounds. Channel index is 1 or 2.
+
+    Requires pyserial (imported lazily so this module loads without it). The
+    immediate-mode SCPI tokens are the B&K multi-output dialect (VOLT/CURR/
+    MEAS:VOLT?/MEAS:CURR?, INST:SEL CHn) shared with the well-documented
+    9130B (via pymeasure). The tokens marked CONFIRM below have not yet been
+    checked against this exact unit's firmware -- they are centralised as
+    class attributes so a read-only Phase-1 probe can correct any in one
+    place. Every method that changes state selects its channel first, so no
+    hidden channel context can bleed between calls.
     """
     DEFAULT_PORT = '/dev/ttyUSB0'
-    DEFAULT_BAUD = 9600   # PLACEHOLDER: confirm against the actual supply's spec
+    DEFAULT_BAUD = 57600            # confirmed from BK's stepExample9174B.py
+    WRITE_TERM = '\r\n'            # 9174B example uses b'...\r\n'
+    CHANNELS = (1, 2)
 
-    def __init__(self, port=None, baud=None, timeout=1.0):
-        import serial  # lazy import
+    # --- SCPI templates (centralised; CONFIRM against the unit in Phase 1) -
+    CMD_IDN = '*IDN?'
+    CMD_SELECT = 'INST:SEL CH{ch}'      # CONFIRM: alt 'INST:NSEL {ch}'
+    CMD_SELECT_Q = 'INST:SEL?'
+    CMD_SET_VOLT = 'VOLT {val}'
+    CMD_GET_VOLT = 'VOLT?'
+    CMD_SET_CURR = 'CURR {val}'
+    CMD_GET_CURR = 'CURR?'
+    CMD_SET_OUT = 'OUTP {state}'        # CONFIRM: alt 'SOUR:CHAN:OUTP:STAT'
+    CMD_GET_OUT = 'OUTP?'
+    CMD_MEAS_VOLT = 'MEAS:VOLT?'
+    CMD_MEAS_CURR = 'MEAS:CURR?'
+    CMD_SET_OVP = 'VOLT:PROT {val}'     # CONFIRM
+    CMD_SET_OCP = 'CURR:PROT {val}'     # CONFIRM
+    CMD_REMOTE = 'SYST:REM'
+    CMD_LOCAL = 'SYST:LOC'
+
+    # Dual-range safety envelope (per output).
+    V_MAX = 70.0
+    RANGE_LOW_V = 35.0        # boundary between the two current ranges
+    I_LOW_RANGE = 3.0         # V <= 35 -> up to 3 A (also the absolute I max)
+    I_HIGH_RANGE = 1.5        # 35 < V <= 70 -> up to 1.5 A
+
+    def __init__(self, port=None, baud=None, timeout=1.0, identify=True,
+                 transport=None):
+        """Open the serial port and (optionally) read *IDN?.
+
+        transport: an already-open serial-like object (write(bytes)/
+        readline()->bytes/close()); used by the headless tests to avoid
+        touching real hardware. When None a pyserial port is opened.
+        """
         self.port = port or self.DEFAULT_PORT
         self.baud = baud or self.DEFAULT_BAUD
-        self.ser = serial.Serial(self.port, baudrate=self.baud, timeout=timeout)
-        self.idn = ''  # populate once protocol known
+        self.idn = ''
+        if transport is not None:
+            self.ser = transport
+        else:
+            import serial  # lazy import; keeps this module importable without it
+            self.ser = serial.Serial(self.port, baudrate=self.baud,
+                                     timeout=timeout)
+        if identify:
+            try:
+                self.idn = self.query(self.CMD_IDN)
+            except Exception:
+                self.idn = ''
 
+    # --- transport ---------------------------------------------------------
     def write(self, command):
-        if not command.endswith('\n'):
-            command += '\n'
-        self.ser.write(command.encode('ascii'))
+        self.ser.write((command + self.WRITE_TERM).encode('ascii'))
 
-    def read(self, length=1024):
-        return self.ser.read(length).decode('ascii', errors='replace').strip()
+    def read(self):
+        return self.ser.readline().decode('ascii', errors='replace').strip()
 
     def query(self, command):
         self.write(command)
@@ -949,6 +1002,137 @@ class SerialDCSupply:
             self.ser.close()
         except Exception:
             pass
+
+    # --- helpers -----------------------------------------------------------
+    @staticmethod
+    def _fmt(value):
+        """Plain decimal, no exponent, no trailing zeros: 12.0->'12',
+        0.3->'0.3', 0.0001->'0.0001'."""
+        return f'{float(value):.4f}'.rstrip('0').rstrip('.') or '0'
+
+    @staticmethod
+    def _to_float(raw):
+        """Parse a numeric reply, dropping any unit suffix ('12.003V')."""
+        m = re.match(r'[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?',
+                     (raw or '').strip())
+        if not m:
+            raise ValueError(f"expected a number, got {raw!r}")
+        return float(m.group())
+
+    def _check_channel(self, ch):
+        if ch not in self.CHANNELS:
+            raise ValueError(f"channel must be one of {self.CHANNELS}, "
+                             f"got {ch!r}")
+        return ch
+
+    def _check_envelope(self, voltage_v, current_a):
+        """Raise unless (V, I) fits the dual-range envelope."""
+        v = float(voltage_v)
+        a = float(current_a)
+        if not 0 <= v <= self.V_MAX:
+            raise ValueError(f"voltage {v} V out of range 0..{self.V_MAX} V")
+        limit = self.I_LOW_RANGE if v <= self.RANGE_LOW_V else self.I_HIGH_RANGE
+        if not 0 <= a <= limit:
+            raise ValueError(
+                f"current {a} A exceeds the {limit} A limit at {v} V "
+                f"(dual-range: <=35 V -> 3 A, 35-70 V -> 1.5 A)")
+
+    # --- control (each selects its channel first) --------------------------
+    def select_channel(self, ch):
+        self.write(self.CMD_SELECT.format(ch=self._check_channel(ch)))
+
+    def set_remote(self):
+        self.write(self.CMD_REMOTE)
+
+    def set_local(self):
+        self.write(self.CMD_LOCAL)
+
+    def set_voltage(self, ch, voltage_v):
+        self._check_channel(ch)
+        v = float(voltage_v)
+        if not 0 <= v <= self.V_MAX:
+            raise ValueError(f"voltage {v} V out of range 0..{self.V_MAX} V")
+        self.select_channel(ch)
+        self.write(self.CMD_SET_VOLT.format(val=self._fmt(v)))
+
+    def set_current(self, ch, current_a):
+        self._check_channel(ch)
+        a = float(current_a)
+        if not 0 <= a <= self.I_LOW_RANGE:
+            raise ValueError(f"current {a} A exceeds absolute max "
+                             f"{self.I_LOW_RANGE} A")
+        self.select_channel(ch)
+        self.write(self.CMD_SET_CURR.format(val=self._fmt(a)))
+
+    def set_output(self, ch, on):
+        self._check_channel(ch)
+        self.select_channel(ch)
+        self.write(self.CMD_SET_OUT.format(state='ON' if on else 'OFF'))
+
+    def apply(self, ch, voltage_v, current_a, output=None):
+        """Set V and I limit together with the dual-range envelope enforced.
+
+        output: True/False to also switch the output, or None to leave the
+        output state untouched (the safe default -- a PSU may be powering a
+        live DUT)."""
+        self._check_channel(ch)
+        self._check_envelope(voltage_v, current_a)
+        self.select_channel(ch)
+        self.write(self.CMD_SET_VOLT.format(val=self._fmt(voltage_v)))
+        self.write(self.CMD_SET_CURR.format(val=self._fmt(current_a)))
+        if output is not None:
+            self.write(self.CMD_SET_OUT.format(state='ON' if output else 'OFF'))
+
+    def set_ovp(self, ch, voltage_v):
+        self._check_channel(ch)
+        self.select_channel(ch)
+        self.write(self.CMD_SET_OVP.format(val=self._fmt(voltage_v)))
+
+    def set_ocp(self, ch, current_a):
+        self._check_channel(ch)
+        self.select_channel(ch)
+        self.write(self.CMD_SET_OCP.format(val=self._fmt(current_a)))
+
+    # --- reads (safe: queries only) ---------------------------------------
+    def get_setpoint_voltage(self, ch):
+        self.select_channel(ch)
+        return self._to_float(self.query(self.CMD_GET_VOLT))
+
+    def get_setpoint_current(self, ch):
+        self.select_channel(ch)
+        return self._to_float(self.query(self.CMD_GET_CURR))
+
+    def get_output(self, ch):
+        self.select_channel(ch)
+        raw = self.query(self.CMD_GET_OUT).upper()
+        return raw in ('1', 'ON', 'TRUE')
+
+    def measure_voltage(self, ch):
+        self.select_channel(ch)
+        return self._to_float(self.query(self.CMD_MEAS_VOLT))
+
+    def measure_current(self, ch):
+        self.select_channel(ch)
+        return self._to_float(self.query(self.CMD_MEAS_CURR))
+
+    def measure_power(self, ch):
+        self.select_channel(ch)
+        v = self._to_float(self.query(self.CMD_MEAS_VOLT))
+        a = self._to_float(self.query(self.CMD_MEAS_CURR))
+        return v * a
+
+    def read_channel(self, ch):
+        """One poll of a channel for logging -- selects it once, then reads
+        the setpoint voltage and the measured voltage/current. Returns a dict
+        with calculated power (P = V_meas * I_meas)."""
+        self._check_channel(ch)
+        self.select_channel(ch)
+        set_v = self._to_float(self.query(self.CMD_GET_VOLT))
+        meas_v = self._to_float(self.query(self.CMD_MEAS_VOLT))
+        meas_i = self._to_float(self.query(self.CMD_MEAS_CURR))
+        return {'channel': ch, 'set_voltage_v': set_v,
+                'meas_voltage_v': meas_v, 'meas_current_a': meas_i,
+                'power_w': meas_v * meas_i}
 
 
 # --------------------------------------------------------------------------

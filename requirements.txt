@@ -8,6 +8,11 @@ PyVISA==1.16.1
 PyVISA-py==0.8.1
 typing_extensions==4.15.0
 
+# BK9174B DC power supply: serial (virtual COM port) transport over its
+# CP2102 USB-UART bridge -> /dev/ttyUSB0. Not USB-TMC, so it needs pyserial
+# rather than PyVISA. instruments.BK9174B imports it lazily.
+pyserial==3.5
+
 # Webcam tab (live preview + interval/stepped capture). cv2 captures frames,
 # Pillow displays them in Tk, numpy backs the focus metric. The Webcam tab
 # degrades gracefully (shows an install hint) if these are absent.
