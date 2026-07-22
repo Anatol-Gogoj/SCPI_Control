@@ -124,6 +124,35 @@ PREVIEW_MAX_HEIGHT = 520   # webcam preview height budget (px)
 
 SG_LOAD_HIGHZ = 'High-Z'   # UI label for the SCPI 'HZ' (high impedance) token
 
+# Signal generator over LAN. Arb upload works only over the wire (USB's
+# 52-byte cap blocks it), so the GUI prefers LAN and falls back to USB.
+# The box is statically set to 192.168.71.230; override with SCPI_SG_LAN
+# (empty string disables the LAN attempt entirely). Verified 2026-07-22.
+SG_LAN_RESOURCE = os.environ.get('SCPI_SG_LAN',
+                                 'TCPIP0::192.168.71.230::INSTR')
+
+
+def _lan_reachable(resource, timeout=2.0):
+    """Quick TCP liveness probe of a TCPIP VISA resource's host, so a missing
+    box/cable falls back to USB fast instead of waiting out a long VISA open
+    timeout. Probes the port that matches the resource: VXI-11's portmapper
+    (111) for an ``INSTR`` resource, the socket port for a ``SOCKET`` one.
+    Deliberately NOT the raw command socket (5025) for VXI-11 -- that port is
+    single-session and briefly occupying it can stall the following VISA
+    open (bench-observed 2026-07-22)."""
+    import re
+    import socket
+    m = re.search(r'TCPIP\d*::([^:]+)(?:::(\d+))?', resource or '')
+    if not m:
+        return False
+    host = m.group(1)
+    port = int(m.group(2)) if m.group(2) else 111   # 111 = VXI-11 portmapper
+    try:
+        socket.create_connection((host, port), timeout=timeout).close()
+        return True
+    except OSError:
+        return False
+
 # Instrument I/O works only on the Linux bench box (pyvisa-py drives the
 # USB-TMC boxes via libusb with a udev/blacklist setup that exists only
 # there). On Windows/macOS the app still runs: Battery Data and Webcam
@@ -474,15 +503,31 @@ class InstrumentControlGUI:
             # One serial worker on purpose: the drivers share a process-wide
             # pyvisa-py ResourceManager, which is not re-entrant.
             results = {}
-            for key, cls in (('lcr', BK894), ('scope', TekMSO24),
-                             ('sg', BK4055B)):
+            for key, factory in (('lcr', BK894), ('scope', TekMSO24),
+                                 ('sg', self._connect_sg)):
                 try:
-                    results[key] = cls()
+                    results[key] = factory()
                 except Exception as e:
                     results[key] = e
             return results
 
         self._run_bg(work, self._auto_connect_done, busy='connect')
+
+    @staticmethod
+    def _connect_sg():
+        """Connect the signal generator LAN-first (arb upload is LAN-only),
+        USB fallback. Runs in a worker thread -- no Tk here."""
+        if SG_LAN_RESOURCE and _lan_reachable(SG_LAN_RESOURCE):
+            try:
+                return BK4055B(resource=SG_LAN_RESOURCE)
+            except Exception:
+                pass          # box answered the probe but VISA failed -> USB
+        return BK4055B()      # USB auto-discover
+
+    @staticmethod
+    def _transport(inst):
+        return ('LAN' if str(getattr(inst, 'resource', '')).startswith('TCPIP')
+                else 'USB')
 
     def _auto_connect_done(self, results, error):
         if error:   # work() catches per-instrument; this is belt-and-braces
@@ -497,7 +542,9 @@ class InstrumentControlGUI:
                 label.config(text=f"Not connected: {inst}", fg="red")
                 continue
             setattr(self, key, inst)
-            label.config(text=f"Connected: {inst.idn}", fg="green")
+            label.config(
+                text=f"Connected ({self._transport(inst)}): {inst.idn}",
+                fg="green")
             if sync:
                 sync()   # reads config; catches its own errors
 
@@ -524,7 +571,9 @@ class InstrumentControlGUI:
                 messagebox.showerror("Connection Error", str(error))
                 return
             setattr(self, key, inst)
-            label.config(text=f"Connected: {inst.idn}", fg="green")
+            label.config(
+                text=f"Connected ({self._transport(inst)}): {inst.idn}",
+                fg="green")
             if sync:
                 sync()
 
@@ -2225,7 +2274,8 @@ ANALYSIS:
         return f'{ohms:g}'
 
     def reconnect_sg(self):
-        self._reconnect('sg', BK4055B, self.sg_status,
+        # LAN-first (arb upload is LAN-only), USB fallback -- same as startup.
+        self._reconnect('sg', self._connect_sg, self.sg_status,
                         sync=self.update_sg_config)
 
     # The SG read paths are split into a VISA half (fetch -- worker thread)
