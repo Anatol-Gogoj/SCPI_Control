@@ -30,6 +30,7 @@ import presets_path
 from instruments import BK894, TekMSO24, BK4055B
 import lcr_format
 import scope_trace
+import siggen_presets
 from siggen_presets import SignalGenPresetStore
 from ui_widgets import ScrollableTab, SplashScreen, add_tooltip
 from arb_editor import ArbWaveformEditor
@@ -1714,6 +1715,21 @@ ANALYSIS:
         ttk.Button(preset_frame, text="Save Preset",
                    command=self.sg_save_preset).grid(row=1, column=2, padx=5)
 
+        # Browse to a file, so a preset can live anywhere (a USB stick, a
+        # project folder) and move between machines, not just the shared
+        # preset library.
+        ttk.Label(preset_frame, text="Or use a file:").grid(
+            row=2, column=0, sticky='w', pady=5)
+        add_tooltip(ttk.Button(preset_frame, text="Save to File...",
+                               command=self.sg_export_preset),
+                    "Browse to save the CURRENT CH1+CH2 settings as a "
+                    ".json preset file anywhere you choose.").grid(
+            row=2, column=1, padx=10, pady=5, sticky='w')
+        add_tooltip(ttk.Button(preset_frame, text="Load from File...",
+                               command=self.sg_import_preset),
+                    "Browse to load a preset .json file and apply it to "
+                    "both channels.").grid(row=2, column=2, padx=5)
+
         self.sg_refresh_presets()
 
         # Tips button at bottom
@@ -2664,6 +2680,37 @@ ANALYSIS:
             self.status_bar.config(text=f"Preset loaded: {name}")
         except Exception as e:
             messagebox.showerror("Load Error", str(e))
+
+    def sg_export_preset(self):
+        """Browse to a file and save the CURRENT channel settings there."""
+        path = filedialog.asksaveasfilename(
+            title="Save signal-generator preset to file",
+            defaultextension=".json", initialfile="sg_preset.json",
+            filetypes=[("Preset files", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            siggen_presets.write_preset_file(path, self._sg_collect_state())
+        except Exception as e:
+            messagebox.showerror("Save to File", str(e))
+            return
+        self.status_bar.config(text=f"Preset saved to file: {path}")
+
+    def sg_import_preset(self):
+        """Browse to a preset file and apply it to both channels."""
+        path = filedialog.askopenfilename(
+            title="Load signal-generator preset from file",
+            filetypes=[("Preset files", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            channels = siggen_presets.read_preset_file(path)
+        except Exception as e:
+            messagebox.showerror("Load from File", str(e))
+            return
+        self._sg_apply_state(channels)
+        self.status_bar.config(
+            text=f"Preset loaded from file: {os.path.basename(path)}")
 
     def sg_delete_preset(self):
         """Delete the selected preset."""

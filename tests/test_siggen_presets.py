@@ -16,7 +16,8 @@ import tempfile
 
 from siggen_presets import (SignalGenPresetStore, validate_channel_state,
                             arb_from_csv, write_arb_template,
-                            sanitize_arb_name)
+                            sanitize_arb_name, write_preset_file,
+                            read_preset_file)
 
 
 def _state(waveform='SINE', freq=1000.0, amp=1.0, offset=0.0,
@@ -191,6 +192,66 @@ def test_arb_name_in_channel_state():
     out = validate_channel_state({'waveform': 'SINE'})
     assert 'arb_name' not in out                 # absent when not given
     assert sanitize_arb_name('x' * 40) == 'x' * 16   # length cap
+
+
+def test_preset_file_round_trip():
+    channels = {1: {'waveform': 'SINE', 'freq_hz': 1000, 'amp_vpp': 2,
+                    'offset_v': 0},
+                2: {'waveform': 'SQUARE', 'freq_hz': 500, 'amp_vpp': 3,
+                    'offset_v': 1, 'duty_pct': 25}}
+    d = tempfile.mkdtemp(prefix='sgpreset_')
+    try:
+        path = os.path.join(d, 'sub', 'my_preset.json')
+        write_preset_file(path, channels)          # creates parent dir
+        got = read_preset_file(path)
+        assert set(got) == {'1', '2'}
+        assert got['1']['waveform'] == 'SINE' and got['1']['freq_hz'] == 1000.0
+        assert got['2']['waveform'] == 'SQUARE' and got['2']['duty_pct'] == 25.0
+        # the file is self-describing
+        with open(path) as f:
+            raw = json.load(f)
+        assert raw['kind'] == 'scpi_sg_preset' and 'channels' in raw
+    finally:
+        shutil.rmtree(d)
+
+
+def test_preset_file_imports_single_store_file():
+    # a full store file with exactly one preset is importable
+    d = tempfile.mkdtemp(prefix='sgpreset_')
+    try:
+        store = SignalGenPresetStore(os.path.join(d, 'store.json'))
+        store.save('only', {1: {'waveform': 'RAMP', 'freq_hz': 100,
+                                'amp_vpp': 1, 'offset_v': 0, 'sym_pct': 50}})
+        got = read_preset_file(os.path.join(d, 'store.json'))
+        assert got['1']['waveform'] == 'RAMP'
+        # ...but a store with several presets is ambiguous -> error
+        store.save('second', {1: {'waveform': 'SINE', 'freq_hz': 1,
+                                  'amp_vpp': 1, 'offset_v': 0}})
+        try:
+            read_preset_file(os.path.join(d, 'store.json'))
+            assert False, "multi-preset store must raise"
+        except ValueError:
+            pass
+    finally:
+        shutil.rmtree(d)
+
+
+def test_preset_file_rejects_junk():
+    d = tempfile.mkdtemp(prefix='sgpreset_')
+    try:
+        p = os.path.join(d, 'junk.json')
+        with open(p, 'w') as f:
+            f.write('{"hello": "world"}')          # no channels
+        try:
+            read_preset_file(p)
+            assert False, "must raise on a non-preset file"
+        except ValueError:
+            pass
+    finally:
+        shutil.rmtree(d)
+
+
+import shutil  # noqa: E402  (used by the preset-file tests above)
 
 
 if __name__ == '__main__':
