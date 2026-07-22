@@ -157,6 +157,55 @@ def validate_channel_state(state):
     return out
 
 
+PRESET_FILE_KIND = 'scpi_sg_preset'
+
+
+def write_preset_file(path, channels):
+    """Write ONE preset (a {1|2 -> ChannelState} mapping) to a JSON file the
+    user chose via a browse dialog. Channel states are validated; the write
+    is atomic (tmp + os.replace). Returns the path."""
+    normalised = {str(ch): validate_channel_state(st)
+                  for ch, st in channels.items()}
+    data = {
+        'kind': PRESET_FILE_KIND,
+        'version': SCHEMA_VERSION,
+        'saved_utc': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'channels': normalised,
+    }
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+    return path
+
+
+def read_preset_file(path):
+    """Read a browsed preset file -> validated {'1'|'2' -> ChannelState}.
+
+    Accepts a single-preset file (this exporter) OR a full store file
+    (siggen_presets.json) when it holds exactly one preset. Raises
+    ValueError on anything that isn't a usable single preset."""
+    with open(path) as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("not a preset file (expected a JSON object)")
+    channels = data.get('channels')
+    if channels is None and isinstance(data.get('presets'), dict):
+        presets = data['presets']
+        if len(presets) == 1:
+            channels = next(iter(presets.values())).get('channels')
+        elif len(presets) > 1:
+            raise ValueError(
+                "this file holds several presets -- import one saved with "
+                "'Save to File'")
+    if not isinstance(channels, dict) or not channels:
+        raise ValueError("no signal-generator channel settings in this file")
+    return {str(k): validate_channel_state(v) for k, v in channels.items()}
+
+
 class SignalGenPresetStore:
     """JSON-backed store of named signal-generator presets."""
 
