@@ -6,7 +6,7 @@ git commit hash when run from a checkout, so the footer pins the exact build
 the user is running (useful when running from a feature branch).
 """
 
-__version__ = "0.17.0"
+__version__ = "0.18.0"
 
 
 def version_string():
