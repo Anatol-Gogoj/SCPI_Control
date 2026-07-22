@@ -910,35 +910,80 @@ class BK4055B(VisaInstrument):
 # Serial-attached DC power supply (CP2102 USB-UART bridge)
 # --------------------------------------------------------------------------
 
-class SerialDCSupply:
-    """Placeholder wrapper for the CP2102-connected DC power supply.
+class BK9174B:
+    """B&K Precision 9174B dual-output, dual-range programmable DC supply.
 
-    The CP2102 USB-UART bridge (VID 0x10c4, PID 0xea60, s/n 503B22108)
-    enumerates as /dev/ttyUSB0. The supply behind it has NOT been identified
-    yet -- model, baudrate, and wire protocol are unknown. This stub provides
-    a minimal write/read/query surface and a place to wire in specifics once
-    the supply is identified.
+    Serial transport over the built-in CP2102 USB-UART bridge (VID 0x10c4,
+    PID 0xea60, s/n 503B22108) -> /dev/ttyUSB0. This is a virtual COM port,
+    NOT USB-TMC, so it does not appear in list_usb_instruments(). Transport
+    parameters are taken from B&K's own example code
+    (github.com/bkprecisioncorp/9170-and-9180_Series, stepExample9174B.py):
+    57600 baud, 8N1, CR+LF terminators.
 
-    Requires pyserial (`pip install pyserial`); imported lazily so the rest of
-    this module loads without it.
+    Two independent outputs, each dual-range:
+        <=35 V -> up to 3.0 A     (105 W)
+        35-70 V -> up to 1.5 A    (105 W)
+    apply() enforces this envelope; set_voltage/set_current guard the
+    absolute bounds. Channel index is 1 or 2.
+
+    Requires pyserial (imported lazily so this module loads without it).
+
+    CHANNEL ADDRESSING (from the 9170B/9180B series manual section 4.2, and
+    verified read-only against this unit 2026-07-22): the 9174B has NO
+    channel-select command. Channel 1 uses the bare command; channel 2 uses
+    a '2'-suffixed token. So CH1 vs CH2 is VOLT/VOLT2, CURR/CURR2,
+    MEAS:VOLT?/MEAS:VOLT2?, MEAS:CURR?/MEAS:CURR2?, OUT/OUT2, and
+    PROT:OVP:LEV/PROT:OVP2:LEV. The [SOURce] prefix is optional (bare VOLT?
+    reads back correctly). _sfx(ch) returns that suffix and drives every
+    command -- there is no modal channel state to leak between calls.
     """
     DEFAULT_PORT = '/dev/ttyUSB0'
-    DEFAULT_BAUD = 9600   # PLACEHOLDER: confirm against the actual supply's spec
+    DEFAULT_BAUD = 57600            # confirmed from BK's stepExample9174B.py
+    WRITE_TERM = '\r\n'            # 9174B example uses b'...\r\n'
+    CHANNELS = (1, 2)
 
-    def __init__(self, port=None, baud=None, timeout=1.0):
-        import serial  # lazy import
+    # Per-channel commands are built from a '' / '2' suffix (see _sfx); only
+    # the channel-agnostic ones are named constants.
+    CMD_IDN = '*IDN?'
+    CMD_REMOTE = 'SYST:REM'      # front-panel Local key returns to local
+    CMD_ERROR = 'SYST:ERR?'      # -> "<code>,<text>"; code 0 = no error
+
+    # Dual-range safety envelope (per output).
+    V_MAX = 70.0
+    RANGE_LOW_V = 35.0        # boundary between the two current ranges
+    I_LOW_RANGE = 3.0         # V <= 35 -> up to 3 A (also the absolute I max)
+    I_HIGH_RANGE = 1.5        # 35 < V <= 70 -> up to 1.5 A
+
+    def __init__(self, port=None, baud=None, timeout=1.0, identify=True,
+                 transport=None):
+        """Open the serial port and (optionally) read *IDN?.
+
+        transport: an already-open serial-like object (write(bytes)/
+        readline()->bytes/close()); used by the headless tests to avoid
+        touching real hardware. When None a pyserial port is opened.
+        """
         self.port = port or self.DEFAULT_PORT
         self.baud = baud or self.DEFAULT_BAUD
-        self.ser = serial.Serial(self.port, baudrate=self.baud, timeout=timeout)
-        self.idn = ''  # populate once protocol known
+        self.resource = self.port      # lets the GUI label the transport
+        self.idn = ''
+        if transport is not None:
+            self.ser = transport
+        else:
+            import serial  # lazy import; keeps this module importable without it
+            self.ser = serial.Serial(self.port, baudrate=self.baud,
+                                     timeout=timeout)
+        if identify:
+            try:
+                self.idn = self.query(self.CMD_IDN)
+            except Exception:
+                self.idn = ''
 
+    # --- transport ---------------------------------------------------------
     def write(self, command):
-        if not command.endswith('\n'):
-            command += '\n'
-        self.ser.write(command.encode('ascii'))
+        self.ser.write((command + self.WRITE_TERM).encode('ascii'))
 
-    def read(self, length=1024):
-        return self.ser.read(length).decode('ascii', errors='replace').strip()
+    def read(self):
+        return self.ser.readline().decode('ascii', errors='replace').strip()
 
     def query(self, command):
         self.write(command)
@@ -949,6 +994,149 @@ class SerialDCSupply:
             self.ser.close()
         except Exception:
             pass
+
+    # --- helpers -----------------------------------------------------------
+    @staticmethod
+    def _fmt(value):
+        """Plain decimal, no exponent, no trailing zeros: 12.0->'12',
+        0.3->'0.3', 0.0001->'0.0001'."""
+        return f'{float(value):.4f}'.rstrip('0').rstrip('.') or '0'
+
+    @staticmethod
+    def _to_float(raw):
+        """Parse a numeric reply, dropping any unit suffix ('12.003V')."""
+        m = re.match(r'[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?',
+                     (raw or '').strip())
+        if not m:
+            raise ValueError(f"expected a number, got {raw!r}")
+        return float(m.group())
+
+    def _check_channel(self, ch):
+        if ch not in self.CHANNELS:
+            raise ValueError(f"channel must be one of {self.CHANNELS}, "
+                             f"got {ch!r}")
+        return ch
+
+    def _check_envelope(self, voltage_v, current_a):
+        """Raise unless (V, I) fits the dual-range envelope."""
+        v = float(voltage_v)
+        a = float(current_a)
+        if not 0 <= v <= self.V_MAX:
+            raise ValueError(f"voltage {v} V out of range 0..{self.V_MAX} V")
+        limit = self.I_LOW_RANGE if v <= self.RANGE_LOW_V else self.I_HIGH_RANGE
+        if not 0 <= a <= limit:
+            raise ValueError(
+                f"current {a} A exceeds the {limit} A limit at {v} V "
+                f"(dual-range: <=35 V -> 3 A, 35-70 V -> 1.5 A)")
+
+    # --- channel addressing ------------------------------------------------
+    @staticmethod
+    def _sfx(ch):
+        """SCPI token suffix for a channel: '' for CH1, '2' for CH2. The
+        9174B has no channel-select -- outputs are addressed by name."""
+        return '' if ch == 1 else '2'
+
+    # --- control -----------------------------------------------------------
+    def set_remote(self):
+        self.write(self.CMD_REMOTE)
+
+    def set_voltage(self, ch, voltage_v):
+        self._check_channel(ch)
+        v = float(voltage_v)
+        if not 0 <= v <= self.V_MAX:
+            raise ValueError(f"voltage {v} V out of range 0..{self.V_MAX} V")
+        self.write(f'VOLT{self._sfx(ch)} {self._fmt(v)}')
+
+    def set_current(self, ch, current_a):
+        self._check_channel(ch)
+        a = float(current_a)
+        if not 0 <= a <= self.I_LOW_RANGE:
+            raise ValueError(f"current {a} A exceeds absolute max "
+                             f"{self.I_LOW_RANGE} A")
+        self.write(f'CURR{self._sfx(ch)} {self._fmt(a)}')
+
+    def set_output(self, ch, on):
+        self._check_channel(ch)
+        self.write(f'OUT{self._sfx(ch)} {"ON" if on else "OFF"}')
+
+    def apply(self, ch, voltage_v, current_a, output=None):
+        """Set V and I limit together with the dual-range envelope enforced.
+
+        output: True/False to also switch the output, or None to leave the
+        output state untouched (the safe default -- a PSU may be powering a
+        live DUT)."""
+        self._check_channel(ch)
+        self._check_envelope(voltage_v, current_a)
+        s = self._sfx(ch)
+        self.write(f'VOLT{s} {self._fmt(voltage_v)}')
+        self.write(f'CURR{s} {self._fmt(current_a)}')
+        if output is not None:
+            self.write(f'OUT{s} {"ON" if output else "OFF"}')
+
+    def set_ovp(self, ch, voltage_v):
+        """Set the over-voltage trip level and arm OVP for the channel."""
+        self._check_channel(ch)
+        s = self._sfx(ch)
+        self.write(f'PROT:OVP{s}:LEV {self._fmt(voltage_v)}')
+        self.write(f'PROT:OVP{s} ON')
+
+    def set_ocp(self, ch, current_a):
+        """Set the over-current trip level and arm OCP for the channel."""
+        self._check_channel(ch)
+        s = self._sfx(ch)
+        self.write(f'PROT:OCP{s}:LEV {self._fmt(current_a)}')
+        self.write(f'PROT:OCP{s} ON')
+
+    def clear_protection(self):
+        """Clear a tripped OVP/OCP latch (PROT:CLE, whole supply)."""
+        self.write('PROT:CLE')
+
+    # --- reads (safe: queries only) ---------------------------------------
+    def get_setpoint_voltage(self, ch):
+        self._check_channel(ch)
+        return self._to_float(self.query(f'VOLT{self._sfx(ch)}?'))
+
+    def get_setpoint_current(self, ch):
+        self._check_channel(ch)
+        return self._to_float(self.query(f'CURR{self._sfx(ch)}?'))
+
+    def get_output(self, ch):
+        self._check_channel(ch)
+        return self.query(f'OUT{self._sfx(ch)}?').strip().upper() \
+            in ('1', 'ON', 'TRUE')
+
+    def measure_voltage(self, ch):
+        self._check_channel(ch)
+        return self._to_float(self.query(f'MEAS:VOLT{self._sfx(ch)}?'))
+
+    def measure_current(self, ch):
+        self._check_channel(ch)
+        return self._to_float(self.query(f'MEAS:CURR{self._sfx(ch)}?'))
+
+    def measure_power(self, ch):
+        return self.measure_voltage(ch) * self.measure_current(ch)
+
+    def get_error(self):
+        """(code, raw) from SYST:ERR?. code 0 = no error; 1 command,
+        2 execution, 3 query, 4 input-range; -1 if unparseable."""
+        raw = self.query(self.CMD_ERROR)
+        try:
+            code = int(float(raw.split(',')[0]))
+        except (ValueError, IndexError):
+            code = -1
+        return code, raw
+
+    def read_channel(self, ch):
+        """One poll of a channel for logging: setpoint voltage + measured
+        voltage/current, with calculated power (P = V_meas * I_meas)."""
+        self._check_channel(ch)
+        s = self._sfx(ch)
+        set_v = self._to_float(self.query(f'VOLT{s}?'))
+        meas_v = self._to_float(self.query(f'MEAS:VOLT{s}?'))
+        meas_i = self._to_float(self.query(f'MEAS:CURR{s}?'))
+        return {'channel': ch, 'set_voltage_v': set_v,
+                'meas_voltage_v': meas_v, 'meas_current_a': meas_i,
+                'power_w': meas_v * meas_i}
 
 
 # --------------------------------------------------------------------------

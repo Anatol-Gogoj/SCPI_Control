@@ -11,6 +11,8 @@ tab has a Reconnect button):
     Arbitrary waveforms are designed in the Waveform Editor and delivered
     to the box as a flash-drive .bin (front USB port); direct upload over
     the wire is LAN-only -- see issue #20.
+  - DC Supply (BK 9174B): dual-output V / current-limit with protection,
+    live V/A/W readout, and an explicit output toggle. Serial (CP2102).
   - Data Logging (CSV)
 
 A version readout is shown in the footer. Instrument drivers live in
@@ -28,7 +30,7 @@ from datetime import datetime
 import bench_profiles
 from bench_profiles import BenchProfileStore
 import presets_path
-from instruments import BK894, TekMSO24, BK4055B
+from instruments import BK894, TekMSO24, BK4055B, BK9174B
 import lcr_format
 import scope_trace
 import siggen_presets
@@ -205,6 +207,13 @@ class InstrumentControlGUI:
         self.lcr = None
         self.scope = None
         self.sg = None
+        self.psu = None
+        # The DC supply is on a stateful serial link (INST:SEL then query);
+        # the live-readout poller and the logging thread both reach it, so
+        # every PSU serial op is serialised through this lock.
+        self.psu_lock = threading.Lock()
+        self.psu_channel_widgets = {}
+        self.psu_live_job = None
         self.recording = False
         self.record_thread = None
         # Keys of background instrument operations in flight (issue #40) --
@@ -241,6 +250,7 @@ class InstrumentControlGUI:
         for label, build in (("LCR meter", self.create_lcr_tab),
                              ("oscilloscope", self.create_scope_tab),
                              ("signal generator", self.create_sg_tab),
+                             ("DC supply", self.create_psu_tab),
                              ("data logging", self.create_logging_tab),
                              ("battery data", self.create_battery_tab),
                              ("webcam", self.create_webcam_tab)):
@@ -531,13 +541,14 @@ class InstrumentControlGUI:
         """Connect to all instruments in the background at startup."""
         if not INSTRUMENTS_SUPPORTED:
             for label in (self.lcr_status, self.scope_status,
-                          self.sg_status):
+                          self.sg_status, self.psu_status):
                 label.config(text=NOT_LINUX_SHORT, fg="#8a5a00")
             self.status_bar.config(
                 text="Non-Linux platform: instrument tabs are view/edit "
                      "only; Battery Data and Webcam are fully available")
             return
-        for label in (self.lcr_status, self.scope_status, self.sg_status):
+        for label in (self.lcr_status, self.scope_status, self.sg_status,
+                      self.psu_status):
             label.config(text="Connecting...", fg="#b36b00")
 
         def work():
@@ -545,7 +556,8 @@ class InstrumentControlGUI:
             # pyvisa-py ResourceManager, which is not re-entrant.
             results = {}
             for key, factory in (('lcr', BK894), ('scope', TekMSO24),
-                                 ('sg', self._connect_sg)):
+                                 ('sg', self._connect_sg),
+                                 ('psu', self._connect_psu)):
                 try:
                     results[key] = factory()
                 except Exception as e:
@@ -566,9 +578,28 @@ class InstrumentControlGUI:
         return BK4055B()      # USB auto-discover
 
     @staticmethod
+    def _connect_psu():
+        """Connect the BK9174B DC supply over its CP2102 serial port.
+        Read-only on connect (*IDN? only -- never changes the output). Runs
+        in a worker thread, so no Tk here.
+
+        SCPI_PSU_PORT overrides the port ('/dev/ttyUSB0' default); set it to
+        an empty string to keep the GUI off the supply entirely -- useful
+        when the box is mid-experiment and must see zero serial traffic."""
+        port = os.environ.get('SCPI_PSU_PORT', BK9174B.DEFAULT_PORT)
+        if not port:
+            raise RuntimeError("PSU auto-connect disabled (SCPI_PSU_PORT empty)")
+        return BK9174B(port=port)
+
+    @staticmethod
     def _transport(inst):
-        return ('LAN' if str(getattr(inst, 'resource', '')).startswith('TCPIP')
-                else 'USB')
+        res = str(getattr(inst, 'resource', ''))
+        if res.startswith('TCPIP'):
+            return 'LAN'
+        if res.startswith('ASRL') or res.startswith('/dev/') \
+                or res[:3].upper() == 'COM':
+            return 'Serial'
+        return 'USB'
 
     def _auto_connect_done(self, results, error):
         if error:   # work() catches per-instrument; this is belt-and-braces
@@ -577,7 +608,8 @@ class InstrumentControlGUI:
         for key, label, sync in (
                 ('lcr', self.lcr_status, self.update_lcr_config),
                 ('scope', self.scope_status, None),
-                ('sg', self.sg_status, self.update_sg_config)):
+                ('sg', self.sg_status, self.update_sg_config),
+                ('psu', self.psu_status, self._psu_after_connect)):
             inst = results.get(key)
             if isinstance(inst, Exception) or inst is None:
                 label.config(text=f"Not connected: {inst}", fg="red")
@@ -839,6 +871,8 @@ FILE FORMAT:
 - SigGen columns: Timestamp, Waveform, Frequency, Amplitude, Offset,
   Stdev, Mean, Output - the STIMULUS that was driving the DUT, so a
   swept run records cause and effect in the same session
+- DC Supply columns: Timestamp, Set V, Meas V, Meas A, Power (W) -
+  applied voltage, measured current, and calculated power (V*I)
 - A source that errors 5 times in a row is dropped from the run with
   one notice (no endless error spam); logging stops if all sources die
 
@@ -1778,6 +1812,312 @@ ANALYSIS:
         ttk.Button(tips_frame, text="📖 Show Usage Tips",
                    command=self.show_sg_tips).pack(side=tk.RIGHT)
 
+    # ==================== DC supply tab (BK 9174B) ====================
+    PSU_POLL_MS = 500       # live-readout cadence
+
+    def create_psu_tab(self):
+        """DC power supply (BK 9174B) control: per-channel V/I setpoint,
+        protection, live V/A/W readout, and an explicit output toggle."""
+        _tab = ScrollableTab(self.notebook)
+        self.notebook.add(_tab, text="DC Supply (BK 9174B)")
+        psu_frame = _tab.body
+
+        status_frame = ttk.LabelFrame(psu_frame, text="Connection", padding=10)
+        status_frame.pack(fill='x', padx=10, pady=10)
+        self.psu_status = tk.Label(status_frame, text="Not connected",
+                                   fg="red")
+        self.psu_status.pack(side=tk.LEFT)
+        ttk.Button(status_frame, text="Reconnect",
+                   command=self.reconnect_psu).pack(side=tk.RIGHT)
+        self.psu_live = tk.BooleanVar(value=False)
+        add_tooltip(ttk.Checkbutton(status_frame, text="Live readout",
+                                    variable=self.psu_live,
+                                    command=self.psu_start_live),
+                    "Poll measured voltage/current on both channels every "
+                    f"{self.PSU_POLL_MS/1000:g} s (read-only).").pack(
+            side=tk.RIGHT, padx=12)
+
+        note = tk.Label(
+            psu_frame, fg='#8a5a00', justify='left', anchor='w',
+            text="Safety: Apply sets the voltage and current limit but never "
+                 "switches the output — use the Output button (it confirms "
+                 "before energizing). Closing the app leaves the supply as-is "
+                 "(it may be powering a live load).")
+        note.pack(fill='x', padx=14, pady=(0, 6))
+
+        config_notebook = ttk.Notebook(psu_frame)
+        config_notebook.pack(fill='x', padx=10, pady=10)
+        self.psu_channel_widgets = {}
+        for ch in (1, 2):
+            ch_frame = ttk.Frame(config_notebook)
+            config_notebook.add(ch_frame, text=f"Channel {ch}")
+            self._psu_build_channel_panel(ch_frame, ch)
+
+        tips_frame = ttk.Frame(psu_frame)
+        tips_frame.pack(side=tk.BOTTOM, fill='x', padx=10, pady=5)
+        ttk.Button(tips_frame, text="📖 Show Usage Tips",
+                   command=self.show_psu_tips).pack(side=tk.RIGHT)
+
+    def _psu_build_channel_panel(self, parent, ch):
+        w = {}
+        self.psu_channel_widgets[ch] = w
+
+        setf = ttk.LabelFrame(parent, text="Setpoint", padding=10)
+        setf.pack(fill='x', padx=10, pady=8)
+        ttk.Label(setf, text="Set Voltage (V):").grid(row=0, column=0,
+                                                      sticky='w', pady=4)
+        w['set_v'] = ttk.Entry(setf, width=12)
+        w['set_v'].grid(row=0, column=1, padx=8)
+        w['set_v'].insert(0, '0')
+        ttk.Label(setf, text="Current Limit (A):").grid(row=0, column=2,
+                                                        sticky='w',
+                                                        padx=(16, 0))
+        w['set_i'] = ttk.Entry(setf, width=12)
+        w['set_i'].grid(row=0, column=3, padx=8)
+        w['set_i'].insert(0, '0.1')
+        add_tooltip(ttk.Button(setf, text="Apply V / I limit",
+                               command=lambda: self.psu_apply_channel(ch)),
+                    f"Send the voltage and current limit to CH{ch}. Does NOT "
+                    "switch the output on or off.").grid(row=0, column=4,
+                                                         padx=10)
+        ttk.Label(setf, foreground='#555',
+                  text="Dual-range:  ≤35 V → up to 3 A,   35–70 V → up to "
+                       "1.5 A").grid(row=1, column=0, columnspan=5, sticky='w',
+                                     pady=(6, 0))
+
+        protf = ttk.LabelFrame(parent, text="Protection", padding=10)
+        protf.pack(fill='x', padx=10, pady=8)
+        ttk.Label(protf, text="OVP (V):").grid(row=0, column=0, sticky='w',
+                                               pady=4)
+        w['ovp'] = ttk.Entry(protf, width=12)
+        w['ovp'].grid(row=0, column=1, padx=8)
+        w['ovp'].insert(0, '71')
+        ttk.Label(protf, text="OCP (A):").grid(row=0, column=2, sticky='w',
+                                               padx=(16, 0))
+        w['ocp'] = ttk.Entry(protf, width=12)
+        w['ocp'].grid(row=0, column=3, padx=8)
+        w['ocp'].insert(0, '3.1')
+        add_tooltip(ttk.Button(protf, text="Set Protection",
+                               command=lambda: self.psu_set_protection(ch)),
+                    f"Set over-voltage / over-current trip points for CH{ch}."
+                    ).grid(row=0, column=4, padx=10)
+
+        rdf = ttk.LabelFrame(parent, text="Readout", padding=10)
+        rdf.pack(fill='x', padx=10, pady=8)
+        big = ('TkDefaultFont', 15, 'bold')
+        ttk.Label(rdf, text="Set:").grid(row=0, column=0, sticky='e', padx=4)
+        w['rd_setv'] = tk.Label(rdf, text="—  V", width=12, anchor='w')
+        w['rd_setv'].grid(row=0, column=1, sticky='w')
+        ttk.Label(rdf, text="Power:").grid(row=1, column=0, sticky='e', padx=4)
+        w['rd_power'] = tk.Label(rdf, text="—  W", width=12, anchor='w',
+                                 font=big, fg='#1f3a5f')
+        w['rd_power'].grid(row=1, column=1, sticky='w')
+        ttk.Label(rdf, text="Meas V:").grid(row=0, column=2, sticky='e',
+                                            padx=(18, 4))
+        w['rd_measv'] = tk.Label(rdf, text="—  V", width=12, anchor='w',
+                                 font=big, fg='#2e7d32')
+        w['rd_measv'].grid(row=0, column=3, sticky='w')
+        ttk.Label(rdf, text="Meas I:").grid(row=1, column=2, sticky='e',
+                                            padx=(18, 4))
+        w['rd_measi'] = tk.Label(rdf, text="—  A", width=12, anchor='w',
+                                 font=big, fg='#2e7d32')
+        w['rd_measi'].grid(row=1, column=3, sticky='w')
+
+        w['output'] = tk.BooleanVar(value=False)
+        w['out_btn'] = tk.Button(rdf, text="Output: OFF", width=14,
+                                 command=lambda: self.psu_toggle_output(ch))
+        w['out_btn'].grid(row=0, column=4, rowspan=2, padx=24)
+        w['out_btn_bg'] = w['out_btn'].cget('bg')
+
+    def reconnect_psu(self):
+        self._reconnect('psu', BK9174B, self.psu_status,
+                        sync=self._psu_after_connect)
+
+    def psu_apply_channel(self, ch):
+        """Push voltage + current limit to a channel. Never switches output."""
+        if not self.psu:
+            messagebox.showerror("Error", "DC supply not connected")
+            return
+        w = self.psu_channel_widgets[ch]
+        try:
+            v = float(w['set_v'].get())
+            a = float(w['set_i'].get())
+        except (TypeError, ValueError) as e:
+            messagebox.showerror("Configuration Error",
+                                 f"Voltage and current limit must be numbers "
+                                 f"({e})")
+            return
+        try:                                   # friendly message on the main
+            self.psu._check_envelope(v, a)     # thread before the worker
+        except ValueError as e:
+            messagebox.showerror("Out of range", str(e))
+            return
+
+        def work():
+            with self.psu_lock:
+                self.psu.apply(ch, v, a)       # output=None -> left untouched
+
+        self._bg_simple(
+            work, f"CH{ch} set: {v:g} V, {a:g} A limit (output unchanged)",
+            busy='psu-io', err_title="Apply")
+
+    def psu_set_protection(self, ch):
+        if not self.psu:
+            messagebox.showerror("Error", "DC supply not connected")
+            return
+        w = self.psu_channel_widgets[ch]
+        try:
+            ovp = float(w['ovp'].get())
+            ocp = float(w['ocp'].get())
+        except (TypeError, ValueError) as e:
+            messagebox.showerror("Configuration Error",
+                                 f"OVP and OCP must be numbers ({e})")
+            return
+
+        def work():
+            with self.psu_lock:
+                self.psu.set_ovp(ch, ovp)
+                self.psu.set_ocp(ch, ocp)
+
+        self._bg_simple(work, f"CH{ch} protection: OVP {ovp:g} V, "
+                        f"OCP {ocp:g} A", busy='psu-io', err_title="Protection")
+
+    def psu_toggle_output(self, ch):
+        """Flip a channel output on/off; confirm before energizing."""
+        if not self.psu:
+            messagebox.showerror("Error", "DC supply not connected")
+            return
+        w = self.psu_channel_widgets[ch]
+        new_state = not w['output'].get()
+        if new_state:
+            try:
+                detail = (f"Enable CH{ch} output at {float(w['set_v'].get()):g}"
+                          f" V with a {float(w['set_i'].get()):g} A limit?")
+            except (TypeError, ValueError):
+                detail = f"Enable CH{ch} output?"
+            if not messagebox.askyesno(
+                    "Enable output",
+                    detail + "\n\nThis energizes the terminals."):
+                return
+
+        def done(_result, error):
+            if error:
+                messagebox.showerror("Error", str(error))
+                return
+            w['output'].set(new_state)
+            self._psu_set_output_button(ch, new_state)
+            self.status_bar.config(
+                text=f"CH{ch} output {'ON' if new_state else 'OFF'}")
+
+        def work():
+            with self.psu_lock:
+                self.psu.set_output(ch, new_state)
+
+        self._run_bg(work, done, busy='psu-io')
+
+    def _psu_set_output_button(self, ch, on):
+        btn = self.psu_channel_widgets[ch]['out_btn']
+        if on:
+            btn.config(text="Output: ON", bg='#2e7d32', fg='white',
+                       activebackground='#1b5e20', activeforeground='white')
+        else:
+            bg = self.psu_channel_widgets[ch]['out_btn_bg']
+            btn.config(text="Output: OFF", bg=bg, fg='black',
+                       activebackground=bg, activeforeground='black')
+
+    def _psu_show_reading(self, ch, r):
+        w = self.psu_channel_widgets[ch]
+        w['rd_setv'].config(text=f"{r['set_voltage_v']:.3f}  V")
+        w['rd_measv'].config(text=f"{r['meas_voltage_v']:.3f}  V")
+        w['rd_measi'].config(text=f"{r['meas_current_a']:.4f}  A")
+        w['rd_power'].config(text=f"{r['power_w']:.3f}  W")
+
+    def psu_start_live(self):
+        """Checkbox handler: (re)start the poller when ticked."""
+        if self.psu_live.get():
+            self._psu_poll()
+
+    def _psu_poll(self):
+        """Live readout: read both channels off the UI thread, then re-arm.
+        Re-arms unconditionally while ticked (a busy tick just skips, like the
+        LCR continuous poller)."""
+        if not self.psu_live.get():
+            return
+        if self.psu:
+            def work():
+                with self.psu_lock:
+                    return {c: self.psu.read_channel(c) for c in (1, 2)}
+
+            def done(readings, error):
+                if not error and readings:
+                    for c, r in readings.items():
+                        self._psu_show_reading(c, r)
+
+            self._run_bg(work, done, busy='psu-io', quiet=True)
+        self.psu_live_job = self.root.after(self.PSU_POLL_MS, self._psu_poll)
+
+    def _psu_after_connect(self):
+        """On (re)connect: pull each channel's setpoint + output state into
+        the UI and show one live reading. Read-only."""
+        if not self.psu:
+            return
+
+        def work():
+            out = {}
+            with self.psu_lock:
+                for ch in (1, 2):
+                    out[ch] = {
+                        'set_v': self.psu.get_setpoint_voltage(ch),
+                        'set_i': self.psu.get_setpoint_current(ch),
+                        'output': self.psu.get_output(ch),
+                        'reading': self.psu.read_channel(ch),
+                    }
+            return out
+
+        def done(data, error):
+            if error or not data:
+                return
+            for ch, d in data.items():
+                w = self.psu_channel_widgets[ch]
+                self._set_entry(w['set_v'], f"{d['set_v']:g}")
+                self._set_entry(w['set_i'], f"{d['set_i']:g}")
+                w['output'].set(bool(d['output']))
+                self._psu_set_output_button(ch, bool(d['output']))
+                self._psu_show_reading(ch, d['reading'])
+
+        self._run_bg(work, done, busy='psu-io', quiet=True)
+
+    def show_psu_tips(self):
+        tips = """DC Supply (BK 9174B) - Usage Tips
+
+WHAT IT IS:
+- Dual-output, dual-range programmable supply.
+  Each output:  0-35 V at up to 3 A,  or  35-70 V at up to 1.5 A (105 W).
+- Talks over its built-in serial port (CP2102 -> /dev/ttyUSB0), 57600 baud.
+
+SETTING AN OUTPUT:
+1. Pick the Channel tab (1 or 2).
+2. Type Set Voltage and Current Limit, then "Apply V / I limit".
+   - Apply NEVER switches the output -- it only stages V and the limit.
+   - Values are range-checked (>1.5 A above 35 V is refused).
+3. Press "Output: OFF" to energize -- it asks first, then turns green "ON".
+
+PROTECTION:
+- OVP/OCP set the hardware trip points; set them before enabling output.
+
+READOUT & LOGGING:
+- Tick "Live readout" for a 0.5 s measured V / I / power display.
+- To record over time, use the Data Logging tab: tick DC Supply CH1/CH2.
+  Each channel writes psu_chN_<timestamp>.csv with columns
+  Timestamp, Set V, Meas V, Meas A, Power (W) -- power is V*I.
+
+SAFETY:
+- Current-limit is constant-current, not a fuse: at the limit the supply
+  drops voltage to hold the current. Set it just above your expected draw.
+- Closing the app leaves the supply exactly as-is (it will NOT turn the
+  output off -- it may be powering something you care about)."""
+        messagebox.showinfo("DC Supply Tips", tips)
+
     def create_logging_tab(self):
         """Create data logging tab"""
         _tab = ScrollableTab(self.notebook)
@@ -1834,7 +2174,18 @@ ANALYSIS:
             ttk.Checkbutton(sg_frame, text=f"CH{ch}",
                             variable=var).pack(anchor='w')
             self.log_sg_channels[ch] = var
-        
+
+        # DC supply channels: applied V, measured A, calculated power over time.
+        psu_frame = ttk.LabelFrame(instr_frame, text="DC Supply (BK 9174B)",
+                                   padding=5)
+        psu_frame.pack(anchor='w', pady=5)
+        self.log_psu_channels = {}
+        for ch in (1, 2):
+            var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(psu_frame, text=f"CH{ch}",
+                            variable=var).pack(anchor='w')
+            self.log_psu_channels[ch] = var
+
         # Control buttons
         button_frame = ttk.Frame(config_frame)
         button_frame.grid(row=3, column=0, columnspan=3, pady=20)
@@ -2948,6 +3299,9 @@ ANALYSIS:
         for ch in (1, 2):
             if self.log_sg_channels[ch].get():
                 (selected if self.sg else missing).append(f'SigGen CH{ch}')
+        for ch in (1, 2):
+            if self.log_psu_channels[ch].get():
+                (selected if self.psu else missing).append(f'DC Supply CH{ch}')
         if missing:
             self.log_message("Skipping (not connected): " + ", ".join(missing))
         if not selected:
@@ -3039,6 +3393,11 @@ ANALYSIS:
                       ['Timestamp', 'Waveform', 'Frequency (Hz)',
                        'Amplitude (Vpp)', 'Offset (V)', 'Stdev (V)',
                        'Mean (V)', 'Output'])
+        # DC supply: applied voltage, measured current, calculated power.
+        for ch in (1, 2):
+            if self.log_psu_channels[ch].get() and self.psu:
+                _open(f'DC Supply CH{ch}', f"psu_ch{ch}_{stamp}.csv",
+                      ['Timestamp', 'Set V', 'Meas V', 'Meas A', 'Power (W)'])
 
         def _sample(key, fn):
             """One source sample; drops the source after repeated errors."""
@@ -3085,6 +3444,14 @@ ANALYSIS:
                                      bswv.get('STDEV'), bswv.get('MEAN'),
                                      'ON' if outp['state'] else 'OFF'])
                 _sample(f'SigGen CH{ch}', _sg_row)
+            for ch in (1, 2):
+                def _psu_row(writer, c=ch):
+                    with self.psu_lock:
+                        r = self.psu.read_channel(c)
+                    writer.writerow([now, r['set_voltage_v'],
+                                     r['meas_voltage_v'], r['meas_current_a'],
+                                     r['power_w']])
+                _sample(f'DC Supply CH{ch}', _psu_row)
             if not writers:
                 self.log_message("All logging sources failed -- stopping")
                 self.root.after(0, self._logging_failed)
