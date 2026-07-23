@@ -2352,7 +2352,8 @@ LOGGING:
         outf = ttk.LabelFrame(f, text="Output & Measurement", padding=10)
         outf.pack(fill='x', padx=10, pady=8)
         ttk.Label(outf, text="Output dir:").grid(row=0, column=0, sticky='e')
-        self.sldea_outdir = tk.StringVar(value="./sldea_runs")
+        self.sldea_outdir = tk.StringVar(value=os.environ.get(
+            'SCPI_SLDEA_DIR', '/mnt/shareDrive/robot_incubator/SLDEA_data'))
         ttk.Entry(outf, textvariable=self.sldea_outdir, width=34).grid(
             row=0, column=1, padx=6)
         ttk.Button(outf, text="Browse",
