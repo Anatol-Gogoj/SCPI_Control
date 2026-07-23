@@ -2542,12 +2542,16 @@ LOGGING:
         self._sldea_running = True
         self.sldea_run_btn.config(state='disabled')
         self.sldea_abort_btn.config(state='normal')
+        # Read the camera entries HERE, on the main thread -- Tk widgets must
+        # never be touched from the worker (it can hang the Tcl interpreter).
+        cam_exp = self._sldea_cam_value('cam_exposure', 6)
+        cam_gain = self._sldea_cam_value('cam_gain', 60)
         self._sldea_elapsed = 0.0
         self._sldea_log(f"{'DRY-RUN' if dry else 'LIVE HV'} start — {p.summary()}")
         threading.Thread(
             target=self._sldea_worker,
             args=(p, self.sldea_outdir.get(), self.sldea_runname.get().strip(),
-                  sgch, vch, ich, dry), daemon=True).start()
+                  sgch, vch, ich, dry, cam_exp, cam_gain), daemon=True).start()
         self.root.after(100, self._sldea_animate_cursor)   # scroll the playhead
 
     def sldea_abort(self):
@@ -2571,7 +2575,8 @@ LOGGING:
     def _sldea_set_status(self, text, fg='#555'):
         self.root.after(0, lambda: self.sldea_status.config(text=text, fg=fg))
 
-    def _sldea_worker(self, p, outdir, runname, sgch, vch, ich, dry):
+    def _sldea_worker(self, p, outdir, runname, sgch, vch, ich, dry,
+                      cam_exp=6, cam_gain=60):
         """Host-sequenced staircase runner (daemon thread; no Tk calls except
         via _sldea_log/_sldea_set_status/after). Drives the SG DC offset along
         p.kv_at(t), fires webcam+scope snapshots on schedule, writes the run
@@ -2584,36 +2589,33 @@ LOGGING:
         fh = None
         try:
             os.makedirs(framedir, exist_ok=True)
-            # --- camera: lock fully manual (WB off) so nothing drifts ---
-            spec = None
-            cam_info = '(no camera)'
-            try:
-                spec = webcam.resolve_camera(0)
-                if spec.get('kind') == 'bayer':
-                    dev = spec['device']
-                    webcam.set_control(dev, 'auto_exposure', 1)
-                    webcam.set_control(dev, 'white_balance_automatic', 0)
-                    exp = self._sldea_cam_value('cam_exposure', 6)
-                    gain = self._sldea_cam_value('cam_gain', 60)
-                    webcam.set_control(dev, 'exposure_time_absolute', exp)
-                    webcam.set_control(dev, 'gain', gain)
-                    cam_info = (f"{spec['w']}x{spec['h']} {spec['fourcc']}, "
-                                f"exposure {exp}, gain {gain}, WB off")
-            except Exception as e:
-                self._sldea_log(f"camera setup failed ({e}) — frames skipped")
-                spec = None
-            # --- setup.txt ---
+            # Write run metadata FIRST -- before any (possibly slow) camera
+            # setup -- so even an interrupted run leaves setup.txt + the header.
             with open(os.path.join(rundir, 'setup.txt'), 'w') as sf:
                 sf.write(p.setup_text(
                     runname or p.run_dirname(started),
                     started.isoformat(timespec='seconds'),
-                    sgch, vch, ich, dry, cam_info))
-            # --- data.csv ---
+                    sgch, vch, ich, dry,
+                    f"exposure {cam_exp}, gain {cam_gain}, WB off (manual)"))
             fh = open(os.path.join(rundir, 'data.csv'), 'w', newline='')
             writer = _csv.DictWriter(fh, fieldnames=p.CSV_COLUMNS)
             writer.writeheader()
             fh.flush()
             self._sldea_log(f"run dir: {rundir}")
+            # --- camera: lock fully manual (WB off) so nothing drifts ---
+            spec = None
+            try:
+                spec = webcam.resolve_camera(0)
+                if spec.get('kind') == 'bayer':
+                    dev = spec['device']
+                    for ctrl, val in (('auto_exposure', 1),
+                                      ('white_balance_automatic', 0),
+                                      ('exposure_time_absolute', cam_exp),
+                                      ('gain', cam_gain)):
+                        webcam.set_control(dev, ctrl, val)
+            except Exception as e:
+                self._sldea_log(f"camera setup failed ({e}) — frames skipped")
+                spec = None
             # --- SG: DC control voltage, output ON (live only) ---
             if not dry and self.sg:
                 self.sg.set_load_polarity(sgch, load='HZ', polarity='NOR')
