@@ -34,19 +34,20 @@ class FakeLCR(BK894):
 
 def test_get_config_recovers_from_desynced_reply():
     # The mode string desyncs into the numeric field on the first read; after
-    # a buffer clear + retry the meter answers cleanly.
+    # a buffer DRAIN + retry the meter answers cleanly.
     seq = {':FUNC:IMP?': ['CSRS', 'CSRS'],
            ':FREQ?': ['CSRS', '1.00000e+03'],   # desynced, then correct
-           ':VOLT?': ['1.00000e+00']}
+           ':VOLT?': ['1.00000e+00', '1.00000e+00']}
 
     class Retry(BK894):
         def __init__(self):
             self.calls = {}
-            self.cleared = 0
-            self.inst = types.SimpleNamespace(clear=self._clear)
+            self.drained = 0
+            self.inst = types.SimpleNamespace(timeout=2000, read=self._read)
 
-        def _clear(self):
-            self.cleared += 1
+        def _read(self):
+            self.drained += 1
+            raise Exception("buffer empty")     # ends the drain loop
 
         def ask(self, cmd):
             i = self.calls.get(cmd, 0)
@@ -58,7 +59,25 @@ def test_get_config_recovers_from_desynced_reply():
     cfg = lcr.get_config()
     assert cfg['frequency'] == 1000.0 and cfg['voltage'] == 1.0
     assert cfg['mode'] == 'CSRS'
-    assert lcr.cleared == 1              # cleared once and retried
+    assert lcr.drained >= 1                     # it drained and retried
+
+
+def test_get_config_degrades_instead_of_raising():
+    # A persistent desync (every query returns the mode) must NOT raise --
+    # numeric fields come back None so the sync degrades, no footer error.
+    class Stuck(BK894):
+        def __init__(self):
+            self.inst = types.SimpleNamespace(timeout=2000, read=self._read)
+
+        def _read(self):
+            raise Exception("buffer empty")
+
+        def ask(self, cmd):
+            return 'CSRS'
+
+    cfg = Stuck().get_config()
+    assert cfg['mode'] == 'CSRS'
+    assert cfg['frequency'] is None and cfg['voltage'] is None
 
 
 def test_parse_aperture():

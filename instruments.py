@@ -172,6 +172,25 @@ class VisaInstrument:
         except Exception:
             pass
 
+    def _drain(self):
+        """Discard any pending/stale bytes in the input buffer so the next
+        query reads its OWN reply. More forceful than inst.clear() (which
+        does not reliably flush every meter): reads with a short timeout until
+        the buffer is empty. Silent."""
+        old = getattr(self.inst, 'timeout', None)
+        try:
+            self.inst.timeout = 60
+            for _ in range(20):
+                self.inst.read()          # discard a stale reply
+        except Exception:
+            pass                          # timeout -> buffer empty
+        finally:
+            if old is not None:
+                try:
+                    self.inst.timeout = old
+                except Exception:
+                    pass
+
     def go_local(self):
         """Best-effort return-to-local so the front panel works again after
         the app quits. pyvisa-py ASSERTS remote on USB-TMC connect (and any
@@ -277,31 +296,29 @@ class BK894(VisaInstrument):
         return float(primary), float(secondary), int(status)
 
     def get_config(self):
-        try:
-            return self._read_config()
-        except ValueError:
-            # A mismatched reply (e.g. the mode string 'CSRS' landing in a
-            # numeric field -- a stale/desynced I/O buffer). Clear the meter's
-            # buffers and read once more before giving up.
-            try:
-                self.inst.clear()
-            except Exception:
-                pass
-            return self._read_config()
+        """Read mode/frequency/voltage, resilient to a stale/desynced reply
+        (the mode string 'CSRS' bleeding into a numeric field -- an off-by-one
+        where every query returns the previous query's answer). On a bad
+        numeric field it DRAINS the input buffer (which realigns the meter --
+        inst.clear() alone does not reliably flush this unit) and re-reads, up
+        to 3 tries. Never raises: a field that still won't parse comes back
+        None so the config sync degrades instead of erroring in the footer."""
+        mode = freq = volt = None
+        for attempt in range(3):
+            if attempt:
+                self._drain()
+            mode = self.ask(':FUNC:IMP?')
+            freq = self._try_float(':FREQ?')
+            volt = self._try_float(':VOLT?')
+            if freq is not None and volt is not None:
+                break
+        return {'mode': mode, 'frequency': freq, 'voltage': volt}
 
-    def _read_config(self):
-        return {
-            'mode': self.ask(':FUNC:IMP?'),
-            'frequency': self._ask_float(':FREQ?'),
-            'voltage': self._ask_float(':VOLT?'),
-        }
-
-    def _ask_float(self, cmd):
+    def _try_float(self, cmd):
         raw = self.ask(cmd)
-        m = re.match(r'[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?', raw.strip())
-        if not m:
-            raise ValueError(f"{cmd} returned non-numeric {raw!r}")
-        return float(m.group())
+        m = re.match(r'[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?',
+                     (raw or '').strip())
+        return float(m.group()) if m else None
 
     # -- DC bias / aperture / range / fixture correction (issue #44) ------
     # Query forms bench-verified 2026-07-10 on this unit (fw 1.0.5):
