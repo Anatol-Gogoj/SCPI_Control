@@ -2886,10 +2886,12 @@ LOGGING:
                 self.status_bar.config(text=f"Error reading config: {error}")
                 return
             config = data['config']
-            self.lcr_mode.set(config['mode'].upper())
-            self.lcr_applied_mode = config['mode'].upper()
-            self._set_entry(self.lcr_freq, int(config['frequency']))
-            if 'voltage' in config:
+            if config.get('mode'):
+                self.lcr_mode.set(config['mode'].upper())
+                self.lcr_applied_mode = config['mode'].upper()
+            if config.get('frequency') is not None:
+                self._set_entry(self.lcr_freq, int(config['frequency']))
+            if config.get('voltage') is not None:
                 self._set_entry(self.lcr_volt, config['voltage'])
             if 'bias' in data:
                 self._set_entry(self.lcr_bias_volt, data['bias']['volts'])
