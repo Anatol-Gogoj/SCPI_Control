@@ -1139,6 +1139,81 @@ class BK9174B:
                 'power_w': meas_v * meas_i}
 
 
+class BK5493C:
+    """B&K Precision 5493C 6.5-digit bench DMM over LAN.
+
+    NOT USB-TMC / VXI-11: the 5493C's LAN SCPI is a plain TCP socket on the
+    non-standard **port 45454** (this unit's USB enumeration failed -- issue
+    #5 -- so it is driven over Ethernet). Opened through pyvisa-py as a SOCKET
+    resource. The meter's IP is set on its LAN menu ("DHCP Once" puts it on
+    the bench 192.168.68.0/22); override the default with SCPI_DMM_ADDR.
+
+        dmm = BK5493C(addr='192.168.68.58')
+        dmm.measure('DC Voltage')   # -> float volts
+
+    Verified 2026-07-22: IDN 'BK Precision,5493C,W117229033,V1.4.19'.
+    """
+    DEFAULT_ADDR = '192.168.68.58'
+    PORT = 45454
+    # (label, SCPI MEASure query, unit) -- MEAS auto-ranges + returns a reading
+    FUNCTIONS = (
+        ('DC Voltage', 'MEAS:VOLT:DC?', 'V'),
+        ('AC Voltage', 'MEAS:VOLT:AC?', 'V'),
+        ('DC Current', 'MEAS:CURR:DC?', 'A'),
+        ('AC Current', 'MEAS:CURR:AC?', 'A'),
+        ('2W Resistance', 'MEAS:RES?', 'ohm'),
+        ('4W Resistance', 'MEAS:FRES?', 'ohm'),
+        ('Frequency', 'MEAS:FREQ?', 'Hz'),
+        ('Capacitance', 'MEAS:CAP?', 'F'),
+    )
+    _QUERY = {label: q for label, q, u in FUNCTIONS}
+    _UNIT = {label: u for label, q, u in FUNCTIONS}
+
+    def __init__(self, addr=None, rm=None, resource=None, transport=None,
+                 identify=True):
+        if transport is not None:                 # injected fake for tests
+            self.inst = transport
+            self.resource = resource or 'FAKE::DMM'
+        else:
+            rm = rm if rm is not None else get_resource_manager()
+            self.resource = resource or \
+                f'TCPIP0::{addr or self.DEFAULT_ADDR}::{self.PORT}::SOCKET'
+            self.inst = rm.open_resource(self.resource)
+            self.inst.read_termination = '\n'
+            self.inst.write_termination = '\n'
+            self.inst.timeout = 5000
+        self.idn = self.inst.query('*IDN?').strip() if identify else ''
+
+    @classmethod
+    def function_labels(cls):
+        return [label for label, q, u in cls.FUNCTIONS]
+
+    def unit(self, function):
+        return self._UNIT.get(function, '')
+
+    def measure(self, function):
+        """Trigger + read one measurement of `function`; float, or None if the
+        meter returns a non-numeric (e.g. overload)."""
+        q = self._QUERY.get(function)
+        if q is None:
+            raise ValueError(f"unknown DMM function {function!r}")
+        raw = self.inst.query(q).strip()
+        try:
+            return float(raw)
+        except ValueError:
+            return None
+
+    def query(self, command):
+        """Raw SCPI passthrough (e.g. SYST:ERR?)."""
+        return self.inst.query(command).strip()
+
+    def close(self):
+        try:
+            self.inst.close()
+        except Exception:
+            pass
+
+
 # --------------------------------------------------------------------------
 # Smoke test
 # --------------------------------------------------------------------------

@@ -30,7 +30,7 @@ from datetime import datetime
 import bench_profiles
 from bench_profiles import BenchProfileStore
 import presets_path
-from instruments import BK894, TekMSO24, BK4055B, BK9174B
+from instruments import BK894, TekMSO24, BK4055B, BK9174B, BK5493C
 import lcr_format
 import scope_trace
 import siggen_presets
@@ -211,6 +211,8 @@ class InstrumentControlGUI:
         self.scope = None
         self.sg = None
         self.psu = None
+        self.dmm = None
+        self.dmm_live_job = None
         # The DC supply is on a stateful serial link (INST:SEL then query);
         # the live-readout poller and the logging thread both reach it, so
         # every PSU serial op is serialised through this lock.
@@ -259,6 +261,7 @@ class InstrumentControlGUI:
                              ("oscilloscope", self.create_scope_tab),
                              ("signal generator", self.create_sg_tab),
                              ("DC supply", self.create_psu_tab),
+                             ("DMM", self.create_dmm_tab),
                              ("data logging", self.create_logging_tab),
                              ("battery data", self.create_battery_tab),
                              ("webcam", self.create_webcam_tab),
@@ -550,14 +553,14 @@ class InstrumentControlGUI:
         """Connect to all instruments in the background at startup."""
         if not INSTRUMENTS_SUPPORTED:
             for label in (self.lcr_status, self.scope_status,
-                          self.sg_status, self.psu_status):
+                          self.sg_status, self.psu_status, self.dmm_status):
                 label.config(text=NOT_LINUX_SHORT, fg="#8a5a00")
             self.status_bar.config(
                 text="Non-Linux platform: instrument tabs are view/edit "
                      "only; Battery Data and Webcam are fully available")
             return
         for label in (self.lcr_status, self.scope_status, self.sg_status,
-                      self.psu_status):
+                      self.psu_status, self.dmm_status):
             label.config(text="Connecting...", fg="#b36b00")
 
         def work():
@@ -566,7 +569,8 @@ class InstrumentControlGUI:
             results = {}
             for key, factory in (('lcr', BK894), ('scope', TekMSO24),
                                  ('sg', self._connect_sg),
-                                 ('psu', self._connect_psu)):
+                                 ('psu', self._connect_psu),
+                                 ('dmm', self._connect_dmm)):
                 try:
                     results[key] = factory()
                 except Exception as e:
@@ -601,6 +605,19 @@ class InstrumentControlGUI:
         return BK9174B(port=port)
 
     @staticmethod
+    def _connect_dmm():
+        """Connect the BK5493C DMM over LAN (raw socket, port 45454). Probes
+        reachability first so a missing meter never stalls start-up.
+        SCPI_DMM_ADDR overrides the IP; empty disables auto-connect."""
+        addr = os.environ.get('SCPI_DMM_ADDR', BK5493C.DEFAULT_ADDR)
+        if not addr:
+            raise RuntimeError("DMM auto-connect disabled (SCPI_DMM_ADDR empty)")
+        resource = f'TCPIP0::{addr}::{BK5493C.PORT}::SOCKET'
+        if not _lan_reachable(resource):
+            raise RuntimeError(f"DMM not reachable at {addr}:{BK5493C.PORT}")
+        return BK5493C(addr=addr)
+
+    @staticmethod
     def _transport(inst):
         res = str(getattr(inst, 'resource', ''))
         if res.startswith('TCPIP'):
@@ -618,7 +635,8 @@ class InstrumentControlGUI:
                 ('lcr', self.lcr_status, self.update_lcr_config),
                 ('scope', self.scope_status, None),
                 ('sg', self.sg_status, self.update_sg_config),
-                ('psu', self.psu_status, self._psu_after_connect)):
+                ('psu', self.psu_status, self._psu_after_connect),
+                ('dmm', self.dmm_status, None)):
             inst = results.get(key)
             if isinstance(inst, Exception) or inst is None:
                 label.config(text=f"Not connected: {inst}", fg="red")
@@ -2127,6 +2145,141 @@ SAFETY:
   output off -- it may be powering something you care about)."""
         messagebox.showinfo("DC Supply Tips", tips)
 
+    # ==================== DMM tab (BK 5493C) ====================
+    DMM_POLL_MS = 500
+
+    def create_dmm_tab(self):
+        """Bench DMM (BK 5493C) over LAN: pick a function, live reading."""
+        _tab = ScrollableTab(self.notebook)
+        self.notebook.add(_tab, text="DMM (BK 5493C)")
+        frame = _tab.body
+
+        status_frame = ttk.LabelFrame(frame, text="Connection", padding=10)
+        status_frame.pack(fill='x', padx=10, pady=10)
+        self.dmm_status = tk.Label(status_frame, text="Not connected", fg="red")
+        self.dmm_status.pack(side=tk.LEFT)
+        ttk.Button(status_frame, text="Reconnect",
+                   command=self.reconnect_dmm).pack(side=tk.RIGHT)
+        self.dmm_addr = ttk.Entry(status_frame, width=15)
+        self.dmm_addr.insert(0, os.environ.get('SCPI_DMM_ADDR',
+                                               BK5493C.DEFAULT_ADDR))
+        self.dmm_addr.pack(side=tk.RIGHT, padx=(0, 6))
+        add_tooltip(self.dmm_addr,
+                    "DMM IP (LAN socket, port 45454). Set on the meter's LAN "
+                    "menu; 'DHCP Once' puts it on the bench subnet.")
+        ttk.Label(status_frame, text="IP:").pack(side=tk.RIGHT, padx=(12, 2))
+
+        meas = ttk.LabelFrame(frame, text="Measurement", padding=12)
+        meas.pack(fill='x', padx=10, pady=10)
+        ttk.Label(meas, text="Function:").grid(row=0, column=0, sticky='e',
+                                               padx=4)
+        self.dmm_function = ttk.Combobox(meas, width=16, state='readonly',
+                                         values=BK5493C.function_labels())
+        self.dmm_function.set('DC Voltage')
+        self.dmm_function.grid(row=0, column=1, sticky='w', padx=4)
+        self.dmm_live = tk.BooleanVar(value=False)
+        add_tooltip(ttk.Checkbutton(meas, text="Live reading",
+                                    variable=self.dmm_live,
+                                    command=self.dmm_start_live),
+                    f"Poll the selected function every "
+                    f"{self.DMM_POLL_MS/1000:g} s.").grid(row=0, column=2,
+                                                          padx=12)
+        ttk.Button(meas, text="Read once",
+                   command=self.dmm_read_once).grid(row=0, column=3, padx=4)
+
+        self.dmm_reading = tk.Label(meas, text="—",
+                                    font=('TkDefaultFont', 28, 'bold'),
+                                    fg='#2e7d32')
+        self.dmm_reading.grid(row=1, column=0, columnspan=4, pady=(12, 0))
+        self.dmm_reading_sub = tk.Label(meas, text="", fg='#555')
+        self.dmm_reading_sub.grid(row=2, column=0, columnspan=4, pady=(0, 4))
+
+        tips = ttk.Frame(frame)
+        tips.pack(side=tk.BOTTOM, fill='x', padx=10, pady=5)
+        ttk.Button(tips, text="📖 Show Usage Tips",
+                   command=self.show_dmm_tips).pack(side=tk.RIGHT)
+
+    def reconnect_dmm(self):
+        addr = self.dmm_addr.get().strip() or BK5493C.DEFAULT_ADDR
+
+        def factory():
+            resource = f'TCPIP0::{addr}::{BK5493C.PORT}::SOCKET'
+            if not _lan_reachable(resource):
+                raise RuntimeError(f"DMM not reachable at {addr}:{BK5493C.PORT}")
+            return BK5493C(addr=addr)
+
+        self._reconnect('dmm', factory, self.dmm_status)
+
+    @staticmethod
+    def _eng(val, unit):
+        """Engineering-notation reading with an SI prefix (16.74 µV)."""
+        import math
+        if val == 0 or not math.isfinite(val):
+            return f"{val:g} {unit}"
+        pre = {-12: 'p', -9: 'n', -6: 'µ', -3: 'm', 0: '', 3: 'k', 6: 'M',
+               9: 'G'}
+        exp = int(math.floor(math.log10(abs(val)) / 3) * 3)
+        exp = max(-12, min(9, exp))
+        return f"{val / 10 ** exp:.5g} {pre[exp]}{unit}"
+
+    def _dmm_show(self, fn, val):
+        unit = self.dmm.unit(fn) if self.dmm else ''
+        if val is None:
+            self.dmm_reading.config(text="OVLD", fg='#c62828')
+            self.dmm_reading_sub.config(text=f"{fn} — overload / no reading")
+        else:
+            self.dmm_reading.config(text=self._eng(val, unit), fg='#2e7d32')
+            self.dmm_reading_sub.config(text=f"{fn}    ({val:.6g} {unit})")
+
+    def dmm_read_once(self):
+        if not self.dmm:
+            messagebox.showerror("Error", "DMM not connected")
+            return
+        fn = self.dmm_function.get()
+        self._run_bg(lambda: self.dmm.measure(fn),
+                     lambda val, err: (messagebox.showerror("Error", str(err))
+                                       if err else self._dmm_show(fn, val)),
+                     busy='dmm-io')
+
+    def dmm_start_live(self):
+        if self.dmm_live.get():
+            self._dmm_poll()
+
+    def _dmm_poll(self):
+        if not self.dmm_live.get():
+            return
+        if self.dmm:
+            fn = self.dmm_function.get()
+
+            def done(val, error):
+                if not error:
+                    self._dmm_show(fn, val)
+            self._run_bg(lambda: self.dmm.measure(fn), done, busy='dmm-io',
+                         quiet=True)
+        self.dmm_live_job = self.root.after(self.DMM_POLL_MS, self._dmm_poll)
+
+    def show_dmm_tips(self):
+        tips = """DMM (BK 5493C) - Usage Tips
+
+CONNECTION:
+- LAN only on this unit (USB enumeration failed). It speaks SCPI over a
+  raw socket on the non-standard port 45454.
+- Set the meter's IP on its front panel (Menu -> I/O / LAN). "DHCP Once"
+  grabs an address on the bench subnet; type that IP here and Reconnect.
+- Override the auto-connect IP with the SCPI_DMM_ADDR environment variable.
+
+USE:
+- Pick a Function (DC/AC volts, DC/AC current, 2W/4W resistance, frequency,
+  capacitance), then "Read once" or tick "Live reading" for a ~2 Hz display.
+- The big number is engineering-formatted (e.g. 16.74 mV); the line under it
+  shows the raw value + unit.
+- Overload / non-numeric replies show as OVLD.
+
+LOGGING:
+- Tick "DMM" on the Data Logging tab to record the selected function to CSV
+  alongside the other instruments."""
+        messagebox.showinfo("DMM Tips", tips)
+
     # ==================== SLDEA test tab ====================
     # A dedicated Single-Layer DEA characterisation tab: plug in a voltage
     # staircase (no arb authoring), preview it, and run it host-sequenced --
@@ -2601,6 +2754,11 @@ SAFETY:
             ttk.Checkbutton(psu_frame, text=f"CH{ch}",
                             variable=var).pack(anchor='w')
             self.log_psu_channels[ch] = var
+
+        # DMM: the function currently selected on the DMM tab.
+        self.log_dmm = tk.BooleanVar(value=False)
+        ttk.Checkbutton(instr_frame, text="DMM (BK 5493C — selected function)",
+                        variable=self.log_dmm).pack(anchor='w', pady=5)
 
         # Control buttons
         button_frame = ttk.Frame(config_frame)
@@ -3718,6 +3876,12 @@ SAFETY:
         for ch in (1, 2):
             if self.log_psu_channels[ch].get():
                 (selected if self.psu else missing).append(f'DC Supply CH{ch}')
+        if self.log_dmm.get():
+            (selected if self.dmm else missing).append('DMM')
+        # Capture the DMM function on the main thread (the worker must not read
+        # Tk widgets); used by logging_loop.
+        self._log_dmm_fn = (self.dmm_function.get()
+                            if hasattr(self, 'dmm_function') else 'DC Voltage')
         if missing:
             self.log_message("Skipping (not connected): " + ", ".join(missing))
         if not selected:
@@ -3814,6 +3978,9 @@ SAFETY:
             if self.log_psu_channels[ch].get() and self.psu:
                 _open(f'DC Supply CH{ch}', f"psu_ch{ch}_{stamp}.csv",
                       ['Timestamp', 'Set V', 'Meas V', 'Meas A', 'Power (W)'])
+        if self.log_dmm.get() and self.dmm:
+            _open('DMM', f"dmm_{stamp}.csv",
+                  ['Timestamp', 'Function', 'Value', 'Unit'])
 
         def _sample(key, fn):
             """One source sample; drops the source after repeated errors."""
@@ -3868,6 +4035,13 @@ SAFETY:
                                      r['meas_voltage_v'], r['meas_current_a'],
                                      r['power_w']])
                 _sample(f'DC Supply CH{ch}', _psu_row)
+
+            def _dmm_row(writer):
+                fn = self._log_dmm_fn
+                val = self.dmm.measure(fn)
+                writer.writerow([now, fn, '' if val is None else val,
+                                 self.dmm.unit(fn)])
+            _sample('DMM', _dmm_row)
             if not writers:
                 self.log_message("All logging sources failed -- stopping")
                 self.root.after(0, self._logging_failed)
