@@ -35,6 +35,9 @@ import lcr_format
 import scope_trace
 import siggen_presets
 from siggen_presets import SignalGenPresetStore
+import sldea_profile
+from sldea_profile import (SldeaProfile, control_v_for_kv, measured_kv,
+                           measured_ua, fmt_duration)
 from ui_widgets import ScrollableTab, SplashScreen, add_tooltip
 from arb_editor import ArbWaveformEditor
 from waveform_render import unit_waveform, scale_waveform
@@ -214,6 +217,11 @@ class InstrumentControlGUI:
         self.psu_lock = threading.Lock()
         self.psu_channel_widgets = {}
         self.psu_live_job = None
+        # SLDEA test state (host-sequenced staircase runner in a daemon thread)
+        self.sldea_vars = {}
+        self._sldea_profile = None
+        self._sldea_running = False
+        self._sldea_stop = False
         self.recording = False
         self.record_thread = None
         # Keys of background instrument operations in flight (issue #40) --
@@ -253,7 +261,8 @@ class InstrumentControlGUI:
                              ("DC supply", self.create_psu_tab),
                              ("data logging", self.create_logging_tab),
                              ("battery data", self.create_battery_tab),
-                             ("webcam", self.create_webcam_tab)):
+                             ("webcam", self.create_webcam_tab),
+                             ("SLDEA test", self.create_sldea_tab)):
             self._progress(f"Loading {label}...")
             build()
         
@@ -2117,6 +2126,413 @@ SAFETY:
 - Closing the app leaves the supply exactly as-is (it will NOT turn the
   output off -- it may be powering something you care about)."""
         messagebox.showinfo("DC Supply Tips", tips)
+
+    # ==================== SLDEA test tab ====================
+    # A dedicated Single-Layer DEA characterisation tab: plug in a voltage
+    # staircase (no arb authoring), preview it, and run it host-sequenced --
+    # the SG drives a DC control voltage into a Trek HV amp (1 V = 1 kV), the
+    # scope reads the Trek V_Out/I_Out monitors, and the webcam snapshots each
+    # landing for the later area-vs-voltage edge trace. The DC supply tab is
+    # unrelated to this. Profile math lives in sldea_profile.py.
+
+    SLDEA_POLL_S = 0.1
+
+    def create_sldea_tab(self):
+        _tab = ScrollableTab(self.notebook)
+        self.notebook.add(_tab, text="SLDEA Test")
+        f = _tab.body
+
+        inp = ttk.LabelFrame(f, text="Test Profile (voltages in kV; "
+                             "1 V control = 1 kV, Trek max 10 kV)", padding=10)
+        inp.pack(fill='x', padx=10, pady=8)
+
+        def field(r, c, label, key, default, tip=None):
+            ttk.Label(inp, text=label).grid(row=r, column=c*2, sticky='e',
+                                            pady=3, padx=(8, 2))
+            e = ttk.Entry(inp, width=8)
+            e.insert(0, str(default))
+            e.grid(row=r, column=c*2+1, sticky='w', padx=(0, 10))
+            e.bind('<KeyRelease>', lambda _ev: self._sldea_refresh())
+            if tip:
+                add_tooltip(e, tip)
+            self.sldea_vars[key] = e
+
+        field(0, 0, "Start (kV):", 'start_kv', 0,
+              "First voltage. 0 kV is captured as the baseline, not held.")
+        field(0, 1, "End (kV):", 'end_kv', 10, "Final voltage (<= 10 kV).")
+        field(0, 2, "Step (kV):", 'step_kv', 0.25, "Voltage increment per step.")
+        field(1, 0, "Ramp (s):", 'ramp_s', 5, "Transition time between levels.")
+        field(1, 1, "Landing (s):", 'landing_s', 60, "Hold time at each level.")
+        field(1, 2, "Settle (s):", 'settle_s', 2,
+              "Wait after the ramp before the post-ramp snapshot.")
+        field(2, 0, "Snap lead (s):", 'snap_lead_s', 1,
+              "How long before the next step to take the pre-step snapshot.")
+        field(2, 1, "Repeat:", 'repeat', 1, "Repeat the whole sweep N times.")
+
+        self.sldea_updown = tk.BooleanVar(value=False)
+        ttk.Checkbutton(inp, text="Up/down (hysteresis)",
+                        variable=self.sldea_updown,
+                        command=self._sldea_refresh).grid(row=2, column=4,
+                                                          columnspan=2,
+                                                          sticky='w')
+        self.sldea_baseline = tk.BooleanVar(value=True)
+        ttk.Checkbutton(inp, text="0 kV baseline frame",
+                        variable=self.sldea_baseline,
+                        command=self._sldea_refresh).grid(row=3, column=4,
+                                                          columnspan=2,
+                                                          sticky='w')
+        self.sldea_summary = tk.Label(inp, text="", fg='#1f3a5f', anchor='w',
+                                      justify='left')
+        self.sldea_summary.grid(row=4, column=0, columnspan=6, sticky='w',
+                                pady=(6, 0))
+
+        prev = ttk.LabelFrame(f, text="Preview — kV vs time  "
+                              "(● baseline  ● post-ramp  ● pre-step)", padding=6)
+        prev.pack(fill='x', padx=10, pady=8)
+        self.sldea_canvas = tk.Canvas(prev, height=210, bg='white',
+                                      highlightthickness=0)
+        self.sldea_canvas.pack(fill='x')
+        self.sldea_canvas.bind('<Configure>', lambda _ev: self._sldea_redraw())
+
+        outf = ttk.LabelFrame(f, text="Output & Measurement", padding=10)
+        outf.pack(fill='x', padx=10, pady=8)
+        ttk.Label(outf, text="Output dir:").grid(row=0, column=0, sticky='e')
+        self.sldea_outdir = tk.StringVar(value="./sldea_runs")
+        ttk.Entry(outf, textvariable=self.sldea_outdir, width=34).grid(
+            row=0, column=1, padx=6)
+        ttk.Button(outf, text="Browse",
+                   command=self._sldea_browse_out).grid(row=0, column=2)
+        ttk.Label(outf, text="Run name (blank = auto):").grid(row=1, column=0,
+                                                              sticky='e')
+        self.sldea_runname = ttk.Entry(outf, width=26)
+        self.sldea_runname.grid(row=1, column=1, sticky='w', padx=6)
+        for r, lbl, key, default, vals in (
+                (0, "V_Out scope CH:", 'vch', '2', ['1', '2', '3', '4']),
+                (1, "I_Out scope CH:", 'ich', '3', ['1', '2', '3', '4']),
+                (2, "SG CH:", 'sgch', '2', ['1', '2'])):
+            ttk.Label(outf, text=lbl).grid(row=r, column=3, sticky='e',
+                                           padx=(16, 2))
+            cb = ttk.Combobox(outf, width=4, state='readonly', values=vals)
+            cb.set(default)
+            cb.grid(row=r, column=4, sticky='w')
+            self.sldea_vars[key] = cb
+
+        runf = ttk.Frame(f)
+        runf.pack(fill='x', padx=10, pady=8)
+        self.sldea_dryrun = tk.BooleanVar(value=True)
+        self.sldea_dry_cb = tk.Checkbutton(
+            runf, text="DRY RUN — HV OFF", variable=self.sldea_dryrun,
+            command=self._sldea_dry_toggle, font=('TkDefaultFont', 10, 'bold'),
+            indicatoron=True, padx=6)
+        self.sldea_dry_cb.pack(side=tk.LEFT, padx=4)
+        self.sldea_run_btn = tk.Button(runf, text="▶ Run", command=self.sldea_run,
+                                       font=('TkDefaultFont', 10, 'bold'),
+                                       fg='white', width=16)
+        self.sldea_run_btn.pack(side=tk.LEFT, padx=8)
+        self.sldea_abort_btn = ttk.Button(runf, text="■ Abort",
+                                          command=self.sldea_abort,
+                                          state='disabled')
+        self.sldea_abort_btn.pack(side=tk.LEFT)
+        self.sldea_status = tk.Label(runf, text="idle", anchor='w', fg='#555')
+        self.sldea_status.pack(side=tk.LEFT, padx=12)
+
+        logf = ttk.LabelFrame(f, text="Run log", padding=6)
+        logf.pack(fill='both', expand=True, padx=10, pady=8)
+        self.sldea_log = tk.Text(logf, height=8, state='disabled')
+        self.sldea_log.pack(fill='both', expand=True)
+
+        self._sldea_dry_toggle()
+        self._sldea_refresh()
+
+    def _sldea_build_profile(self):
+        try:
+            g = lambda k: self.sldea_vars[k].get()
+            p = SldeaProfile(
+                start_kv=float(g('start_kv')), end_kv=float(g('end_kv')),
+                step_kv=float(g('step_kv')), ramp_s=float(g('ramp_s')),
+                landing_s=float(g('landing_s')), settle_s=float(g('settle_s')),
+                snap_lead_s=float(g('snap_lead_s')),
+                repeat=int(float(g('repeat'))),
+                updown=self.sldea_updown.get(),
+                baseline=self.sldea_baseline.get())
+            return p, None
+        except (ValueError, KeyError) as e:
+            return None, str(e)
+
+    def _sldea_refresh(self):
+        p, err = self._sldea_build_profile()
+        self._sldea_profile = p
+        if p:
+            self.sldea_summary.config(
+                text=p.summary() + "   |   control 0–"
+                f"{control_v_for_kv(max(p.levels)):g} V", fg='#1f3a5f')
+        else:
+            self.sldea_summary.config(text=f"⚠ {err}", fg='red')
+        self._sldea_redraw()
+
+    def _sldea_redraw(self):
+        c = self.sldea_canvas
+        c.delete('all')
+        p = self._sldea_profile
+        w = c.winfo_width() or 700
+        h = c.winfo_height() or 210
+        mL, mR, mT, mB = 52, 14, 26, 26
+        x0, y0, x1, y1 = mL, mT, w - mR, h - mB
+        c.create_line(x0, y1, x1, y1)
+        c.create_line(x0, y0, x0, y1)
+        if not p:
+            c.create_text(w / 2, h / 2, text="enter valid values", fill='#999')
+            return
+        total = p.total_duration_s or 1.0
+        vmax = max([p.end_kv] + p.levels) or 1.0
+
+        def X(t):
+            return x0 + (x1 - x0) * t / total
+
+        def Y(v):
+            return y1 - (y1 - y0) * v / vmax
+        pts = []
+        for kind, t0, t1, a, b in p.segments:
+            pts += [X(t0), Y(a), X(t1), Y(b)]
+        if pts:
+            c.create_line(*pts, fill='#1565c0', width=2)
+        colour = {'baseline': '#888888', 'post': '#2e7d32', 'pre': '#c62828'}
+        for s in p.snapshots:
+            x, y = X(s['t']), Y(s['nominal_kv'])
+            c.create_oval(x - 3, y - 3, x + 3, y + 3,
+                          fill=colour.get(s['tag'], '#000'), outline='')
+        c.create_text(x0 - 6, Y(vmax), text=f"{vmax:g} kV", anchor='e',
+                      font=('TkDefaultFont', 7))
+        c.create_text(x0 - 6, y1, text="0", anchor='e',
+                      font=('TkDefaultFont', 7))
+        c.create_text(x1, y1 + 12, text=fmt_duration(total), anchor='e',
+                      font=('TkDefaultFont', 7), fill='#555')
+        c.create_text(x0 + 4, y0 - 14, anchor='w', font=('TkDefaultFont', 7),
+                      fill='#555', text=f"{p.n_frames} frames")
+
+    def _sldea_dry_toggle(self):
+        if self.sldea_dryrun.get():
+            self.sldea_dry_cb.config(bg='#fff3cd', fg='#8a5a00',
+                                     selectcolor='#fff3cd')
+            self.sldea_run_btn.config(text="▶ Run (DRY)", bg='#8a5a00',
+                                      activebackground='#6d4700')
+        else:
+            self.sldea_dry_cb.config(bg='#f8d7da', fg='#a01010',
+                                     selectcolor='#f8d7da')
+            self.sldea_run_btn.config(text="▶ Run — LIVE HV", bg='#c62828',
+                                      activebackground='#8e1a1a')
+
+    def _sldea_browse_out(self):
+        d = filedialog.askdirectory()
+        if d:
+            self.sldea_outdir.set(d)
+
+    def sldea_run(self):
+        if self._sldea_running:
+            return
+        p, err = self._sldea_build_profile()
+        if not p:
+            messagebox.showerror("SLDEA", f"Fix the profile first:\n{err}")
+            return
+        dry = self.sldea_dryrun.get()
+        if not dry:
+            if not INSTRUMENTS_SUPPORTED:
+                messagebox.showinfo("Linux only", NOT_LINUX_NOTE)
+                return
+            if not self.sg:
+                messagebox.showerror(
+                    "SLDEA", "Signal generator not connected — it drives the "
+                    "Trek. Connect it (Signal Gen tab) or use Dry Run.")
+                return
+            if not messagebox.askyesno(
+                    "Energize HV?",
+                    f"LIVE run — this drives the Trek up to "
+                    f"{max(p.levels):g} kV via SG CH{self.sldea_vars['sgch'].get()}"
+                    f".\n\n{p.summary()}\n\nProceed?"):
+                return
+        sgch = int(self.sldea_vars['sgch'].get())
+        vch = int(self.sldea_vars['vch'].get())
+        ich = int(self.sldea_vars['ich'].get())
+        self._sldea_stop = False
+        self._sldea_running = True
+        self.sldea_run_btn.config(state='disabled')
+        self.sldea_abort_btn.config(state='normal')
+        self._sldea_log(f"{'DRY-RUN' if dry else 'LIVE HV'} start — {p.summary()}")
+        threading.Thread(
+            target=self._sldea_worker,
+            args=(p, self.sldea_outdir.get(), self.sldea_runname.get().strip(),
+                  sgch, vch, ich, dry), daemon=True).start()
+
+    def sldea_abort(self):
+        self._sldea_stop = True
+        self._sldea_log("abort requested — ramping to 0 and stopping…")
+
+    def _sldea_finished(self):
+        self._sldea_running = False
+        self.sldea_run_btn.config(state='normal')
+        self.sldea_abort_btn.config(state='disabled')
+
+    def _sldea_log(self, msg):
+        def up():
+            self.sldea_log.config(state='normal')
+            self.sldea_log.insert(
+                tk.END, f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n")
+            self.sldea_log.see(tk.END)
+            self.sldea_log.config(state='disabled')
+        self.root.after(0, up)
+
+    def _sldea_set_status(self, text, fg='#555'):
+        self.root.after(0, lambda: self.sldea_status.config(text=text, fg=fg))
+
+    def _sldea_worker(self, p, outdir, runname, sgch, vch, ich, dry):
+        """Host-sequenced staircase runner (daemon thread; no Tk calls except
+        via _sldea_log/_sldea_set_status/after). Drives the SG DC offset along
+        p.kv_at(t), fires webcam+scope snapshots on schedule, writes the run
+        dir (setup.txt + data.csv + frames/)."""
+        import os
+        import csv as _csv
+        started = datetime.now()
+        rundir = os.path.join(outdir, runname or p.run_dirname(started))
+        framedir = os.path.join(rundir, 'frames')
+        fh = None
+        try:
+            os.makedirs(framedir, exist_ok=True)
+            # --- camera: lock fully manual (WB off) so nothing drifts ---
+            spec = None
+            cam_info = '(no camera)'
+            try:
+                spec = webcam.resolve_camera(0)
+                if spec.get('kind') == 'bayer':
+                    dev = spec['device']
+                    webcam.set_control(dev, 'auto_exposure', 1)
+                    webcam.set_control(dev, 'white_balance_automatic', 0)
+                    exp = self._sldea_cam_value('cam_exposure', 6)
+                    gain = self._sldea_cam_value('cam_gain', 60)
+                    webcam.set_control(dev, 'exposure_time_absolute', exp)
+                    webcam.set_control(dev, 'gain', gain)
+                    cam_info = (f"{spec['w']}x{spec['h']} {spec['fourcc']}, "
+                                f"exposure {exp}, gain {gain}, WB off")
+            except Exception as e:
+                self._sldea_log(f"camera setup failed ({e}) — frames skipped")
+                spec = None
+            # --- setup.txt ---
+            with open(os.path.join(rundir, 'setup.txt'), 'w') as sf:
+                sf.write(p.setup_text(
+                    runname or p.run_dirname(started),
+                    started.isoformat(timespec='seconds'),
+                    sgch, vch, ich, dry, cam_info))
+            # --- data.csv ---
+            fh = open(os.path.join(rundir, 'data.csv'), 'w', newline='')
+            writer = _csv.DictWriter(fh, fieldnames=p.CSV_COLUMNS)
+            writer.writeheader()
+            fh.flush()
+            self._sldea_log(f"run dir: {rundir}")
+            # --- SG: DC control voltage, output ON (live only) ---
+            if not dry and self.sg:
+                self.sg.set_load_polarity(sgch, load='HZ', polarity='NOR')
+                self.sg.set_basic_wave(sgch, WVTP='DC', OFST=0.0)
+                self.sg.set_output(sgch, True)
+
+            snaps = sorted(p.snapshots, key=lambda s: s['t'])
+            si = 0
+            t0 = time.monotonic()
+            last_status = -1.0
+            last_kv = None
+            while not self._sldea_stop:
+                el = time.monotonic() - t0
+                if el > p.total_duration_s + 0.3:
+                    break
+                if not dry and self.sg:
+                    kv = p.kv_at(el)
+                    if last_kv is None or abs(kv - last_kv) > 1e-4:
+                        try:
+                            self.sg.set_offset(sgch, control_v_for_kv(kv))
+                        except Exception as e:
+                            self._sldea_log(f"SG set_offset error: {e}")
+                        last_kv = kv
+                while si < len(snaps) and el >= snaps[si]['t']:
+                    self._sldea_capture(p, snaps[si], si + 1, spec, framedir,
+                                        writer, fh, vch, ich, dry)
+                    si += 1
+                if el - last_status >= 1.0:
+                    self._sldea_set_status(
+                        f"{'DRY' if dry else 'LIVE'}  t={el:.0f}/"
+                        f"{p.total_duration_s:.0f}s  ~{p.kv_at(el):.2f} kV  "
+                        f"frames {si}/{len(snaps)}",
+                        fg='#8a5a00' if dry else '#a01010')
+                    last_status = el
+                time.sleep(self.SLDEA_POLL_S)
+            done = 'aborted' if self._sldea_stop else 'complete'
+            self._sldea_log(f"run {done}: {si}/{len(snaps)} frames")
+            self._sldea_set_status(f"{done} — {si} frames", fg='#2e7d32')
+        except Exception as e:
+            self._sldea_log(f"ERROR: {e}")
+            self._sldea_set_status("error", fg='red')
+        finally:
+            if not dry and self.sg:
+                try:
+                    self.sg.set_offset(sgch, 0.0)
+                    self.sg.set_output(sgch, False)
+                except Exception:
+                    pass
+            if fh is not None:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+            self.root.after(0, self._sldea_finished)
+
+    def _sldea_cam_value(self, attr, default):
+        try:
+            return int(float(getattr(self, attr).get()))
+        except Exception:
+            return default
+
+    def _sldea_capture(self, p, snap, index, spec, framedir, writer, fh,
+                       vch, ich, dry):
+        import os
+        frame = None
+        if spec is not None:
+            try:
+                frame = webcam.oneshot_rgb(spec, count=3)
+            except Exception as e:
+                self._sldea_log(f"capture error: {e}")
+        mkv = mua = None
+        if self.scope:
+            try:
+                mv = self.scope.measure('MEAN', vch)
+                mi = self.scope.measure('MEAN', ich)
+                mkv = measured_kv(mv) if mv is not None else None
+                mua = measured_ua(mi) if mi is not None else None
+            except Exception as e:
+                self._sldea_log(f"scope read error: {e}")
+        fname = p.frame_filename(snap['step'], snap['nominal_kv'], snap['tag'])
+        if frame is not None:
+            try:
+                import cv2
+                cv2.imwrite(os.path.join(framedir, fname),
+                            cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+            except Exception as e:
+                self._sldea_log(f"frame save error: {e}")
+                fname = ''
+        writer.writerow({
+            'snapshot': index, 'step': snap['step'], 'tag': snap['tag'],
+            'nominal_kV': round(snap['nominal_kv'], 3),
+            'control_V': round(control_v_for_kv(snap['nominal_kv']), 3),
+            'measured_kV': '' if mkv is None else round(mkv, 4),
+            'measured_uA': '' if mua is None else round(mua, 2),
+            't_planned_s': round(snap['t'], 2),
+            'timestamp': datetime.now().isoformat(timespec='milliseconds'),
+            'frame_file': fname,
+            'active_area_px': '', 'active_area_mm2': '', 'active_diam_mm': '',
+            'notes': '',
+        })
+        fh.flush()
+        meas = (f"  meas {mkv:.2f} kV / {mua:.0f} µA"
+                if mkv is not None else "")
+        self._sldea_log(
+            f"snap s{snap['step']:02d} {snap['nominal_kv']:.2f} kV "
+            f"[{snap['tag']}]{meas}  → {fname or '(no frame)'}")
 
     def create_logging_tab(self):
         """Create data logging tab"""
