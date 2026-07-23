@@ -324,9 +324,12 @@ def set_manual_exposure(device, exposure=None, gain=None):
 
     Industrial cameras often ship with auto-exposure that never converges
     over UVC -- this one produced a pure black frame at its defaults while
-    happily exposing under manual control.
+    happily exposing under manual control. Auto white-balance is also turned
+    off here: left on, it continuously re-balances red/blue gain and shifts
+    the DUT's apparent brightness, so a hand-set exposure never "sticks".
     """
     set_control(device, 'auto_exposure', 1)          # 1 = manual (UVC)
+    set_control(device, 'white_balance_automatic', 0)  # stop auto re-balancing
     if exposure is not None:
         set_control(device, 'exposure_time_absolute', exposure)
     if gain is not None:
