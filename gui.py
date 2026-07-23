@@ -224,6 +224,8 @@ class InstrumentControlGUI:
         self._sldea_profile = None
         self._sldea_running = False
         self._sldea_stop = False
+        self._sldea_plot = None        # preview geometry, for the run cursor
+        self._sldea_elapsed = 0.0      # current run time (worker -> cursor)
         self.recording = False
         self.record_thread = None
         # Keys of background instrument operations in flight (issue #40) --
@@ -2427,16 +2429,21 @@ LOGGING:
         c = self.sldea_canvas
         c.delete('all')
         p = self._sldea_profile
-        w = c.winfo_width() or 700
-        h = c.winfo_height() or 210
+        w = c.winfo_width()
+        h = c.winfo_height()
+        w = w if w > 50 else 700           # guard an unrealized canvas (width 1)
+        h = h if h > 50 else 210
         mL, mR, mT, mB = 52, 14, 26, 26
         x0, y0, x1, y1 = mL, mT, w - mR, h - mB
         c.create_line(x0, y1, x1, y1)
         c.create_line(x0, y0, x0, y1)
         if not p:
             c.create_text(w / 2, h / 2, text="enter valid values", fill='#999')
+            self._sldea_plot = None
             return
         total = p.total_duration_s or 1.0
+        self._sldea_plot = {'x0': x0, 'x1': x1, 'y0': y0, 'y1': y1,
+                            'total': total}
         vmax = max([p.end_kv] + p.levels) or 1.0
 
         def X(t):
@@ -2462,6 +2469,31 @@ LOGGING:
                       font=('TkDefaultFont', 7), fill='#555')
         c.create_text(x0 + 4, y0 - 14, anchor='w', font=('TkDefaultFont', 7),
                       fill='#555', text=f"{p.n_frames} frames")
+        if self._sldea_running:                # keep the playhead through a redraw
+            self._sldea_draw_cursor(self._sldea_elapsed)
+
+    def _sldea_draw_cursor(self, elapsed):
+        """Draw/move the run playhead -- a scrolling vertical line at the
+        current test time -- on the preview (tagged so only it is redrawn)."""
+        c = self.sldea_canvas
+        c.delete('cursor')
+        pl = self._sldea_plot
+        if not pl or pl['total'] <= 0:
+            return
+        frac = min(1.0, max(0.0, elapsed / pl['total']))
+        x = pl['x0'] + (pl['x1'] - pl['x0']) * frac
+        c.create_line(x, pl['y0'], x, pl['y1'], fill='#c62828', width=1,
+                      tags='cursor')
+        c.create_text(x, pl['y0'] - 2, text=fmt_duration(elapsed), anchor='s',
+                      fill='#c62828', font=('TkDefaultFont', 7), tags='cursor')
+
+    def _sldea_animate_cursor(self):
+        """Main-thread ~10 Hz loop scrolling the cursor while a run is on."""
+        if not self._sldea_running:
+            self.sldea_canvas.delete('cursor')
+            return
+        self._sldea_draw_cursor(self._sldea_elapsed)
+        self.root.after(100, self._sldea_animate_cursor)
 
     def _sldea_dry_toggle(self):
         if self.sldea_dryrun.get():
@@ -2510,11 +2542,13 @@ LOGGING:
         self._sldea_running = True
         self.sldea_run_btn.config(state='disabled')
         self.sldea_abort_btn.config(state='normal')
+        self._sldea_elapsed = 0.0
         self._sldea_log(f"{'DRY-RUN' if dry else 'LIVE HV'} start — {p.summary()}")
         threading.Thread(
             target=self._sldea_worker,
             args=(p, self.sldea_outdir.get(), self.sldea_runname.get().strip(),
                   sgch, vch, ich, dry), daemon=True).start()
+        self.root.after(100, self._sldea_animate_cursor)   # scroll the playhead
 
     def sldea_abort(self):
         self._sldea_stop = True
@@ -2593,6 +2627,7 @@ LOGGING:
             last_kv = None
             while not self._sldea_stop:
                 el = time.monotonic() - t0
+                self._sldea_elapsed = el          # feeds the preview playhead
                 if el > p.total_duration_s + 0.3:
                     break
                 if not dry and self.sg:
