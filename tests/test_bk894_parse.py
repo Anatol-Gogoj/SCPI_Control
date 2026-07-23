@@ -32,6 +32,35 @@ class FakeLCR(BK894):
         self.sent.append(command)
 
 
+def test_get_config_recovers_from_desynced_reply():
+    # The mode string desyncs into the numeric field on the first read; after
+    # a buffer clear + retry the meter answers cleanly.
+    seq = {':FUNC:IMP?': ['CSRS', 'CSRS'],
+           ':FREQ?': ['CSRS', '1.00000e+03'],   # desynced, then correct
+           ':VOLT?': ['1.00000e+00']}
+
+    class Retry(BK894):
+        def __init__(self):
+            self.calls = {}
+            self.cleared = 0
+            self.inst = types.SimpleNamespace(clear=self._clear)
+
+        def _clear(self):
+            self.cleared += 1
+
+        def ask(self, cmd):
+            i = self.calls.get(cmd, 0)
+            self.calls[cmd] = i + 1
+            vals = seq[cmd]
+            return vals[min(i, len(vals) - 1)]
+
+    lcr = Retry()
+    cfg = lcr.get_config()
+    assert cfg['frequency'] == 1000.0 and cfg['voltage'] == 1.0
+    assert cfg['mode'] == 'CSRS'
+    assert lcr.cleared == 1              # cleared once and retried
+
+
 def test_parse_aperture():
     assert BK894.parse_aperture('MED,1') == ('MED', 1)
     assert BK894.parse_aperture('SLOW,32') == ('SLOW', 32)

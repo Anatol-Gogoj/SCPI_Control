@@ -277,11 +277,31 @@ class BK894(VisaInstrument):
         return float(primary), float(secondary), int(status)
 
     def get_config(self):
+        try:
+            return self._read_config()
+        except ValueError:
+            # A mismatched reply (e.g. the mode string 'CSRS' landing in a
+            # numeric field -- a stale/desynced I/O buffer). Clear the meter's
+            # buffers and read once more before giving up.
+            try:
+                self.inst.clear()
+            except Exception:
+                pass
+            return self._read_config()
+
+    def _read_config(self):
         return {
             'mode': self.ask(':FUNC:IMP?'),
-            'frequency': float(self.ask(':FREQ?')),
-            'voltage': float(self.ask(':VOLT?')),
+            'frequency': self._ask_float(':FREQ?'),
+            'voltage': self._ask_float(':VOLT?'),
         }
+
+    def _ask_float(self, cmd):
+        raw = self.ask(cmd)
+        m = re.match(r'[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?', raw.strip())
+        if not m:
+            raise ValueError(f"{cmd} returned non-numeric {raw!r}")
+        return float(m.group())
 
     # -- DC bias / aperture / range / fixture correction (issue #44) ------
     # Query forms bench-verified 2026-07-10 on this unit (fw 1.0.5):
