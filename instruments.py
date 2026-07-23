@@ -172,6 +172,43 @@ class VisaInstrument:
         except Exception:
             pass
 
+    def go_local(self):
+        """Best-effort return-to-local so the front panel works again after
+        the app quits. pyvisa-py ASSERTS remote on USB-TMC connect (and any
+        command puts a box in remote), so without this the panel stays locked
+        until a power cycle. Sends SCPI SYSTem:LOCal and then the transport's
+        go-to-local (USB488 GO_TO_LOCAL / VXI-11 device_local). Silent --
+        shutdown must never raise."""
+        try:
+            self.write('SYST:LOC')
+        except Exception:
+            pass
+        try:
+            self._visa_go_local()
+        except Exception:
+            pass
+
+    def _visa_go_local(self):
+        """Issue the transport-level go-to-local via the pyvisa-py session:
+        USB488 GO_TO_LOCAL for USB-TMC, device_local for VXI-11. All reaches
+        are guarded by the caller."""
+        sess = self.inst.visalib.sessions[self.inst.session]
+        iface = getattr(sess, 'interface', None)
+        if iface is None:
+            return
+        usb_dev = getattr(iface, 'usb_dev', None)
+        if usb_dev is not None:                         # USB-TMC (USB488)
+            import usb.util as uu
+            intf = getattr(iface, 'usb_intf', None)
+            usb_dev.ctrl_transfer(
+                uu.build_request_type(uu.CTRL_IN, uu.CTRL_TYPE_CLASS,
+                                      uu.CTRL_RECIPIENT_INTERFACE),
+                161,                                    # USBTMC GO_TO_LOCAL
+                0x0000, intf.index if intf is not None else 0, 0x0001,
+                timeout=1000)
+        elif hasattr(iface, 'device_local') and hasattr(sess, 'link'):  # VXI-11
+            iface.device_local(sess.link, 0, 1000, 1000)
+
 
 # --------------------------------------------------------------------------
 # B&K Precision 894 LCR Meter (USB-TMC)
@@ -1040,6 +1077,13 @@ class BK9174B:
     def set_remote(self):
         self.write(self.CMD_REMOTE)
 
+    def go_local(self):
+        """Return the front panel to local control (best-effort)."""
+        try:
+            self.write('SYST:LOC')
+        except Exception:
+            pass
+
     def set_voltage(self, ch, voltage_v):
         self._check_channel(ch)
         v = float(voltage_v)
@@ -1206,6 +1250,13 @@ class BK5493C:
     def query(self, command):
         """Raw SCPI passthrough (e.g. SYST:ERR?)."""
         return self.inst.query(command).strip()
+
+    def go_local(self):
+        """Return the meter's front panel to local control (best-effort)."""
+        try:
+            self.inst.write('SYST:LOC')
+        except Exception:
+            pass
 
     def close(self):
         try:

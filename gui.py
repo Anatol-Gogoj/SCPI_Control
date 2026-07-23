@@ -309,6 +309,19 @@ class InstrumentControlGUI:
                 self.lcr.set_bias_enabled(False)
             except Exception:
                 pass
+        # Hand each instrument back to LOCAL and close its link so the front
+        # panels work again without a power cycle (pyvisa-py asserts remote on
+        # connect). Best-effort -- a dead/wedged link must never block exit.
+        for inst in (self.lcr, self.scope, self.sg, self.psu, self.dmm):
+            if inst is None:
+                continue
+            for action in ('go_local', 'close'):
+                fn = getattr(inst, action, None)
+                if fn is not None:
+                    try:
+                        fn()
+                    except Exception:
+                        pass
         self.root.destroy()
 
     # ---- Background instrument I/O (issue #40) ---------------------------

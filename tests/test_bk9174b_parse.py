@@ -180,6 +180,12 @@ def test_non_numeric_reply_raises():
         pass
 
 
+def test_go_local_writes_syst_loc():
+    p = _psu()
+    p.go_local()
+    assert p.ser.written == ['SYST:LOC\r\n'], p.ser.written
+
+
 def _run():
     fns = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     for fn in fns:
