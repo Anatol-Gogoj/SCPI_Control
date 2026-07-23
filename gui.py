@@ -2560,6 +2560,15 @@ LOGGING:
         # never be touched from the worker (it can hang the Tcl interpreter).
         cam_exp = self._sldea_cam_value('cam_exposure', 6)
         cam_gain = self._sldea_cam_value('cam_gain', 60)
+        # Free the camera: the Webcam preview holds /dev/video0 open and a
+        # one-shot grab can't run while it streams (empty frames otherwise).
+        try:
+            self.cam_stop_preview()
+            if self.cam is not None:
+                self.cam.close()
+                self.cam = None
+        except Exception:
+            pass
         self._sldea_elapsed = 0.0
         self._sldea_log(f"{'DRY-RUN' if dry else 'LIVE HV'} start — {p.summary()}")
         threading.Thread(
@@ -2697,10 +2706,14 @@ LOGGING:
         import os
         frame = None
         if spec is not None:
-            try:
-                frame = webcam.oneshot_rgb(spec, count=3)
-            except Exception as e:
-                self._sldea_log(f"capture error: {e}")
+            for _attempt in range(2):                 # one retry
+                try:
+                    frame = webcam.oneshot_rgb(spec, count=3)
+                except Exception as e:
+                    self._sldea_log(f"capture error: {e}")
+                    frame = None
+                if frame is not None:
+                    break
         mkv = mua = None
         if self.scope:
             try:
@@ -2710,12 +2723,17 @@ LOGGING:
                 mua = measured_ua(mi) if mi is not None else None
             except Exception as e:
                 self._sldea_log(f"scope read error: {e}")
-        fname = p.frame_filename(snap['step'], snap['nominal_kv'], snap['tag'])
+        # Only record a filename if a frame was actually written -- otherwise
+        # the CSV would name a file that does not exist.
+        fname = ''
         if frame is not None:
+            fname = p.frame_filename(snap['step'], snap['nominal_kv'],
+                                     snap['tag'])
             try:
                 import cv2
-                cv2.imwrite(os.path.join(framedir, fname),
-                            cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                if not cv2.imwrite(os.path.join(framedir, fname),
+                                   cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)):
+                    raise IOError("imwrite returned False")
             except Exception as e:
                 self._sldea_log(f"frame save error: {e}")
                 fname = ''
@@ -2734,9 +2752,11 @@ LOGGING:
         fh.flush()
         meas = (f"  meas {mkv:.2f} kV / {mua:.0f} µA"
                 if mkv is not None else "")
+        tail = (f"→ {fname}" if fname
+                else "→ NO FRAME (camera busy? close the Webcam preview)")
         self._sldea_log(
             f"snap s{snap['step']:02d} {snap['nominal_kv']:.2f} kV "
-            f"[{snap['tag']}]{meas}  → {fname or '(no frame)'}")
+            f"[{snap['tag']}]{meas}  {tail}")
 
     def create_logging_tab(self):
         """Create data logging tab"""
