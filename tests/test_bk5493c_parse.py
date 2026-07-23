@@ -18,10 +18,14 @@ class FakeInst:
     def __init__(self, replies=None):
         self.replies = replies or {}
         self.queries = []
+        self.writes = []
 
     def query(self, cmd):
         self.queries.append(cmd)
         return self.replies.get(cmd, '0')
+
+    def write(self, cmd):
+        self.writes.append(cmd)
 
     def close(self):
         pass
@@ -69,6 +73,12 @@ def test_bad_function_raises():
         raise AssertionError("unknown function must raise")
     except ValueError:
         pass
+
+
+def test_go_local_writes_syst_loc():
+    d = _dmm()
+    d.go_local()
+    assert 'SYST:LOC' in d.inst.writes
 
 
 def _run():
