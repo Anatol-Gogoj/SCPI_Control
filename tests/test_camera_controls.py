@@ -74,6 +74,24 @@ def test_apply_locked_noop_when_unlocked():
     assert webcam.apply_locked('/dev/videoX') == 0
 
 
+def test_apply_locked_can_exclude_gain():
+    # The live-preview re-stamp skips 'gain' (firmware AGC overrides it and
+    # re-writing just flickers) but must still hold everything else.
+    calls = []
+    orig = webcam.set_control
+    webcam.set_control = lambda dev, name, val: calls.append(name)
+    try:
+        webcam.set_locked({'gain': 44, 'exposure_time_absolute': 20,
+                           'white_balance_automatic': 0, 'red_balance': 92})
+        n = webcam.apply_locked('/dev/videoX', exclude={'gain'})
+        assert 'gain' not in calls
+        assert 'exposure_time_absolute' in calls and 'red_balance' in calls
+        assert n == 3
+    finally:
+        webcam.set_control = orig
+        webcam.set_locked({})
+
+
 def test_settings_persist_roundtrip():
     d = tempfile.mkdtemp(prefix='camctl_')
     try:

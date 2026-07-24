@@ -150,6 +150,19 @@ def test_electrode_glints_are_masked_out():
         "strip should dominate unmasked; test scene too weak"
 
 
+def test_norm_bg_neutralizes_global_brightness_drift():
+    # The DFK's internal auto-gain drifts global brightness a few percent;
+    # without normalization the WHOLE frame diffs as fake change.
+    base = _disc_frame(0, level=0, base=120.0)
+    img = _disc_frame(40, level=30, base=120.0) * 1.10   # +10% global drift
+    s = dict(se.DEFAULT_SETTINGS)
+    cands = se.candidates(base, np.clip(img, 0, 255), s)
+    assert cands, "no candidates with normalization on"
+    true_area = np.pi * 40 * 40
+    assert abs(cands[0]['area_px'] - true_area) / true_area < 0.15, \
+        f"norm_bg failed to isolate the disc: {cands[0]['area_px']:.0f} px"
+
+
 def test_weak_fallback_candidate_reaches_review():
     # A change that fails the fill filter must still surface ONE candidate
     # for human review, not silently vanish -- and a fallback must never

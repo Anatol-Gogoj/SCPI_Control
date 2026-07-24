@@ -337,15 +337,22 @@ def set_locked(controls):
     return dict(LOCKED_CONTROLS)
 
 
-def apply_locked(device):
+def apply_locked(device, exclude=None):
     """Stamp the locked controls onto the device (autos first). Silent
-    no-op when nothing is locked; returns how many controls were set."""
+    no-op when nothing is locked; returns how many controls were set.
+
+    `exclude` is a set of control names to skip -- used by the live preview
+    re-stamp to leave 'gain' alone: the DFK has a firmware auto-gain that
+    overrides any written value within ~0.5 s, so re-writing it every second
+    only produces visible flicker (bench 2026-07-24). Gain is instead held
+    stable by pinning it at its floor at Apply time, where the AGC clamps."""
     if not LOCKED_CONTROLS:
         return 0
+    exclude = exclude or set()
     n = 0
     for name in list(_CTRL_ORDER) + [k for k in LOCKED_CONTROLS
                                      if k not in _CTRL_ORDER]:
-        if name in LOCKED_CONTROLS:
+        if name in LOCKED_CONTROLS and name not in exclude:
             try:
                 set_control(device, name, LOCKED_CONTROLS[name])
                 n += 1
