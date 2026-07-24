@@ -412,7 +412,8 @@ class EdgeReviewApp:
         for k, c in enumerate(cands):
             pts = [(float(x) * scale, float(y) * scale)
                    for x, y in np.asarray(c['contour'])]
-            wdt = 4 if (chosen and c['method'] == chosen['method']) else 2
+            # fine lines: the detailed outlines read better thin
+            wdt = 2 if (chosen and c['method'] == chosen['method']) else 1
             if len(pts) > 2:
                 dr.line(pts + [pts[0]], fill=CAND_COLORS[k], width=wdt)
         self._photo = ImageTk.PhotoImage(img)
@@ -607,7 +608,11 @@ class EdgeReviewApp:
                 'diff_thresh': "fixed diff threshold; 0 = auto (Otsu tiers)",
                 'min_diff': "diff p99 below this = no change vs baseline "
                             "(frame auto-rejected; lower it to dig for "
-                            "subtle changes)",
+                            "subtle changes; frames above it always yield "
+                            "at least one candidate for review)",
+                'electrode_lum': "mask pixels near-saturated in either frame "
+                                 "(copper electrode glints shift with "
+                                 "voltage); 0 disables",
                 'min_solidity': "drop candidates below this solidity (0–1); "
                                 "oblong shapes still score 1.0",
                 'roi_frac': "central search window as a fraction of the "

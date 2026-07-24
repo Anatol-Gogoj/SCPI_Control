@@ -33,9 +33,10 @@ DEFAULT_SETTINGS = {
     'diam_mm': 16.0,        # DEA nominal resting active-area diameter
     'blur_px': 5,           # Gaussian blur kernel (odd)
     'diff_thresh': 0,       # fixed diff threshold; 0 = auto (Otsu)
-    'min_diff': 10.0,       # diff p99 below this = "no change vs baseline"
-    'min_solidity': 0.35,   # min FILL of the traced outline (changed/hull)
+    'min_diff': 6.0,        # diff p99 below this = "no change vs baseline"
+    'min_solidity': 0.35,   # min FILL of the traced outline (changed/region)
     'roi_frac': 0.85,       # central search window (frame fraction)
+    'electrode_lum': 220.0,  # mask px this bright in the BASELINE; 0=off
     'accept_conf': 0.75,    # auto-accept at/above this confidence
     'spread_pct': 12.0,     # candidate area disagreement that forces review
     'breakdown_ua': 50.0,   # Trek current above this flags breakdown
@@ -121,41 +122,45 @@ def _region_candidate(mask, method, offset=(0, 0)):
     """Changed-region outline for one threshold tier -> candidate dict.
 
     The DEA's activated area often reads as a PATCHY texture change
-    (wrinkling/buckling under field), so the outline is the CONVEX HULL of
-    all significant changed components -- not the largest blob alone (bench
-    2026-07-23: wrinkled frames fragmented into low-solidity crumbs and every
-    candidate was dropped). The hull is also naturally oblong-friendly.
+    (wrinkling/buckling under field), so nearby changed patches are MERGED
+    with a wide morphological close and the outline is the detailed contour
+    of the merged region -- finer than the earlier convex hull (which drew
+    coarse straight spans and would stretch to any stray speck, e.g. an
+    electrode glint) and still oblong-friendly since there is no shape prior.
 
-    'solidity' here = FILL: changed px inside the hull / hull area. A real
-    activation fills a decent fraction of its outline; scattered noise dots
-    span a huge hull with near-zero fill."""
+    'solidity' here = FILL: changed px inside the outline / outline area.
+    A real activation fills a decent fraction of its outline; scattered
+    noise spans a large merged region with near-zero fill."""
     import cv2
     kernel3 = np.ones((3, 3), np.uint8)
     kernel7 = np.ones((7, 7), np.uint8)
-    m = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_OPEN, kernel3)
-    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel7)
-    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    changed = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_OPEN, kernel3)
+    changed = cv2.morphologyEx(changed, cv2.MORPH_CLOSE, kernel7)
+    # merge patches within ~2 kernel-widths; keeps distant regions separate
+    merge_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+    merged = cv2.morphologyEx(changed, cv2.MORPH_CLOSE, merge_k)
+    cnts, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL,
+                               cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
         return None
-    areas = [float(cv2.contourArea(c)) for c in cnts]
-    amax = max(areas)
-    if amax < 80:
+    c = max(cnts, key=cv2.contourArea)
+    area = float(cv2.contourArea(c))
+    if area < 80:
         return None
-    keep = [c for c, a in zip(cnts, areas) if a >= max(60.0, 0.05 * amax)]
-    union = float(sum(a for a in areas if a >= max(60.0, 0.05 * amax)))
-    hull = cv2.convexHull(np.vstack([c.reshape(-1, 2) for c in keep]))
-    hull_area = float(cv2.contourArea(hull)) or 1.0
-    fill = min(1.0, union / hull_area)
-    per = float(cv2.arcLength(hull, True)) or 1.0
-    circ = min(1.0, 4.0 * np.pi * hull_area / (per * per))
-    mom = cv2.moments(hull)
+    inside = np.zeros_like(changed)
+    cv2.drawContours(inside, [c], -1, 1, -1)
+    denom = float((inside > 0).sum()) or 1.0
+    fill = min(1.0, float(((changed > 0) & (inside > 0)).sum()) / denom)
+    per = float(cv2.arcLength(c, True)) or 1.0
+    circ = min(1.0, 4.0 * np.pi * area / (per * per))
+    mom = cv2.moments(c)
     cx = mom['m10'] / mom['m00'] if mom['m00'] else 0.0
     cy = mom['m01'] / mom['m00'] if mom['m00'] else 0.0
-    pts = hull.reshape(-1, 2) + np.asarray(offset)
-    return {'method': method, 'area_px': hull_area, 'circ': circ,
+    pts = c.reshape(-1, 2) + np.asarray(offset)
+    return {'method': method, 'area_px': area, 'circ': circ,
             'solidity': fill,
             'cx': float(cx + offset[0]), 'cy': float(cy + offset[1]),
-            'diam_px': 2.0 * np.sqrt(hull_area / np.pi), 'contour': pts}
+            'diam_px': 2.0 * np.sqrt(area / np.pi), 'contour': pts}
 
 
 # Detection runs on a downscaled copy: full-res HoughCircles on a 1080p
@@ -236,6 +241,18 @@ def candidates(base_gray, img_gray, settings):
     k = int(settings.get('blur_px', 5)) | 1
     diff = cv2.absdiff(img_gray, base_gray).astype(np.uint8) \
         if base_gray is not None else img_gray.astype(np.uint8)
+    # Electrode suppression: the copper/foil strips read bright and their
+    # glints SHIFT with voltage, lighting up the diff although the membrane
+    # there is hidden anyway. Mask pixels that are bright in the BASELINE --
+    # the electrodes are static objects, so the baseline knows where they
+    # are. (Never mask on the current frame: the wrinkled activated region
+    # saturates too, and masking it would erase the very signal we score --
+    # bench 2026-07-23, 5.5 kV wrinkle index dropped 1.9 -> 1.2 that way.)
+    lum = float(settings.get('electrode_lum', 0) or 0)
+    if lum > 0 and base_gray is not None:
+        glint = (base_gray >= lum).astype(np.uint8)
+        glint = cv2.dilate(glint, np.ones((7, 7), np.uint8))
+        diff[glint > 0] = 0
     diff = cv2.GaussianBlur(diff, (k, k), 0)
     # central ROI: the DEA sits mid-frame; electrode glare lives at the edges
     h, w = diff.shape
@@ -253,12 +270,25 @@ def candidates(base_gray, img_gray, settings):
          ('diff-otsu', max(3.0, otsu_t)),
          ('diff-hi', max(4.0, 1.5 * otsu_t))]
     out = []
+    weak = []
     for method, t in threshes[:3]:
         _t, m = cv2.threshold(sub, t, 255, cv2.THRESH_BINARY)
         c = _region_candidate(m, method, offset=(x0, y0))
-        if c and c['solidity'] >= float(settings.get('min_solidity', 0)):
-            c['_thresh'] = t
+        if c is None:
+            continue
+        if c['solidity'] >= float(settings.get('min_solidity', 0)):
             out.append(c)
+        else:
+            weak.append(c)
+    if not out and weak:
+        # Nothing passed the fill filter, but SOMETHING changed (the frame
+        # already passed the no-change gate) -- keep the best weak candidate
+        # so the human gets to judge it instead of a silent auto-reject
+        # (user 2026-07-23: subtle changes are visible by eye). Tagged so it
+        # can never auto-accept.
+        best_weak = max(weak, key=lambda c: c['solidity'])
+        best_weak['fallback'] = True
+        out = [best_weak]
     if not out:
         return []
     # boundary contrast (downscaled): diff level inside vs just outside
@@ -301,8 +331,12 @@ def candidates(base_gray, img_gray, settings):
 
 
 def needs_review(cands, settings):
-    """True when the human should choose (weak/absent/disagreeing edges)."""
+    """True when the human should choose (weak/absent/disagreeing edges).
+    A fill-filter fallback candidate ALWAYS goes to review -- it exists
+    precisely because the detection was not sure."""
     if not cands:
+        return True
+    if cands[0].get('fallback'):
         return True
     if cands[0]['conf'] < float(settings['accept_conf']):
         return True

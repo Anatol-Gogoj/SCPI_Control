@@ -117,7 +117,51 @@ def test_no_change_gate_returns_empty():
                    255).astype(np.float32)
     img = np.clip(base + rng.normal(0, 1.5, base.shape), 0,
                   255).astype(np.float32)
-    assert se.candidates(base, img, dict(se.DEFAULT_SETTINGS)) == []
+    s = dict(se.DEFAULT_SETTINGS)
+    s['min_diff'] = 10.0            # explicit: gate semantics under test
+    assert se.candidates(base, img, s) == []
+
+
+def test_electrode_glints_are_masked_out():
+    # A near-saturated strip (copper electrode) whose glint shifts between
+    # baseline and frame must NOT become the detection; the mid-grey disc
+    # elsewhere must win.
+    base = np.full((240, 240), 100.0, np.float32)
+    base[15:225, 105:135] = 240.0                 # bright electrode strip
+    base[15:135, 105:135] = 255.0                 # glint on the TOP half
+    img = base.copy()
+    img[15:135, 105:135] = 195.0                  # glint moved away...
+    img[135:225, 105:135] = 255.0                 # ...to the BOTTOM
+    yy, xx = np.mgrid[0:240, 0:240]
+    disc = (xx - 55) ** 2 + (yy - 120) ** 2 <= 28 * 28
+    img[disc] += 35                                # the real change
+    s = dict(se.DEFAULT_SETTINGS)
+    cands = se.candidates(base, img, s)
+    assert cands, "no candidates with the disc present"
+    best = cands[0]
+    assert abs(best['cx'] - 55) < 25, \
+        f"electrode strip won instead of the disc (cx={best['cx']:.0f})"
+    # with masking disabled the strip dominates -> proves the mask is what
+    # excluded it
+    s2 = dict(s)
+    s2['electrode_lum'] = 0
+    c2 = se.candidates(base, img, s2)
+    assert c2 and abs(c2[0]['cx'] - 120) < 30, \
+        "strip should dominate unmasked; test scene too weak"
+
+
+def test_weak_fallback_candidate_reaches_review():
+    # A change that fails the fill filter must still surface ONE candidate
+    # for human review, not silently vanish -- and a fallback must never
+    # auto-accept, however good its other metrics look.
+    base = _disc_frame(0, level=0)
+    img = _disc_frame(40)                       # clean disc...
+    s = dict(se.DEFAULT_SETTINGS)
+    s['min_solidity'] = 1.01                    # impossible: force the fallback
+    cands = se.candidates(base, img, s)
+    assert len(cands) == 1, "fallback must keep exactly the best candidate"
+    assert cands[0].get('fallback') is True
+    assert se.needs_review(cands, s), "fallback must always go to review"
 
 
 def test_candidates_downscaled_frame_rescales_to_full_res():
