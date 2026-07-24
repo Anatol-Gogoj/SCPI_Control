@@ -42,6 +42,7 @@ DEFAULT_SETTINGS = {
     'breakdown_ua': 50.0,   # Trek current above this flags breakdown
     'area_jump_pct': 35.0,  # area collapse (V rising) that flags breakdown
     'wrinkle_ratio': 1.4,   # wrinkle index >= this = wrinkle-mode (active)
+    'norm_bg': 1,           # normalize frame brightness to baseline (1=on)
 }
 _NUM = r'[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?'
 
@@ -238,6 +239,24 @@ def candidates(base_gray, img_gray, settings):
         if base_gray is not None:
             base_gray = cv2.resize(base_gray, size,
                                    interpolation=cv2.INTER_AREA)
+    # Photometric normalization: the DFK's internal auto-gain (no UVC off
+    # switch) drifts global brightness a few %, which would light up the
+    # whole diff as fake change. Scale the frame so the BORDER band (outside
+    # the ROI -- static membrane/holder) matches the baseline's, before
+    # differencing; the wrinkle ratio uses the same scale.
+    h, w = img_gray.shape
+    rf = min(1.0, max(0.2, float(settings.get('roi_frac', 0.85))))
+    bx = int(w * (1 - rf) / 2)
+    by = int(h * (1 - rf) / 2)
+    if base_gray is not None and settings.get('norm_bg', 1) and bx and by:
+        band = np.ones_like(img_gray, bool)
+        band[by:h - by, bx:w - bx] = False
+        med_i = float(np.median(img_gray[band])) or 1.0
+        med_b = float(np.median(base_gray[band]))
+        scale = min(1.4, max(0.7, med_b / med_i))
+        if abs(scale - 1.0) > 0.005:
+            img_gray = np.clip(img_gray * scale, 0, 255)
+            img_full = np.clip(img_full * scale, 0, 255)
     k = int(settings.get('blur_px', 5)) | 1
     diff = cv2.absdiff(img_gray, base_gray).astype(np.uint8) \
         if base_gray is not None else img_gray.astype(np.uint8)

@@ -2395,6 +2395,17 @@ LOGGING:
                           "setup.txt and used by Edge Review for the px→mm "
                           "scale.")
         self.sldea_vars['diam_mm'] = diam
+        self.sldea_trek_inv = tk.BooleanVar(value=False)
+        add_tooltip(ttk.Checkbutton(outf, text="Trek inverts (negate "
+                                                "control)",
+                                    variable=self.sldea_trek_inv),
+                    "Tick when the Trek outputs NEGATIVE kV for a positive "
+                    "control voltage (inverting amp config/input). The run "
+                    "then drives a negative control so the HV output is "
+                    "positive, and the V_Out monitor reading is sign-"
+                    "corrected in the log.").grid(row=3, column=0,
+                                                  columnspan=3, sticky='w',
+                                                  pady=(4, 0))
 
         # Breakdown watchdog (LIVE runs): deliberately slow-to-trip monitor
         # of the Trek I_Out on the scope; sustained overcurrent -> snapshot
@@ -2617,6 +2628,7 @@ LOGGING:
         except (KeyError, ValueError):
             diam_mm = 16.0
         autoproc = self.sldea_autoproc.get()
+        trek_sign = -1.0 if self.sldea_trek_inv.get() else 1.0
         # Breakdown watchdog (live only)
         wd_on = self.sldea_wd_on.get() and not dry
         try:
@@ -2652,7 +2664,7 @@ LOGGING:
             target=self._sldea_worker,
             args=(p, self.sldea_outdir.get(), self.sldea_runname.get().strip(),
                   sgch, vch, ich, dry, cam_exp, cam_gain, diam_mm, autoproc,
-                  wd_on, wd_ua, wd_s),
+                  wd_on, wd_ua, wd_s, trek_sign),
             daemon=True).start()
         self.root.after(100, self._sldea_animate_cursor)   # scroll the playhead
 
@@ -2780,7 +2792,7 @@ LOGGING:
 
     def _sldea_worker(self, p, outdir, runname, sgch, vch, ich, dry,
                       cam_exp=6, cam_gain=60, diam_mm=16.0, autoproc=False,
-                      wd_on=False, wd_ua=100.0, wd_s=3.0):
+                      wd_on=False, wd_ua=100.0, wd_s=3.0, trek_sign=1.0):
         """Host-sequenced staircase runner (daemon thread; no Tk calls except
         via _sldea_log/_sldea_set_status/after). Drives the SG DC offset along
         p.kv_at(t), fires webcam+scope snapshots on schedule, writes the run
@@ -2802,6 +2814,9 @@ LOGGING:
                     sgch, vch, ich, dry,
                     f"exposure {cam_exp}, gain {cam_gain}, WB off (manual)",
                     dea_diam_mm=diam_mm))
+                if trek_sign < 0:
+                    sf.write("Trek control polarity: INVERTED (control = "
+                             "-kV/gain; V_Out sign-corrected in log)\n")
             fh = open(os.path.join(rundir, 'data.csv'), 'w', newline='')
             writer = _csv.DictWriter(fh, fieldnames=p.CSV_COLUMNS)
             writer.writeheader()
@@ -2860,7 +2875,8 @@ LOGGING:
                                 'nominal_kv': p.kv_at(el),
                                 'tag': 'breakdown'},
                             si + 1, spec, framedir, writer, fh, vch, ich,
-                            dry, note=f"WATCHDOG: breakdown confirmed "
+                            dry, vsign=trek_sign,
+                            note=f"WATCHDOG: breakdown confirmed "
                                       f"(>{wd_ua:g}µA for {wd_s:g}s)")
                         self._sldea_stop = True
                         break
@@ -2868,13 +2884,15 @@ LOGGING:
                     kv = p.kv_at(el)
                     if last_kv is None or abs(kv - last_kv) > 1e-4:
                         try:
-                            self.sg.set_offset(sgch, control_v_for_kv(kv))
+                            self.sg.set_offset(
+                                sgch, trek_sign * control_v_for_kv(kv))
                         except Exception as e:
                             self._sldea_log(f"SG set_offset error: {e}")
                         last_kv = kv
                 while si < len(snaps) and el >= snaps[si]['t']:
                     self._sldea_capture(p, snaps[si], si + 1, spec, framedir,
-                                        writer, fh, vch, ich, dry)
+                                        writer, fh, vch, ich, dry,
+                                        vsign=trek_sign)
                     si += 1
                 if el - last_status >= 1.0:
                     self._sldea_set_status(
@@ -2922,7 +2940,7 @@ LOGGING:
             return default
 
     def _sldea_capture(self, p, snap, index, spec, framedir, writer, fh,
-                       vch, ich, dry, note=''):
+                       vch, ich, dry, note='', vsign=1.0):
         import os
         frame = None
         if spec is not None:
@@ -2939,7 +2957,7 @@ LOGGING:
             try:
                 mv = self.scope.measure('MEAN', vch)
                 mi = self.scope.measure('MEAN', ich)
-                mkv = measured_kv(mv) if mv is not None else None
+                mkv = vsign * measured_kv(mv) if mv is not None else None
                 mua = measured_ua(mi) if mi is not None else None
             except Exception as e:
                 self._sldea_log(f"scope read error: {e}")
@@ -4464,6 +4482,13 @@ LOGGING:
                     "scene (a few seconds; stop the preview first), fill "
                     "the fields in, and lock. Bench-tuned 2026-07-24: "
                     "red 92 / blue 151.").pack(side=tk.LEFT, padx=6)
+        add_tooltip(ttk.Button(btns, text="Stabilize (pin gain 0)",
+                               command=self.cam_stabilize),
+                    "The camera's firmware auto-gain can't be switched off "
+                    "over USB and drifts the image. This pins gain at 0 "
+                    "(where the auto is clamped) and finds an EXPOSURE for a "
+                    "mid-grey image — the only genuinely stable combo. Fills "
+                    "the fields; then Apply & Lock.").pack(side=tk.LEFT)
         self.cam_sensor_status = ttk.Label(btns, text="", foreground="gray")
         self.cam_sensor_status.pack(side=tk.LEFT, padx=10)
         self._cam_build_control_rows()
@@ -4862,6 +4887,65 @@ LOGGING:
 
         self._run_bg(work, done, busy='camera-ctrl')
 
+    def cam_stabilize(self):
+        """Pin gain at its floor (defeats the firmware auto-gain) and search
+        exposure for a mid-grey image -- the only combo that holds still."""
+        device = self._cam_device()
+        if not device or not webcam.v4l2_available():
+            messagebox.showerror("Camera", "No camera / v4l2-ctl available.")
+            return
+        was_previewing = self.cam_previewing
+        self.cam_stop_preview()
+        if self.cam is not None:
+            try:
+                self.cam.close()
+            except Exception:
+                pass
+            self.cam = None
+        self.cam_sensor_status.config(text="stabilizing (pinning gain)…",
+                                      foreground='#b36b00')
+
+        def work():
+            m = re.search(r'(\d+)$', device)
+            spec = webcam.resolve_camera(int(m.group(1)) if m else 0)
+            webcam.set_control(device, 'auto_exposure', 1)     # manual
+            webcam.set_control(device, 'white_balance_automatic', 0)
+            webcam.set_control(device, 'gain', 0)              # AGC floor
+            best = None
+            for exp in (16, 24, 32, 40, 50, 64, 80, 100, 130):
+                webcam.set_control(device, 'exposure_time_absolute', exp)
+                f = webcam.oneshot_rgb(spec, count=3)
+                if f is None:
+                    continue
+                mean = float(f.mean())
+                if best is None or abs(mean - 150) < abs(best[2] - 150):
+                    best = (exp, 0, mean)
+                if mean >= 150:
+                    break
+            return best
+
+        def done(best, error):
+            try:
+                if error or not best:
+                    self.cam_sensor_status.config(
+                        text="stabilize failed", foreground='red')
+                    if error:
+                        messagebox.showerror("Stabilize", str(error))
+                    return
+                exp, gain, mean = best
+                for name, val in (('gain', gain),
+                                  ('exposure_time_absolute', exp)):
+                    if name in self.camctl_rows:
+                        self._set_entry(self.camctl_rows[name][1], val)
+                self.cam_sensor_status.config(
+                    text=f"gain 0 / exposure {exp} (mean {mean:.0f}) — "
+                         "now Apply & Lock", foreground='#2e7d32')
+            finally:
+                if was_previewing:
+                    self.cam_start_preview()
+
+        self._run_bg(work, done, busy='camera-ctrl')
+
     def cam_grey_world(self):
         """One-shot grey-world WB: tune red/blue_balance on the CURRENT
         scene until the channel means match, then fill + lock."""
@@ -5023,6 +5107,21 @@ LOGGING:
         if frame is not None:
             self.cam_last_frame = frame
             self._cam_show(frame)
+        # Re-assert the lock a few times a second: the DFK's residual
+        # gain-auto creeps DURING a stream (bench: gain 44->36 over 45 s),
+        # and stamping only on stream-open can't catch that. ~1 Hz is cheap
+        # (one v4l2-ctl set) and pins every locked knob live.
+        self._cam_relock_ctr = getattr(self, '_cam_relock_ctr', 0) + 1
+        if self._cam_relock_ctr % 20 == 0:
+            dev = self._cam_device()
+            if dev:
+                try:
+                    # skip 'gain': the firmware AGC overrides it anyway and
+                    # re-writing every second only flickers. Gain is pinned
+                    # at Apply time.
+                    webcam.apply_locked(dev, exclude={'gain'})
+                except Exception:
+                    pass
         # ~20 fps; light enough for a lab tool
         self.cam_preview_job = self.root.after(50, self._cam_preview_tick)
 

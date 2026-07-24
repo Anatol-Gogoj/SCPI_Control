@@ -624,7 +624,11 @@ class EdgeReviewApp:
                                  "voltage rises",
                 'wrinkle_ratio': "wrinkle index (texture vs baseline) at/"
                                  "above this = wrinkle-mode; first such "
-                                 "frame is noted as the onset"}
+                                 "frame is noted as the onset",
+                'norm_bg': "1 = rescale each frame's brightness to the "
+                           "baseline (via the static border) before diffing "
+                           "— cancels the camera's internal auto-gain drift; "
+                           "0 = off"}
         for r, key in enumerate(se.DEFAULT_SETTINGS):
             ttk.Label(win, text=f"{key}:").grid(row=r, column=0, sticky='e',
                                                 padx=6, pady=3)
