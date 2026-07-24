@@ -88,6 +88,28 @@ def test_settings_persist_roundtrip():
         shutil.rmtree(d)
 
 
+def test_save_falls_back_when_primary_unwritable():
+    # A root-owned ~/.local/share/scpi_control (installer artefact) must not
+    # break persistence: save lands in the fallback, load finds it there.
+    d = tempfile.mkdtemp(prefix='camctl_fb_')
+    ro = os.path.join(d, 'ro')
+    os.makedirs(ro)
+    os.chmod(ro, 0o555)                       # unwritable "primary" parent
+    prim_bak = webcam.CAMERA_SETTINGS_PATH
+    fall_bak = webcam.CAMERA_SETTINGS_FALLBACK
+    webcam.CAMERA_SETTINGS_PATH = os.path.join(ro, 'sub', 'cam.json')
+    webcam.CAMERA_SETTINGS_FALLBACK = os.path.join(d, 'cache', 'cam.json')
+    try:
+        saved = webcam.save_camera_settings({'gain': 7})
+        assert saved == webcam.CAMERA_SETTINGS_FALLBACK, saved
+        assert webcam.load_camera_settings() == {'gain': 7}
+    finally:
+        webcam.CAMERA_SETTINGS_PATH = prim_bak
+        webcam.CAMERA_SETTINGS_FALLBACK = fall_bak
+        os.chmod(ro, 0o755)
+        shutil.rmtree(d)
+
+
 def _run():
     fns = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     for fn in fns:
