@@ -7,12 +7,13 @@ directory the Digital Multitool's SLDEA tab wrote:
 
     SLDEA_<ts>/setup.txt + data.csv + frames/SLDEA_sNN_XX.XXkV_tag.png
 
-Approach: difference-imaging against the 0 kV baseline frame (robust for the
-low-contrast grey disc), plus an independent Hough-circle candidate. Each
-frame yields up to 3 candidate outlines with a confidence score; frames whose
-best candidate is weak (or whose candidates disagree) are queued for the
-human-in-the-loop pass in the GUI. Breakdown heuristics flag suspect steps:
-a Trek current spike and an area collapse while voltage rises.
+Approach: difference-imaging against the 0 kV baseline frame at three
+threshold tiers; each tier's outline is the convex hull of the significant
+changed patches (DEA activation reads as patchy wrinkling, and the shape may
+be oblong -- no circle prior). Up to 3 candidates per frame with a confidence
+score; frames whose best candidate is weak (or whose candidates disagree) are
+queued for the human-in-the-loop pass in the GUI. Breakdown heuristics flag
+suspect steps: a Trek current spike and an area collapse while voltage rises.
 
 Areas are stored in px^2 and converted to mm^2 using the DEA's nominal
 resting diameter (default 16 mm) against the baseline detection.
@@ -32,7 +33,9 @@ DEFAULT_SETTINGS = {
     'diam_mm': 16.0,        # DEA nominal resting active-area diameter
     'blur_px': 5,           # Gaussian blur kernel (odd)
     'diff_thresh': 0,       # fixed diff threshold; 0 = auto (Otsu)
-    'min_circ': 0.55,       # candidates below this circularity are dropped
+    'min_diff': 10.0,       # diff p99 below this = "no change vs baseline"
+    'min_solidity': 0.35,   # min FILL of the traced outline (changed/hull)
+    'roi_frac': 0.85,       # central search window (frame fraction)
     'accept_conf': 0.75,    # auto-accept at/above this confidence
     'spread_pct': 12.0,     # candidate area disagreement that forces review
     'breakdown_ua': 50.0,   # Trek current above this flags breakdown
@@ -113,24 +116,45 @@ def load_gray(path):
 # candidate detection
 # ---------------------------------------------------------------------------
 
-def _contour_candidate(mask, method):
-    """Largest external contour of a binary mask -> candidate dict or None."""
+def _region_candidate(mask, method, offset=(0, 0)):
+    """Changed-region outline for one threshold tier -> candidate dict.
+
+    The DEA's activated area often reads as a PATCHY texture change
+    (wrinkling/buckling under field), so the outline is the CONVEX HULL of
+    all significant changed components -- not the largest blob alone (bench
+    2026-07-23: wrinkled frames fragmented into low-solidity crumbs and every
+    candidate was dropped). The hull is also naturally oblong-friendly.
+
+    'solidity' here = FILL: changed px inside the hull / hull area. A real
+    activation fills a decent fraction of its outline; scattered noise dots
+    span a huge hull with near-zero fill."""
     import cv2
-    cnts, _ = cv2.findContours(mask.astype(np.uint8),
-                               cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    kernel3 = np.ones((3, 3), np.uint8)
+    kernel7 = np.ones((7, 7), np.uint8)
+    m = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_OPEN, kernel3)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel7)
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
         return None
-    c = max(cnts, key=cv2.contourArea)
-    area = float(cv2.contourArea(c))
-    if area < 50:
+    areas = [float(cv2.contourArea(c)) for c in cnts]
+    amax = max(areas)
+    if amax < 80:
         return None
-    per = float(cv2.arcLength(c, True)) or 1.0
-    circ = min(1.0, 4.0 * np.pi * area / (per * per))
-    (cx, cy), _r = cv2.minEnclosingCircle(c)
-    return {'method': method, 'area_px': area, 'circ': circ,
-            'cx': float(cx), 'cy': float(cy),
-            'diam_px': 2.0 * np.sqrt(area / np.pi),
-            'contour': c.reshape(-1, 2)}
+    keep = [c for c, a in zip(cnts, areas) if a >= max(60.0, 0.05 * amax)]
+    union = float(sum(a for a in areas if a >= max(60.0, 0.05 * amax)))
+    hull = cv2.convexHull(np.vstack([c.reshape(-1, 2) for c in keep]))
+    hull_area = float(cv2.contourArea(hull)) or 1.0
+    fill = min(1.0, union / hull_area)
+    per = float(cv2.arcLength(hull, True)) or 1.0
+    circ = min(1.0, 4.0 * np.pi * hull_area / (per * per))
+    mom = cv2.moments(hull)
+    cx = mom['m10'] / mom['m00'] if mom['m00'] else 0.0
+    cy = mom['m01'] / mom['m00'] if mom['m00'] else 0.0
+    pts = hull.reshape(-1, 2) + np.asarray(offset)
+    return {'method': method, 'area_px': hull_area, 'circ': circ,
+            'solidity': fill,
+            'cx': float(cx + offset[0]), 'cy': float(cy + offset[1]),
+            'diam_px': 2.0 * np.sqrt(hull_area / np.pi), 'contour': pts}
 
 
 # Detection runs on a downscaled copy: full-res HoughCircles on a 1080p
@@ -142,14 +166,24 @@ DETECT_MAX_W = 640
 def candidates(base_gray, img_gray, settings):
     """Up to 3 candidate outlines for the active area, best first.
 
-    a) diff-otsu  : |img - baseline| -> blur -> Otsu threshold -> contour
-    b) diff-fixed : same, fixed threshold (diff_thresh, or 0.6*Otsu when auto)
-    c) hough      : CLAHE(img) -> HoughCircles, circle nearest frame centre
+    Difference-imaging only (bench 2026-07-23: the old HoughCircles candidate
+    fabricated a confident circle on EVERY frame -- it teleported around the
+    image with a hard-coded high score -- and the DEA expansion is not
+    necessarily circular anyway, so the circle prior is wrong):
 
-    Confidence = 0.6*circularity + 0.4*cross-method area agreement. Frames
-    wider than DETECT_MAX_W are detected at reduced scale (bench: 1080p
-    full-res Hough took ~100 s/frame; downscaled is sub-second) and every
-    px quantity is scaled back to full resolution.
+      |img - baseline| -> blur -> central ROI -> three thresholds
+      (0.6*Otsu / Otsu / 1.5*Otsu, or the fixed diff_thresh) -> morphological
+      open+close -> largest contour each.
+
+    Honest no-change gate: if the ROI diff's 99th percentile is below
+    min_diff, the frame shows no detectable change vs baseline and NO
+    candidates are returned (low-kV frames really look identical -- inventing
+    an outline there was the old failure mode).
+
+    Confidence = 0.4*solidity + 0.3*boundary-contrast + 0.3*cross-method
+    agreement; solidity (not circularity) so slightly oblong expansions score
+    fully. Frames wider than DETECT_MAX_W are detected at reduced scale and
+    every px quantity is rescaled to full resolution.
     """
     import cv2
     h0, w0 = img_gray.shape
@@ -165,41 +199,43 @@ def candidates(base_gray, img_gray, settings):
     diff = cv2.absdiff(img_gray, base_gray).astype(np.uint8) \
         if base_gray is not None else img_gray.astype(np.uint8)
     diff = cv2.GaussianBlur(diff, (k, k), 0)
-    otsu_t, otsu_mask = cv2.threshold(diff, 0, 255,
-                                      cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # central ROI: the DEA sits mid-frame; electrode glare lives at the edges
+    h, w = diff.shape
+    rf = min(1.0, max(0.2, float(settings.get('roi_frac', 0.85))))
+    x0 = int(w * (1 - rf) / 2)
+    y0 = int(h * (1 - rf) / 2)
+    sub = diff[y0:h - y0 or h, x0:w - x0 or w]
+    if float(np.percentile(sub, 99)) < float(settings.get('min_diff', 10)):
+        return []                       # no detectable change vs baseline
+    otsu_t, _m = cv2.threshold(sub, 0, 255,
+                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    fixed = float(settings.get('diff_thresh') or 0)
+    threshes = ([('diff-fixed', fixed)] if fixed else []) + \
+        [('diff-lo', max(3.0, 0.6 * otsu_t)),
+         ('diff-otsu', max(3.0, otsu_t)),
+         ('diff-hi', max(4.0, 1.5 * otsu_t))]
     out = []
-    c1 = _contour_candidate(otsu_mask, 'diff-otsu')
-    if c1:
-        out.append(c1)
-    fixed = float(settings.get('diff_thresh') or 0) or max(4.0, 0.6 * otsu_t)
-    _t, m2 = cv2.threshold(diff, fixed, 255, cv2.THRESH_BINARY)
-    c2 = _contour_candidate(m2, 'diff-fixed')
-    if c2:
-        out.append(c2)
-    try:
-        h, w = img_gray.shape
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)) \
-            .apply(img_gray.astype(np.uint8))
-        cir = cv2.HoughCircles(cv2.GaussianBlur(clahe, (k, k), 0),
-                               cv2.HOUGH_GRADIENT, dp=1.5, minDist=w,
-                               param1=80, param2=35,
-                               minRadius=int(0.05 * min(h, w)),
-                               maxRadius=int(0.48 * min(h, w)))
-        if cir is not None:
-            best = min(cir[0], key=lambda c: (c[0] - w / 2) ** 2
-                       + (c[1] - h / 2) ** 2)
-            cx, cy, r = [float(v) for v in best]
-            theta = np.linspace(0, 2 * np.pi, 90)
-            ring = np.stack([cx + r * np.cos(theta),
-                             cy + r * np.sin(theta)], axis=1).astype(int)
-            out.append({'method': 'hough', 'area_px': float(np.pi * r * r),
-                        'circ': 0.85,       # by construction; weight it below
-                        'cx': cx, 'cy': cy, 'diam_px': 2 * r, 'contour': ring})
-    except Exception:
-        pass
-    out = [c for c in out if c['circ'] >= float(settings.get('min_circ', 0))]
+    for method, t in threshes[:3]:
+        _t, m = cv2.threshold(sub, t, 255, cv2.THRESH_BINARY)
+        c = _region_candidate(m, method, offset=(x0, y0))
+        if c and c['solidity'] >= float(settings.get('min_solidity', 0)):
+            c['_thresh'] = t
+            out.append(c)
     if not out:
         return []
+    # boundary contrast: diff level inside the shape vs just outside it
+    ker = np.ones((15, 15), np.uint8)
+    for c in out:
+        m = np.zeros_like(sub)
+        cv2.drawContours(m, [np.asarray(c['contour'] -
+                                        np.array([x0, y0]), np.int32)],
+                         -1, 255, -1)
+        ring = cv2.dilate(m, ker) & ~m
+        inside = float(sub[m > 0].mean()) if (m > 0).any() else 0.0
+        outside = float(sub[ring > 0].mean()) if (ring > 0).any() else 0.0
+        c['contrast'] = max(0.0, min(1.0, (inside - outside) / 20.0))
+        c.pop('mask_local', None)
+        c.pop('_thresh', None)
     if f != 1.0:                    # rescale every px quantity to full-res
         inv = 1.0 / f
         for c in out:
@@ -212,7 +248,8 @@ def candidates(base_gray, img_gray, settings):
     spread = float(areas.std() / areas.mean()) if len(out) > 1 else 0.0
     agreement = max(0.0, 1.0 - spread)
     for c in out:
-        c['conf'] = round(0.6 * c['circ'] + 0.4 * agreement, 3)
+        c['conf'] = round(0.4 * c['solidity'] + 0.3 * c['contrast']
+                          + 0.3 * agreement, 3)
         c['spread_pct'] = round(100 * spread, 1)
     out.sort(key=lambda c: c['conf'], reverse=True)
     return out[:3]

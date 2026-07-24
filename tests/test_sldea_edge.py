@@ -46,9 +46,37 @@ def test_candidates_find_synthetic_disc():
     best = cands[0]
     true_area = np.pi * 40 * 40
     assert abs(best['area_px'] - true_area) / true_area < 0.10, best
-    assert best['circ'] > 0.8
+    assert best['solidity'] > 0.9
     assert best['conf'] > 0.75
     assert not se.needs_review(cands, se.DEFAULT_SETTINGS)
+    assert all(c['method'].startswith('diff') for c in cands), \
+        "hough must be gone (it fabricated circles on real frames)"
+
+
+def test_oblong_shape_scores_like_a_circle():
+    # An ellipse (2:1) must NOT be punished -- the DEA expansion can be oblong
+    base = _disc_frame(0, level=0)
+    img = np.full((240, 240), 100.0, np.float32)
+    yy, xx = np.mgrid[0:240, 0:240]
+    img[((xx - 120) / 60.0) ** 2 + ((yy - 120) / 30.0) ** 2 <= 1] += 40
+    cands = se.candidates(base, img, dict(se.DEFAULT_SETTINGS))
+    assert cands, "no candidates on the ellipse"
+    best = cands[0]
+    true_area = np.pi * 60 * 30
+    assert abs(best['area_px'] - true_area) / true_area < 0.10, best
+    assert best['solidity'] > 0.9, "solidity must not punish oblong shapes"
+    assert best['conf'] > 0.75
+
+
+def test_no_change_gate_returns_empty():
+    # Identical frame (plus faint noise) => no candidates, not a fabricated
+    # outline -- this was the 'randomly placed circle' failure mode.
+    rng = np.random.default_rng(3)
+    base = np.clip(rng.normal(100, 2, (240, 240)), 0,
+                   255).astype(np.float32)
+    img = np.clip(base + rng.normal(0, 1.5, base.shape), 0,
+                  255).astype(np.float32)
+    assert se.candidates(base, img, dict(se.DEFAULT_SETTINGS)) == []
 
 
 def test_candidates_downscaled_frame_rescales_to_full_res():
