@@ -522,11 +522,15 @@ class EdgeReviewApp:
         if not xs:
             return
         fig, ax = plt.subplots(figsize=(8, 5))
-        for tag, mk in (('post', 'o'), ('pre', 's'), ('baseline', '^')):
-            px = [x for x, t in zip(xs, tags) if t == tag]
-            py = [y for y, t in zip(ys, tags) if t == tag]
+        # prefix match keeps old runs (tags 'post'/'pre') plottable alongside
+        # new ones ('post-ramp'/'pre-ramp')
+        for pref, mk, label in (('post', 'o', 'post-ramp'),
+                                ('pre', 's', 'pre-ramp'),
+                                ('baseline', '^', 'baseline')):
+            px = [x for x, t in zip(xs, tags) if (t or '').startswith(pref)]
+            py = [y for y, t in zip(ys, tags) if (t or '').startswith(pref)]
             if px:
-                ax.plot(px, py, mk, label=tag, alpha=0.8)
+                ax.plot(px, py, mk, label=label, alpha=0.8)
         ax.set_xlabel('nominal voltage (kV)')
         ax.set_ylabel('active area (mm²)' if scale else 'active area (px²)')
         ax.set_title(os.path.basename(self.rundir) + ' — active area vs voltage')
