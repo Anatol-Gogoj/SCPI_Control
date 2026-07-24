@@ -2468,6 +2468,12 @@ LOGGING:
                     "Open the offline edge-detection/review program on a "
                     "finished run (defaults to the output dir's newest "
                     "run).").pack(side=tk.LEFT)
+        add_tooltip(ttk.Button(runf, text="🎚 Tune params…",
+                               command=lambda: self._sldea_open_tuner(None)),
+                    "Live slider tuner: baseline / mid-run / late frames "
+                    "with the current outlines, redrawn as you drag the "
+                    "thresholds. Save writes them into the run's setup.txt "
+                    "for Edge Review.").pack(side=tk.LEFT, padx=(8, 0))
         self.sldea_status = tk.Label(runf, text="idle", anchor='w', fg='#555')
         self.sldea_status.pack(side=tk.LEFT, padx=12)
 
@@ -2768,6 +2774,20 @@ LOGGING:
                 text=f"Edge Review opened on {os.path.basename(target)}")
         except Exception as e:
             messagebox.showerror("Edge Review", f"Could not launch: {e}")
+
+    def _sldea_open_tuner(self, rundir):
+        """Launch the live parameter tuner (its own process). rundir=None
+        lets the tuner pick the newest run under the output dir."""
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              'sldea_tuner.py')
+        target = rundir or self.sldea_outdir.get()
+        try:
+            subprocess.Popen([sys.executable, script, target],
+                             start_new_session=True)
+            self.status_bar.config(
+                text=f"Edge tuner opened on {os.path.basename(target)}")
+        except Exception as e:
+            messagebox.showerror("Edge tuner", f"Could not launch: {e}")
 
     def sldea_abort(self):
         self._sldea_stop = True
