@@ -179,7 +179,7 @@ class SldeaProfile:
                 f"total {fmt_duration(self.total_duration_s)}")
 
     def setup_text(self, run_name, started_iso, sg_ch, vmon_ch, imon_ch,
-                   dry_run, cam_info=''):
+                   dry_run, cam_info='', dea_diam_mm=None):
         step_desc = (f"{self.step_kv:g} kV/step" if self.step_kv
                      else f"{self.n_steps_req} steps")
         return "\n".join([
@@ -208,7 +208,8 @@ class SldeaProfile:
             "",
             "--- Camera ---",
             cam_info or "(settings not recorded)",
-            "",
+            ""] + ([f"DEA nominal diameter: {dea_diam_mm:g} mm", ""]
+                   if dea_diam_mm else []) + [
             "--- Snapshots ---",
             "baseline @ 0 kV" if self.baseline else "(no baseline)",
             "per landing: "

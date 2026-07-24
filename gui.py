@@ -2378,13 +2378,22 @@ LOGGING:
         for r, lbl, key, default, vals in (
                 (0, "V_Out scope CH:", 'vch', '2', ['1', '2', '3', '4']),
                 (1, "I_Out scope CH:", 'ich', '3', ['1', '2', '3', '4']),
-                (2, "SG CH:", 'sgch', '2', ['1', '2'])):
+                (2, "SG CH:", 'sgch', '1', ['1', '2'])):
             ttk.Label(outf, text=lbl).grid(row=r, column=3, sticky='e',
                                            padx=(16, 2))
             cb = ttk.Combobox(outf, width=4, state='readonly', values=vals)
             cb.set(default)
             cb.grid(row=r, column=4, sticky='w')
             self.sldea_vars[key] = cb
+        ttk.Label(outf, text="DEA diam (mm):").grid(row=2, column=0,
+                                                    sticky='e')
+        diam = ttk.Entry(outf, width=8)
+        diam.insert(0, '16')
+        diam.grid(row=2, column=1, sticky='w', padx=6)
+        add_tooltip(diam, "Nominal resting active-area diameter. Written to "
+                          "setup.txt and used by Edge Review for the px→mm "
+                          "scale.")
+        self.sldea_vars['diam_mm'] = diam
 
         runf = ttk.Frame(f)
         runf.pack(fill='x', padx=10, pady=8)
@@ -2402,6 +2411,19 @@ LOGGING:
                                           command=self.sldea_abort,
                                           state='disabled')
         self.sldea_abort_btn.pack(side=tk.LEFT)
+        self.sldea_autoproc = tk.BooleanVar(value=True)
+        add_tooltip(ttk.Checkbutton(runf, text="Auto-open Edge Review",
+                                    variable=self.sldea_autoproc),
+                    "When the run completes with frames captured, launch the "
+                    "SLDEA Edge Review program on it and start a default "
+                    "detection pass (human review still in the loop).").pack(
+            side=tk.LEFT, padx=10)
+        add_tooltip(ttk.Button(runf, text="🔍 Edge Review…",
+                               command=lambda:
+                               self._sldea_open_edge_review(None)),
+                    "Open the offline edge-detection/review program on a "
+                    "finished run (defaults to the output dir's newest "
+                    "run).").pack(side=tk.LEFT)
         self.sldea_status = tk.Label(runf, text="idle", anchor='w', fg='#555')
         self.sldea_status.pack(side=tk.LEFT, padx=12)
 
@@ -2560,6 +2582,11 @@ LOGGING:
         # never be touched from the worker (it can hang the Tcl interpreter).
         cam_exp = self._sldea_cam_value('cam_exposure', 6)
         cam_gain = self._sldea_cam_value('cam_gain', 60)
+        try:
+            diam_mm = float(self.sldea_vars['diam_mm'].get())
+        except (KeyError, ValueError):
+            diam_mm = 16.0
+        autoproc = self.sldea_autoproc.get()
         # Free the camera: the Webcam preview holds /dev/video0 open and a
         # one-shot grab can't run while it streams (empty frames otherwise).
         try:
@@ -2574,8 +2601,24 @@ LOGGING:
         threading.Thread(
             target=self._sldea_worker,
             args=(p, self.sldea_outdir.get(), self.sldea_runname.get().strip(),
-                  sgch, vch, ich, dry, cam_exp, cam_gain), daemon=True).start()
+                  sgch, vch, ich, dry, cam_exp, cam_gain, diam_mm, autoproc),
+            daemon=True).start()
         self.root.after(100, self._sldea_animate_cursor)   # scroll the playhead
+
+    def _sldea_open_edge_review(self, rundir, auto=False):
+        """Launch the offline SLDEA Edge Review program (its own process, so
+        it outlives this GUI). rundir=None opens it on the output dir and it
+        preselects the newest run."""
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              'sldea_edge_gui.py')
+        target = rundir or self.sldea_outdir.get()
+        cmd = [sys.executable, script, target] + (['--auto'] if auto else [])
+        try:
+            subprocess.Popen(cmd, start_new_session=True)
+            self.status_bar.config(
+                text=f"Edge Review opened on {os.path.basename(target)}")
+        except Exception as e:
+            messagebox.showerror("Edge Review", f"Could not launch: {e}")
 
     def sldea_abort(self):
         self._sldea_stop = True
@@ -2599,7 +2642,7 @@ LOGGING:
         self.root.after(0, lambda: self.sldea_status.config(text=text, fg=fg))
 
     def _sldea_worker(self, p, outdir, runname, sgch, vch, ich, dry,
-                      cam_exp=6, cam_gain=60):
+                      cam_exp=6, cam_gain=60, diam_mm=16.0, autoproc=False):
         """Host-sequenced staircase runner (daemon thread; no Tk calls except
         via _sldea_log/_sldea_set_status/after). Drives the SG DC offset along
         p.kv_at(t), fires webcam+scope snapshots on schedule, writes the run
@@ -2619,7 +2662,8 @@ LOGGING:
                     runname or p.run_dirname(started),
                     started.isoformat(timespec='seconds'),
                     sgch, vch, ich, dry,
-                    f"exposure {cam_exp}, gain {cam_gain}, WB off (manual)"))
+                    f"exposure {cam_exp}, gain {cam_gain}, WB off (manual)",
+                    dea_diam_mm=diam_mm))
             fh = open(os.path.join(rundir, 'data.csv'), 'w', newline='')
             writer = _csv.DictWriter(fh, fieldnames=p.CSV_COLUMNS)
             writer.writeheader()
@@ -2678,6 +2722,10 @@ LOGGING:
             done = 'aborted' if self._sldea_stop else 'complete'
             self._sldea_log(f"run {done}: {si}/{len(snaps)} frames")
             self._sldea_set_status(f"{done} — {si} frames", fg='#2e7d32')
+            if done == 'complete' and autoproc and si > 0:
+                self._sldea_log("auto-opening Edge Review…")
+                self.root.after(
+                    0, lambda: self._sldea_open_edge_review(rundir, auto=True))
         except Exception as e:
             self._sldea_log(f"ERROR: {e}")
             self._sldea_set_status("error", fg='red')
