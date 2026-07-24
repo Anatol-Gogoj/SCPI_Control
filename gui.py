@@ -2395,6 +2395,38 @@ LOGGING:
                           "scale.")
         self.sldea_vars['diam_mm'] = diam
 
+        # Breakdown watchdog (LIVE runs): deliberately slow-to-trip monitor
+        # of the Trek I_Out on the scope; sustained overcurrent -> snapshot
+        # the breakdown + ramp to 0 + abort.
+        wdf = ttk.LabelFrame(f, text="⚡ Breakdown watchdog (LIVE runs)",
+                             padding=8)
+        wdf.pack(fill='x', padx=10, pady=(0, 8))
+        self.sldea_wd_on = tk.BooleanVar(value=True)
+        add_tooltip(ttk.Checkbutton(wdf, text="Enabled",
+                                    variable=self.sldea_wd_on),
+                    "Watch the Trek current during a live run; a CONFIRMED "
+                    "breakdown captures a frame, ramps to 0 kV and aborts. "
+                    "Ignored on dry runs.").pack(side=tk.LEFT)
+        ttk.Label(wdf, text="Trip (µA):").pack(side=tk.LEFT, padx=(14, 2))
+        wd_ua = ttk.Entry(wdf, width=7)
+        wd_ua.insert(0, '100')
+        wd_ua.pack(side=tk.LEFT)
+        add_tooltip(wd_ua, "Current at/above this counts toward breakdown "
+                           "(I_Out scale: 10 V = 2000 µA).")
+        self.sldea_vars['wd_ua'] = wd_ua
+        ttk.Label(wdf, text="Confirm (s):").pack(side=tk.LEFT, padx=(12, 2))
+        wd_s = ttk.Entry(wdf, width=6)
+        wd_s.insert(0, '3')
+        wd_s.pack(side=tk.LEFT)
+        add_tooltip(wd_s, "Current must stay over the trip level for this "
+                          "many seconds of consecutive reads before the "
+                          "abort fires -- a single dip resets the clock, so "
+                          "transients never trip it.")
+        self.sldea_vars['wd_s'] = wd_s
+        tk.Label(wdf, fg='#8a5a00',
+                 text="waits until it is SURE — sustained overcurrent only"
+                 ).pack(side=tk.LEFT, padx=12)
+
         runf = ttk.Frame(f)
         runf.pack(fill='x', padx=10, pady=8)
         self.sldea_dryrun = tk.BooleanVar(value=True)
@@ -2575,10 +2607,6 @@ LOGGING:
         sgch = int(self.sldea_vars['sgch'].get())
         vch = int(self.sldea_vars['vch'].get())
         ich = int(self.sldea_vars['ich'].get())
-        self._sldea_stop = False
-        self._sldea_running = True
-        self.sldea_run_btn.config(state='disabled')
-        self.sldea_abort_btn.config(state='normal')
         # Read the camera entries HERE, on the main thread -- Tk widgets must
         # never be touched from the worker (it can hang the Tcl interpreter).
         cam_exp = self._sldea_cam_value('cam_exposure', 6)
@@ -2588,6 +2616,13 @@ LOGGING:
         except (KeyError, ValueError):
             diam_mm = 16.0
         autoproc = self.sldea_autoproc.get()
+        # Breakdown watchdog (live only)
+        wd_on = self.sldea_wd_on.get() and not dry
+        try:
+            wd_ua = float(self.sldea_vars['wd_ua'].get())
+            wd_s = float(self.sldea_vars['wd_s'].get())
+        except (KeyError, ValueError):
+            wd_ua, wd_s = 100.0, 3.0
         # Free the camera: the Webcam preview holds /dev/video0 open and a
         # one-shot grab can't run while it streams (empty frames otherwise).
         try:
@@ -2597,14 +2632,114 @@ LOGGING:
                 self.cam = None
         except Exception:
             pass
+        # Camera pre-flight gate: check focus / exposure / centering on a
+        # live snapshot before anything runs.
+        if not getattr(self, '_sldea_skip_preflight', False):
+            if not self._sldea_preflight(cam_exp, cam_gain):
+                self._sldea_log("run cancelled at camera pre-flight")
+                return
+        self._sldea_stop = False
+        self._sldea_bd_tripped = False
+        self._sldea_running = True
+        self.sldea_run_btn.config(state='disabled')
+        self.sldea_abort_btn.config(state='normal')
         self._sldea_elapsed = 0.0
-        self._sldea_log(f"{'DRY-RUN' if dry else 'LIVE HV'} start — {p.summary()}")
+        self._sldea_log(f"{'DRY-RUN' if dry else 'LIVE HV'} start — {p.summary()}"
+                        + (f"  [watchdog: >{wd_ua:g} µA for {wd_s:g}s]"
+                           if wd_on else ""))
         threading.Thread(
             target=self._sldea_worker,
             args=(p, self.sldea_outdir.get(), self.sldea_runname.get().strip(),
-                  sgch, vch, ich, dry, cam_exp, cam_gain, diam_mm, autoproc),
+                  sgch, vch, ich, dry, cam_exp, cam_gain, diam_mm, autoproc,
+                  wd_on, wd_ua, wd_s),
             daemon=True).start()
         self.root.after(100, self._sldea_animate_cursor)   # scroll the playhead
+
+    def _sldea_preflight(self, cam_exp, cam_gain):
+        """Modal camera pre-flight: one fresh snapshot with a centering
+        reticle + focus/exposure stats. Returns True to proceed."""
+        frame = None
+        try:
+            spec = webcam.resolve_camera(0)
+            if spec.get('kind') == 'bayer':
+                dev = spec['device']
+                for ctrl, val in (('auto_exposure', 1),
+                                  ('white_balance_automatic', 0),
+                                  ('exposure_time_absolute', cam_exp),
+                                  ('gain', cam_gain)):
+                    webcam.set_control(dev, ctrl, val)
+            frame = webcam.oneshot_rgb(spec, count=3)
+        except Exception:
+            frame = None
+        if frame is None:
+            return messagebox.askyesno(
+                "Camera pre-flight",
+                "No camera frame available — the run would capture no "
+                "images.\n\nContinue anyway?")
+
+        import numpy as np
+        from PIL import Image, ImageDraw, ImageTk
+        gray = frame.mean(axis=2)
+        mean = float(gray.mean())
+        sat = float((gray >= 250).mean() * 100)
+        try:
+            focus = webcam.focus_score(frame)
+        except Exception:
+            focus = None
+        hints = []
+        if mean < 40:
+            hints.append("⚠ looks DARK — raise exposure/lighting")
+        if mean > 215 or sat > 8:
+            hints.append("⚠ looks BRIGHT/clipped — lower exposure")
+        if not hints:
+            hints.append("exposure OK")
+
+        win = tk.Toplevel(self.root)
+        win.title("Camera pre-flight — SLDEA run")
+        win.grab_set()
+        result = {'go': False}
+        h, w = frame.shape[:2]
+        scale = 520 / w
+        img = Image.fromarray(frame).resize((520, int(h * scale)))
+        dr = ImageDraw.Draw(img)
+        cx, cy = img.width / 2, img.height / 2
+        dr.line([(cx, 0), (cx, img.height)], fill='#00e676', width=1)
+        dr.line([(0, cy), (img.width, cy)], fill='#00e676', width=1)
+        r = img.height * 0.32
+        dr.ellipse([cx - r, cy - r, cx + r, cy + r], outline='#00e676',
+                   width=2)
+        photo = ImageTk.PhotoImage(img)
+        lbl = tk.Label(win, image=photo)
+        lbl.image = photo               # keep a reference
+        lbl.pack(padx=8, pady=8)
+        stats = (f"focus {focus:.0f}   " if focus is not None else "") + \
+            f"mean {mean:.0f}   saturated {sat:.1f}%   —   " + \
+            "; ".join(hints)
+        tk.Label(win, text=stats, fg='#1f3a5f').pack()
+        tk.Label(win, text="Check: DEA centred in the circle · in focus · "
+                           "no glare / clipping", fg='#555').pack(pady=(0, 6))
+        bf = ttk.Frame(win)
+        bf.pack(pady=(0, 10))
+
+        def go():
+            result['go'] = True
+            win.destroy()
+
+        def adjust():
+            win.destroy()
+            for i in range(len(self.notebook.tabs())):
+                if self.notebook.tab(i, 'text') == 'Webcam':
+                    self.notebook.select(i)
+                    break
+
+        ttk.Button(bf, text="✔ Looks good — start run",
+                   command=go).pack(side=tk.LEFT, padx=6)
+        ttk.Button(bf, text="✎ Adjust (open Webcam tab)",
+                   command=adjust).pack(side=tk.LEFT, padx=6)
+        ttk.Button(bf, text="✖ Cancel",
+                   command=win.destroy).pack(side=tk.LEFT, padx=6)
+        self.root.wait_window(win)
+        return result['go']
 
     def _sldea_open_edge_review(self, rundir, auto=False):
         """Launch the offline SLDEA Edge Review program (its own process, so
@@ -2643,7 +2778,8 @@ LOGGING:
         self.root.after(0, lambda: self.sldea_status.config(text=text, fg=fg))
 
     def _sldea_worker(self, p, outdir, runname, sgch, vch, ich, dry,
-                      cam_exp=6, cam_gain=60, diam_mm=16.0, autoproc=False):
+                      cam_exp=6, cam_gain=60, diam_mm=16.0, autoproc=False,
+                      wd_on=False, wd_ua=100.0, wd_s=3.0):
         """Host-sequenced staircase runner (daemon thread; no Tk calls except
         via _sldea_log/_sldea_set_status/after). Drives the SG DC offset along
         p.kv_at(t), fires webcam+scope snapshots on schedule, writes the run
@@ -2695,11 +2831,38 @@ LOGGING:
             t0 = time.monotonic()
             last_status = -1.0
             last_kv = None
+            watchdog = (sldea_profile.BreakdownWatchdog(wd_ua, wd_s)
+                        if (wd_on and not dry and self.scope) else None)
+            last_wd = -1.0
             while not self._sldea_stop:
                 el = time.monotonic() - t0
                 self._sldea_elapsed = el          # feeds the preview playhead
                 if el > p.total_duration_s + 0.3:
                     break
+                # Breakdown watchdog: ~2 Hz current check; deliberately slow
+                # to trip (sustained overcurrent only -- see BreakdownWatchdog)
+                if watchdog is not None and el - last_wd >= 0.5:
+                    last_wd = el
+                    try:
+                        mi = self.scope.measure('MEAN', ich)
+                        ua = measured_ua(mi) if mi is not None else None
+                    except Exception:
+                        ua = None
+                    if watchdog.update(el, ua):
+                        self._sldea_bd_tripped = True
+                        self._sldea_log(
+                            f"⚡ BREAKDOWN CONFIRMED — I={watchdog.last_ua:.0f}"
+                            f" µA sustained >{wd_s:g}s. Capturing frame, "
+                            f"ramping to 0, aborting.")
+                        self._sldea_capture(
+                            p, {'t': el, 'step': 99,
+                                'nominal_kv': p.kv_at(el),
+                                'tag': 'breakdown'},
+                            si + 1, spec, framedir, writer, fh, vch, ich,
+                            dry, note=f"WATCHDOG: breakdown confirmed "
+                                      f"(>{wd_ua:g}µA for {wd_s:g}s)")
+                        self._sldea_stop = True
+                        break
                 if not dry and self.sg:
                     kv = p.kv_at(el)
                     if last_kv is None or abs(kv - last_kv) > 1e-4:
@@ -2720,9 +2883,16 @@ LOGGING:
                         fg='#8a5a00' if dry else '#a01010')
                     last_status = el
                 time.sleep(self.SLDEA_POLL_S)
-            done = 'aborted' if self._sldea_stop else 'complete'
+            if getattr(self, '_sldea_bd_tripped', False):
+                done = 'BREAKDOWN-ABORT'
+            elif self._sldea_stop:
+                done = 'aborted'
+            else:
+                done = 'complete'
             self._sldea_log(f"run {done}: {si}/{len(snaps)} frames")
-            self._sldea_set_status(f"{done} — {si} frames", fg='#2e7d32')
+            self._sldea_set_status(
+                f"{done} — {si} frames",
+                fg='#c62828' if done == 'BREAKDOWN-ABORT' else '#2e7d32')
             if done == 'complete' and autoproc and si > 0:
                 self._sldea_log("auto-opening Edge Review…")
                 self.root.after(
@@ -2751,7 +2921,7 @@ LOGGING:
             return default
 
     def _sldea_capture(self, p, snap, index, spec, framedir, writer, fh,
-                       vch, ich, dry):
+                       vch, ich, dry, note=''):
         import os
         frame = None
         if spec is not None:
@@ -2796,7 +2966,7 @@ LOGGING:
             'timestamp': datetime.now().isoformat(timespec='milliseconds'),
             'frame_file': fname,
             'active_area_px': '', 'active_area_mm2': '', 'active_diam_mm': '',
-            'notes': '',
+            'notes': note,
         })
         fh.flush()
         meas = (f"  meas {mkv:.2f} kV / {mua:.0f} µA"

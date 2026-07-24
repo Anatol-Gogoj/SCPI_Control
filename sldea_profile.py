@@ -63,6 +63,44 @@ def fmt_duration(seconds):
     return f"{s // 3600:d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
 
 
+class BreakdownWatchdog:
+    """Deliberately SLOW-to-trip breakdown detector for live runs.
+
+    Watches the Trek current (via the scope's I_Out monitor) and only
+    declares breakdown after the current has stayed at/above `trip_ua` for
+    `confirm_s` seconds of CONSECUTIVE samples -- any single reading below
+    the threshold resets the streak, and unreadable samples (None) are
+    ignored without resetting. The point is to be essentially certain before
+    aborting a long run: a transient spike or one glitchy scope read never
+    trips it.
+    """
+
+    def __init__(self, trip_ua=100.0, confirm_s=3.0):
+        self.trip_ua = float(trip_ua)
+        self.confirm_s = float(confirm_s)
+        self._over_since = None
+        self.tripped = False
+        self.last_ua = None
+
+    def update(self, t_s, ua):
+        """Feed one sample (time in s, current in uA; ua may be None).
+        Returns True the moment breakdown is CONFIRMED."""
+        if self.tripped:
+            return True
+        if ua is None:
+            return False                 # unreadable: no evidence either way
+        self.last_ua = ua
+        if abs(ua) >= self.trip_ua:
+            if self._over_since is None:
+                self._over_since = t_s
+            elif t_s - self._over_since >= self.confirm_s:
+                self.tripped = True
+                return True
+        else:
+            self._over_since = None      # dipped below: start over
+        return False
+
+
 class SldeaProfile:
     """A full staircase test built from the tab's input fields."""
 
