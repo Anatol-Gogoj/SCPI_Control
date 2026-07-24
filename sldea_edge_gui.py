@@ -72,6 +72,8 @@ class EdgeReviewApp:
         self.detect_btn.pack(side=tk.LEFT, padx=10)
         ttk.Button(top, text="Advanced…",
                    command=self._advanced).pack(side=tk.LEFT)
+        ttk.Button(top, text="🎚 Tune…",
+                   command=self._open_tuner).pack(side=tk.LEFT, padx=(6, 0))
         self.save_btn = ttk.Button(top, text="💾 Save to data.csv…",
                                    command=self.save, state='disabled')
         self.save_btn.pack(side=tk.RIGHT)
@@ -596,6 +598,20 @@ class EdgeReviewApp:
             cv2.polylines(img, [np.asarray(r['contour'], np.int32)], True,
                           (80, 200, 0), 2)
             cv2.imwrite(os.path.join(outdir, os.path.basename(path)), img)
+
+    def _open_tuner(self):
+        """Launch the live slider tuner on the current run (own process)."""
+        if not self.rundir:
+            messagebox.showinfo("Tune", "Pick a run first")
+            return
+        import subprocess
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              'sldea_tuner.py')
+        try:
+            subprocess.Popen([sys.executable, script, self.rundir],
+                             start_new_session=True)
+        except Exception as e:
+            messagebox.showerror("Tune", f"Could not launch: {e}")
 
     # ---------------- advanced settings ----------------
     def _advanced(self):
