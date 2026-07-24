@@ -321,6 +321,13 @@ _CTRL_ORDER = ('auto_exposure', 'white_balance_automatic')
 CAMERA_SETTINGS_PATH = os.path.join(
     os.path.expanduser('~'), '.local', 'share', 'scpi_control',
     'camera_controls.json')
+# Fallback: the launcher's cache dir is created BY the user at every launch,
+# so it is always writable -- unlike ~/.local/share/scpi_control, which the
+# root-run desktop installer created root-owned in one user's home (bench
+# 2026-07-24: Apply & Lock -> Errno 13 for robotincubator).
+CAMERA_SETTINGS_FALLBACK = os.path.join(
+    os.path.expanduser('~'), '.cache', 'scpi_control',
+    'camera_controls.json')
 
 
 def set_locked(controls):
@@ -347,10 +354,8 @@ def apply_locked(device):
     return n
 
 
-def save_camera_settings(controls, path=None):
-    """Persist the locked controls (JSON) so they survive restarts."""
+def _write_settings(controls, path):
     import json
-    path = path or CAMERA_SETTINGS_PATH
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + '.tmp'
     with open(tmp, 'w') as f:
@@ -360,16 +365,38 @@ def save_camera_settings(controls, path=None):
     return path
 
 
+def save_camera_settings(controls, path=None):
+    """Persist the locked controls (JSON) so they survive restarts.
+
+    With no explicit path, tries CAMERA_SETTINGS_PATH then falls back to
+    CAMERA_SETTINGS_FALLBACK when the primary is unwritable (e.g. a
+    root-owned dir left by the installer). Returns the path actually
+    written; raises only if every candidate fails."""
+    if path is not None:
+        return _write_settings(controls, path)
+    last = None
+    for cand in (CAMERA_SETTINGS_PATH, CAMERA_SETTINGS_FALLBACK):
+        try:
+            return _write_settings(controls, cand)
+        except OSError as e:
+            last = e
+    raise last
+
+
 def load_camera_settings(path=None):
-    """Previously saved controls, or {}."""
+    """Previously saved controls, or {}. Checks the fallback location too."""
     import json
-    try:
-        with open(path or CAMERA_SETTINGS_PATH) as f:
-            data = json.load(f)
-        return {str(k): int(v) for k, v in data.items()} \
-            if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    paths = [path] if path is not None else [CAMERA_SETTINGS_PATH,
+                                             CAMERA_SETTINGS_FALLBACK]
+    for p in paths:
+        try:
+            with open(p) as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return {str(k): int(v) for k, v in data.items()}
+        except (OSError, ValueError):
+            continue
+    return {}
 
 
 _CTRL_LINE = re.compile(

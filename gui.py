@@ -4832,16 +4832,32 @@ LOGGING:
         def work():
             webcam.set_locked(controls)
             n = webcam.apply_locked(device)
-            webcam.save_camera_settings(controls)
-            return n
+            # Persistence must never sink the LOCK itself (bench 2026-07-24:
+            # a root-owned ~/.local/share/scpi_control gave Errno 13 here).
+            try:
+                saved = webcam.save_camera_settings(controls)
+                err = None
+            except OSError as e:
+                saved, err = None, str(e)
+            return n, saved, err
 
-        def done(n, error):
+        def done(result, error):
             if error:
                 messagebox.showerror("Camera", str(error))
                 return
-            self.cam_sensor_status.config(
-                text=f"🔒 locked {n} controls (re-stamped on every capture; "
-                     "saved for next start)", foreground='#2e7d32')
+            n, saved, err = result
+            if saved:
+                note = (" (fallback location)" if saved ==
+                        webcam.CAMERA_SETTINGS_FALLBACK else "")
+                self.cam_sensor_status.config(
+                    text=f"🔒 locked {n} controls — saved for next "
+                         f"start{note}", foreground='#2e7d32')
+            else:
+                self.cam_sensor_status.config(
+                    text=f"🔒 locked {n} controls — but could NOT save for "
+                         f"next start ({err}). Fix ownership: mv "
+                         f"~/.local/share/scpi_control{{,.bak}}",
+                    foreground='#b36b00')
             self.status_bar.config(text=f"Camera: {n} controls locked")
 
         self._run_bg(work, done, busy='camera-ctrl')
