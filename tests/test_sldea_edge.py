@@ -68,6 +68,47 @@ def test_oblong_shape_scores_like_a_circle():
     assert best['conf'] > 0.75
 
 
+def test_wrinkled_region_outranks_bigger_smooth_one():
+    # Lab definition: the WRINKLED region is the active area. A patch filled
+    # with high-frequency stripes must outrank a bigger, SEPARATE smooth blob.
+    yy, xx = np.mgrid[0:300, 0:300]
+    # mildly textured baseline (a flat base makes the texture ratio
+    # degenerate; real frames always carry sensor grain)
+    base = (100.0 + 2.0 * ((xx // 8 + yy // 8) % 2)).astype(np.float32)
+    img = base.copy()
+    smooth = (xx - 90) ** 2 + (yy - 150) ** 2 <= 55 * 55      # big faint blob
+    img[smooth] += 12
+    wr = (xx - 215) ** 2 + (yy - 150) ** 2 <= 35 * 35         # wrinkled patch
+    img[wr] += 15 + 40 * ((xx[wr] // 4) % 2)                  # strong stripes
+    cands = se.candidates(base, img, dict(se.DEFAULT_SETTINGS))
+    assert cands, "no candidates"
+    best = cands[0]
+    assert best['wrinkle'] > 1.4, best
+    # best outline centres on the wrinkled patch, not the smooth blob
+    assert abs(best['cx'] - 215) < 45, \
+        f"best candidate is not the wrinkled patch (cx={best['cx']:.0f})"
+
+
+def test_wrinkle_onset_annotations():
+    rows = [{} for _ in range(5)]
+    results = {1: {'wrinkle': 1.1}, 2: {'wrinkle': 1.9},
+               3: {'wrinkle': 2.4}, 4: None}
+    onset, annos = se.wrinkle_onset(rows, results, se.DEFAULT_SETTINGS)
+    assert onset == 2
+    assert 'onset' in annos[2] and 'onset' not in annos[3]
+    assert 1 not in annos and 4 not in annos
+
+
+def test_apply_results_writes_wrinkle_and_annos():
+    rows = [{'tag': 'post-ramp', 'nominal_kV': '5'}]
+    results = {0: {'area_px': 100.0, 'diam_px': 11.3, 'conf': 0.9,
+                   'method': 'diff-hi', 'wrinkle': 2.1}}
+    se.apply_results(rows, results, None, {},
+                     {0: 'wrinkle-mode onset (idx 2.1)'})
+    assert rows[0]['wrinkle_idx'] == '2.10'
+    assert 'wrinkle-mode onset' in rows[0]['notes']
+
+
 def test_no_change_gate_returns_empty():
     # Identical frame (plus faint noise) => no candidates, not a fabricated
     # outline -- this was the 'randomly placed circle' failure mode.

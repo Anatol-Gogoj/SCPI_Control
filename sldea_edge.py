@@ -40,6 +40,7 @@ DEFAULT_SETTINGS = {
     'spread_pct': 12.0,     # candidate area disagreement that forces review
     'breakdown_ua': 50.0,   # Trek current above this flags breakdown
     'area_jump_pct': 35.0,  # area collapse (V rising) that flags breakdown
+    'wrinkle_ratio': 1.4,   # wrinkle index >= this = wrinkle-mode (active)
 }
 _NUM = r'[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?'
 
@@ -163,6 +164,42 @@ def _region_candidate(mask, method, offset=(0, 0)):
 DETECT_MAX_W = 640
 
 
+def _wrinkle_ratio(base_full, img_full, contour):
+    """Wrinkle index for one outline, at FULL resolution.
+
+    Denoise-then-texture: Gaussian blur (sigma 2.5) kills the sensor grain,
+    then mean |Laplacian| inside the outline, frame vs the same region of the
+    baseline. Wrinkling/buckling under field is the activated DEA state --
+    the lab defines the wrinkled region AS the active area. The pre-blur is
+    essential on the bench camera: raw Laplacian is dominated by pixel noise
+    (which the baseline has everywhere) while the wrinkle ridges are
+    multi-pixel and survive the blur (bench 2026-07-23: raw full-res ratio
+    read ~0.9 on obviously wrinkled frames; blurred reads cleanly > 1).
+    Cropped to the outline's bounding box, so it stays cheap."""
+    import cv2
+    if base_full is None:
+        return 1.0
+    pts = np.asarray(contour, np.int32)
+    h, w = img_full.shape
+    x0 = max(int(pts[:, 0].min()) - 8, 0)
+    x1 = min(int(pts[:, 0].max()) + 8, w)
+    y0 = max(int(pts[:, 1].min()) - 8, 0)
+    y1 = min(int(pts[:, 1].max()) + 8, h)
+    if x1 - x0 < 16 or y1 - y0 < 16:
+        return 1.0
+    mask = np.zeros((y1 - y0, x1 - x0), np.uint8)
+    cv2.drawContours(mask, [pts - np.array([x0, y0])], -1, 255, -1)
+    if not (mask > 0).any():
+        return 1.0
+    bi = cv2.GaussianBlur(img_full[y0:y1, x0:x1], (0, 0), 2.5)
+    bb = cv2.GaussianBlur(base_full[y0:y1, x0:x1], (0, 0), 2.5)
+    e_img = float(np.abs(cv2.Laplacian(bi, cv2.CV_32F,
+                                       ksize=3))[mask > 0].mean())
+    e_base = float(np.abs(cv2.Laplacian(bb, cv2.CV_32F,
+                                        ksize=3))[mask > 0].mean())
+    return round(min(e_img / max(e_base, 1e-3), 9.99), 2)
+
+
 def candidates(base_gray, img_gray, settings):
     """Up to 3 candidate outlines for the active area, best first.
 
@@ -186,6 +223,7 @@ def candidates(base_gray, img_gray, settings):
     every px quantity is rescaled to full resolution.
     """
     import cv2
+    img_full, base_full = img_gray, base_gray   # full-res kept for wrinkle
     h0, w0 = img_gray.shape
     f = 1.0
     if w0 > DETECT_MAX_W:
@@ -223,7 +261,7 @@ def candidates(base_gray, img_gray, settings):
             out.append(c)
     if not out:
         return []
-    # boundary contrast: diff level inside the shape vs just outside it
+    # boundary contrast (downscaled): diff level inside vs just outside
     ker = np.ones((15, 15), np.uint8)
     for c in out:
         m = np.zeros_like(sub)
@@ -244,12 +282,19 @@ def candidates(base_gray, img_gray, settings):
             c['cx'] *= inv
             c['cy'] *= inv
             c['contour'] = (np.asarray(c['contour'], float) * inv).astype(int)
+    # wrinkle index at full resolution (contours are full-res now)
+    for c in out:
+        c['wrinkle'] = _wrinkle_ratio(base_full, img_full, c['contour'])
     areas = np.array([c['area_px'] for c in out], float)
     spread = float(areas.std() / areas.mean()) if len(out) > 1 else 0.0
     agreement = max(0.0, 1.0 - spread)
     for c in out:
-        c['conf'] = round(0.4 * c['solidity'] + 0.3 * c['contrast']
-                          + 0.3 * agreement, 3)
+        # wrinkle bonus: the lab defines the wrinkled region AS the active
+        # area, so a candidate whose interior is wrinkle-textured outranks a
+        # bigger smooth one.
+        wbonus = max(0.0, min(1.0, (c['wrinkle'] - 1.0) / 1.5))
+        c['conf'] = round(0.3 * c['solidity'] + 0.3 * c['contrast']
+                          + 0.2 * agreement + 0.2 * wbonus, 3)
         c['spread_pct'] = round(100 * spread, 1)
     out.sort(key=lambda c: c['conf'], reverse=True)
     return out[:3]
@@ -300,6 +345,33 @@ def breakdown_flags(rows, accepted_areas, settings):
     return flags
 
 
+def wrinkle_onset(rows, results, settings):
+    """Wrinkle-MODE detection over the accepted results.
+
+    The wrinkle index (stored on each candidate by `candidates`) compares
+    high-frequency texture inside the outline to the same region of the
+    baseline. At/above `wrinkle_ratio` the DEA is in its wrinkled (activated)
+    state. Returns (onset_row_index_or_None, {row_index: annotation}):
+    the first wrinkled row is annotated 'wrinkle-mode onset', later ones
+    'wrinkle-mode'. These are informational notes -- NOT breakdown flags, so
+    they never trigger the _BREAKDOWN file renaming."""
+    lim = float(settings.get('wrinkle_ratio', 1.6))
+    onset = None
+    annos = {}
+    for i in range(len(rows)):
+        r = results.get(i)
+        if not r:
+            continue
+        w = float(r.get('wrinkle') or 0)
+        if w >= lim:
+            if onset is None:
+                onset = i
+                annos[i] = f"wrinkle-mode onset (idx {w:g})"
+            else:
+                annos[i] = f"wrinkle-mode (idx {w:g})"
+    return onset, annos
+
+
 # ---------------------------------------------------------------------------
 # scale + write-back
 # ---------------------------------------------------------------------------
@@ -322,8 +394,11 @@ def mm_per_px(results, rows, settings):
     return float(settings['diam_mm']) / float(ref['diam_px'])
 
 
-def apply_results(rows, results, scale, flags):
-    """Fill the active_area_* / notes columns in `rows` (in place)."""
+def apply_results(rows, results, scale, flags, annos=None):
+    """Fill the active_area_* / wrinkle_idx / notes columns in `rows`
+    (in place). `annos` are informational notes (e.g. wrinkle-mode) appended
+    alongside the breakdown flags but never treated as breakdown."""
+    annos = annos or {}
     for i, row in enumerate(rows):
         r = results.get(i)
         if r:
@@ -331,6 +406,8 @@ def apply_results(rows, results, scale, flags):
             if scale:
                 row['active_area_mm2'] = f"{r['area_px'] * scale * scale:.3f}"
                 row['active_diam_mm'] = f"{r['diam_px'] * scale:.3f}"
+            if r.get('wrinkle') is not None:
+                row['wrinkle_idx'] = f"{float(r['wrinkle']):.2f}"
             note = f"edge:{r['method']} conf {r['conf']:.2f}"
             if r.get('chosen_by'):
                 note += f" ({r['chosen_by']})"
@@ -339,8 +416,9 @@ def apply_results(rows, results, scale, flags):
             note = 'rejected (no reliable edge)'
         else:
             note = row.get('notes') or ''
-        if i in flags:
-            note = (note + '; ' if note else '') + flags[i]
+        for extra in (flags.get(i), annos.get(i)):
+            if extra:
+                note = (note + '; ' if note else '') + extra
         row['notes'] = note
     return rows
 
