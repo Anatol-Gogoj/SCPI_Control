@@ -45,12 +45,12 @@ def test_snapshot_times_and_tags():
     assert tags[0] == 'baseline'
     assert p.snapshots[0]['t'] == 0.0
     # first landing is 2 kV (0 kV is baseline): ramp 0->5, hold 5..65
-    post = next(s for s in p.snapshots if s['step'] == 1 and s['tag'] == 'post')
-    pre = next(s for s in p.snapshots if s['step'] == 1 and s['tag'] == 'pre')
+    post = next(s for s in p.snapshots if s['step'] == 1 and s['tag'] == 'post-ramp')
+    pre = next(s for s in p.snapshots if s['step'] == 1 and s['tag'] == 'pre-ramp')
     assert post['t'] == 5 + 2 and post['nominal_kv'] == 2   # ramp_end + settle
     assert pre['t'] == 65 - 1                                # hold_end - lead
     # second landing (4 kV): starts at t=65
-    post2 = next(s for s in p.snapshots if s['step'] == 2 and s['tag'] == 'post')
+    post2 = next(s for s in p.snapshots if s['step'] == 2 and s['tag'] == 'post-ramp')
     assert post2['t'] == 65 + 5 + 2
     assert post2['nominal_kv'] == 4
 

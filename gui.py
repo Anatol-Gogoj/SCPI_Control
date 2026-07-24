@@ -2355,7 +2355,7 @@ LOGGING:
                                 pady=(6, 0))
 
         prev = ttk.LabelFrame(f, text="Preview — kV vs time  "
-                              "(● baseline  ● post-ramp  ● pre-step)", padding=6)
+                              "(● baseline  ● post-ramp  ● pre-ramp)", padding=6)
         prev.pack(fill='x', padx=10, pady=8)
         self.sldea_canvas = tk.Canvas(prev, height=210, bg='white',
                                       highlightthickness=0)
@@ -2492,7 +2492,8 @@ LOGGING:
             pts += [X(t0), Y(a), X(t1), Y(b)]
         if pts:
             c.create_line(*pts, fill='#1565c0', width=2)
-        colour = {'baseline': '#888888', 'post': '#2e7d32', 'pre': '#c62828'}
+        colour = {'baseline': '#888888', 'post-ramp': '#2e7d32',
+                  'pre-ramp': '#c62828'}
         for s in p.snapshots:
             x, y = X(s['t']), Y(s['nominal_kv'])
             c.create_oval(x - 3, y - 3, x + 3, y + 3,

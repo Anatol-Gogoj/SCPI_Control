@@ -137,11 +137,11 @@ class SldeaProfile:
             if self.snap_post:
                 self.snapshots.append(
                     {'t': t_ramp_end + self.settle_s, 'step': step,
-                     'nominal_kv': lvl, 'tag': 'post'})
+                     'nominal_kv': lvl, 'tag': 'post-ramp'})
             if self.snap_pre:
                 self.snapshots.append(
                     {'t': t_hold_end - self.snap_lead_s, 'step': step,
-                     'nominal_kv': lvl, 'tag': 'pre'})
+                     'nominal_kv': lvl, 'tag': 'pre-ramp'})
             prev = lvl
             t = t_hold_end
         self.total_duration_s = t
@@ -213,8 +213,9 @@ class SldeaProfile:
             "--- Snapshots ---",
             "baseline @ 0 kV" if self.baseline else "(no baseline)",
             "per landing: "
-            + ", ".join(([f"post (ramp-end + {self.settle_s:g}s)"]
+            + ", ".join(([f"post-ramp (ramp-end + {self.settle_s:g}s)"]
                          if self.snap_post else [])
-                        + ([f"pre (landing-end - {self.snap_lead_s:g}s)"]
+                        + ([f"pre-ramp (landing-end - {self.snap_lead_s:g}s, "
+                            f"just before the next ramp)"]
                            if self.snap_pre else [])),
         ]) + "\n"
