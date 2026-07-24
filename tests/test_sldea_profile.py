@@ -8,8 +8,38 @@ import sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(
     _os.path.abspath(__file__))))
 
-from sldea_profile import (SldeaProfile, compute_levels, control_v_for_kv,
-                           measured_kv, measured_ua, TREK_MAX_KV)
+from sldea_profile import (SldeaProfile, BreakdownWatchdog, compute_levels,
+                           control_v_for_kv, measured_kv, measured_ua,
+                           TREK_MAX_KV)
+
+
+def test_watchdog_trips_only_after_sustained_current():
+    wd = BreakdownWatchdog(trip_ua=100, confirm_s=3.0)
+    assert not wd.update(0.0, 150)          # first over-sample starts streak
+    assert not wd.update(1.0, 160)
+    assert not wd.update(2.9, 170)          # 2.9 s < confirm window
+    assert wd.update(3.1, 155)              # sustained >= 3 s -> CONFIRMED
+    assert wd.tripped and wd.update(4.0, 5) # latched once tripped
+
+
+def test_watchdog_dip_resets_streak():
+    wd = BreakdownWatchdog(trip_ua=100, confirm_s=3.0)
+    wd.update(0.0, 150)
+    wd.update(2.0, 150)
+    assert not wd.update(2.5, 40)           # dip below -> reset
+    wd.update(3.0, 150)                     # new streak starts here
+    assert not wd.update(5.5, 150)          # only 2.5 s into new streak
+    assert wd.update(6.1, 150)
+
+
+def test_watchdog_ignores_unreadable_samples():
+    wd = BreakdownWatchdog(trip_ua=100, confirm_s=2.0)
+    wd.update(0.0, 150)
+    assert not wd.update(1.0, None)         # glitch: no reset, no evidence
+    assert wd.update(2.2, 150)              # streak survived the None
+    wd2 = BreakdownWatchdog(trip_ua=100, confirm_s=2.0)
+    assert not wd2.update(0.0, None)        # None never starts a streak
+    assert not wd2.tripped
 
 
 def test_scaling():
