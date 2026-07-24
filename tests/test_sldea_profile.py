@@ -105,11 +105,13 @@ def test_naming_and_csv_columns():
 def test_setup_text_covers_key_facts():
     p = SldeaProfile(start_kv=0, end_kv=8, step_kv=0.2, ramp_s=5, landing_s=60)
     txt = p.setup_text('SLDEA_x', '2026-07-23T14:00', sg_ch=2, vmon_ch=1,
-                       imon_ch=2, dry_run=True, cam_info='exp 6, WB off')
+                       imon_ch=2, dry_run=True, cam_info='exp 6, WB off',
+                       dea_diam_mm=16)
     assert 'DRY RUN' in txt
     assert 'CH2' in txt and 'CH1' in txt
     assert '2000 uA' in txt
     assert 'exp 6, WB off' in txt
+    assert 'DEA nominal diameter: 16 mm' in txt
 
 
 def _run():

@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  Deploy / refresh SCPI_Control onto the shared drive so any user
+#  (amg17031 OR robotincubator) can launch it with launch_gui.sh.
+#
+#  Default: fetch the latest main from GitHub (public repo, anonymous pull) via
+#  a fresh shallow clone into LOCAL /tmp -- git can't run reliably on the CIFS
+#  share -- then rsync that into the shared app dir. Works for any user.
+#
+#  Dev override (deploy a local working tree instead of pulling main):
+#      SCPI_SRC=/home/amg17031/projects/SCPI_Control bash update_software.sh
+# ============================================================================
+set -euo pipefail
+
+REPO_URL="https://github.com/Anatol-Gogoj/SCPI_Control.git"
+DEST="/mnt/shareDrive/_software"
+APP="$DEST/SCPI_Control"
+LIBS="$DEST/pylibs"
+export GIT_TERMINAL_PROMPT=0          # never hang on a credential prompt
+
+CLEANUP=""
+if [ -n "${SCPI_SRC:-}" ]; then
+  SRC="$SCPI_SRC"
+  [ -d "$SRC" ] || { echo "SCPI_SRC not found: $SRC" >&2; exit 1; }
+  echo "0/3  Using local checkout $SRC (dev override)"
+  [ -d "$SRC/.git" ] && { git -c safe.directory="$SRC" -C "$SRC" pull --ff-only \
+      || echo "     pull skipped (uncommitted/diverged) -- deploying working tree"; }
+else
+  SRC="$(mktemp -d /tmp/scpi-src-XXXXXX)"      # local disk: CIFS corrupts git
+  CLEANUP="$SRC"
+  trap '[ -n "$CLEANUP" ] && rm -rf "$CLEANUP"' EXIT
+  echo "0/3  Cloning latest main from GitHub -> $SRC"
+  git clone -q --depth 1 "$REPO_URL" "$SRC"
+fi
+
+PIP_PY="$SRC/.venv/bin/python"
+[ -x "$PIP_PY" ] || PIP_PY=/usr/bin/python3.11
+mkdir -p "$APP" "$LIBS"
+
+echo "1/3  Syncing app code -> $APP"
+rsync -a --delete \
+  --exclude '.git' --exclude '.venv' --exclude '__pycache__' \
+  --exclude '*.pyc' --exclude 'presets' \
+  "$SRC"/ "$APP"/
+mkdir -p "$APP/presets/arb"
+[ -f "$APP/presets/siggen_presets.json" ] || \
+  printf '{\n  "version": 1,\n  "presets": {}\n}\n' > "$APP/presets/siggen_presets.json"
+
+echo "2/3  Stamping build hash into version.py"
+HASH="$(git -c safe.directory="$SRC" -C "$SRC" rev-parse --short HEAD 2>/dev/null || true)"
+if [ -n "$HASH" ] && [ -f "$APP/version.py" ]; then
+  sed -i -E "s/^(__version__ = \")([^\"]*)(\")/\1\2+$HASH\3/" "$APP/version.py"
+  echo "     stamped +$HASH"
+else
+  echo "     (no git hash available; footer shows plain version)"
+fi
+
+echo "3/3  Installing Python deps (staged locally, then synced -> $LIBS)"
+# Stage the whole dependency set on LOCAL disk first, then one rsync to the
+# share. Installing straight into the CIFS pylibs left a long window where a
+# user's launcher could cache-sync a HALF-WRITTEN package (bench 2026-07-23:
+# torn pandas -> "No module named pandas.util" in the Battery tab), and
+# repeated in-place --upgrade also left duplicate *.dist-info dirs.
+STAGE="$(mktemp -d /tmp/scpi-libs-XXXXXX)"
+"$PIP_PY" -m pip install --quiet --target="$STAGE" -r "$SRC/requirements.txt"
+rsync -a --delete "$STAGE"/ "$LIBS"/
+rm -rf "$STAGE"
+
+echo "Done. Launch with:  bash $DEST/launch_gui.sh"
