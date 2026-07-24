@@ -133,6 +133,12 @@ def _contour_candidate(mask, method):
             'contour': c.reshape(-1, 2)}
 
 
+# Detection runs on a downscaled copy: full-res HoughCircles on a 1080p
+# frame takes ~minutes (accumulator blow-up on noise) while the disc needs
+# nowhere near that resolution. Results are rescaled to full-res px.
+DETECT_MAX_W = 640
+
+
 def candidates(base_gray, img_gray, settings):
     """Up to 3 candidate outlines for the active area, best first.
 
@@ -140,9 +146,21 @@ def candidates(base_gray, img_gray, settings):
     b) diff-fixed : same, fixed threshold (diff_thresh, or 0.6*Otsu when auto)
     c) hough      : CLAHE(img) -> HoughCircles, circle nearest frame centre
 
-    Confidence = 0.6*circularity + 0.4*cross-method area agreement.
+    Confidence = 0.6*circularity + 0.4*cross-method area agreement. Frames
+    wider than DETECT_MAX_W are detected at reduced scale (bench: 1080p
+    full-res Hough took ~100 s/frame; downscaled is sub-second) and every
+    px quantity is scaled back to full resolution.
     """
     import cv2
+    h0, w0 = img_gray.shape
+    f = 1.0
+    if w0 > DETECT_MAX_W:
+        f = DETECT_MAX_W / float(w0)
+        size = (DETECT_MAX_W, max(1, int(round(h0 * f))))
+        img_gray = cv2.resize(img_gray, size, interpolation=cv2.INTER_AREA)
+        if base_gray is not None:
+            base_gray = cv2.resize(base_gray, size,
+                                   interpolation=cv2.INTER_AREA)
     k = int(settings.get('blur_px', 5)) | 1
     diff = cv2.absdiff(img_gray, base_gray).astype(np.uint8) \
         if base_gray is not None else img_gray.astype(np.uint8)
@@ -182,6 +200,14 @@ def candidates(base_gray, img_gray, settings):
     out = [c for c in out if c['circ'] >= float(settings.get('min_circ', 0))]
     if not out:
         return []
+    if f != 1.0:                    # rescale every px quantity to full-res
+        inv = 1.0 / f
+        for c in out:
+            c['area_px'] *= inv * inv
+            c['diam_px'] *= inv
+            c['cx'] *= inv
+            c['cy'] *= inv
+            c['contour'] = (np.asarray(c['contour'], float) * inv).astype(int)
     areas = np.array([c['area_px'] for c in out], float)
     spread = float(areas.std() / areas.mean()) if len(out) > 1 else 0.0
     agreement = max(0.0, 1.0 - spread)
@@ -280,6 +306,38 @@ def apply_results(rows, results, scale, flags):
             note = (note + '; ' if note else '') + flags[i]
         row['notes'] = note
     return rows
+
+
+def mark_breakdown_files(run, flags):
+    """Rename every frame at/after the FIRST breakdown flag with a
+    '_BREAKDOWN' suffix so the frames/ listing shows at a glance which images
+    are of a broken-down DEA. Files are renamed, never deleted (they stay
+    useful, e.g. as ML training data); frame_file in the rows is updated to
+    match, and rows after the flag gain a 'post-breakdown' note. Idempotent.
+    Returns the number of files renamed."""
+    if not flags:
+        return 0
+    start = min(flags)
+    renamed = 0
+    for i, row in enumerate(run['rows']):
+        if i < start:
+            continue
+        if i not in flags:
+            note = row.get('notes') or ''
+            if 'post-breakdown' not in note:
+                row['notes'] = (note + '; ' if note else '') + 'post-breakdown'
+        name = (row.get('frame_file') or '').strip()
+        if not name or '_BREAKDOWN' in name:
+            continue
+        base, ext = os.path.splitext(name)
+        new = base + '_BREAKDOWN' + ext
+        src = os.path.join(run['frames_dir'], name)
+        dst = os.path.join(run['frames_dir'], new)
+        if os.path.exists(src):
+            os.replace(src, dst)
+            renamed += 1
+        row['frame_file'] = new     # keep the CSV link valid either way
+    return renamed
 
 
 def write_back(rundir, run):
