@@ -45,6 +45,7 @@ class EdgeReviewApp:
         self.cands_all = {}     # frame row index -> candidate list
         self.results = {}       # row index -> chosen candidate | None=rejected
         self.auto_idx = set()   # auto-accepted row indices
+        self.auto_rej = set()   # auto-rejected (no change / no edge)
         self.frame_rows = []    # row indices that have a frame file
         self.pos = 0
         self.flags = {}
@@ -204,7 +205,7 @@ class EdgeReviewApp:
         self.frame_rows = [i for i, r in enumerate(self.run['rows'])
                            if (r.get('frame_file') or '').strip()]
         self.cands_all, self.results, self.flags = {}, {}, {}
-        self.auto_idx = set()
+        self.auto_idx, self.auto_rej = set(), set()
         self.pos = 0
         self.save_btn.config(state='disabled')
         n = len(self.frame_rows)
@@ -312,11 +313,17 @@ class EdgeReviewApp:
         self._finish_detect()
 
     def _finish_detect(self):
+        self.auto_rej = set()
         for i in self.frame_rows:
             cands = self.cands_all.get(i, [])
             if cands and not se.needs_review(cands, self.settings):
                 self.results[i] = dict(cands[0])
                 self.auto_idx.add(i)
+            elif not cands:
+                # honest no-change/no-edge: nothing to choose, so auto-reject
+                # (browse back + lower min_diff in Advanced to disagree)
+                self.results[i] = None
+                self.auto_rej.add(i)
         self._recount()
         self.detect_btn.config(state='normal')
         self.save_btn.config(state='normal')
@@ -326,7 +333,9 @@ class EdgeReviewApp:
         took = self._fmt_t(time.time() - self._t0) if self._t0 else '?'
         self.status.config(
             text=f"detected {len(self.frame_rows)} frames in {took}: "
-                 f"{len(self.auto_idx)} auto-accepted, {len(q)} need review")
+                 f"{len(self.auto_idx)} auto-accepted, "
+                 f"{len(self.auto_rej)} no-change/no-edge, "
+                 f"{len(q)} need review")
         self.pos = self.frame_rows.index(q[0]) if q else 0
         self._show()
 
@@ -351,6 +360,8 @@ class EdgeReviewApp:
         # info panel
         state = ('auto-accepted' if i in self.auto_idx else
                  'accepted' if chosen else
+                 'no change vs baseline (auto)' if i in self.auto_rej
+                 and i in self.results else
                  'REJECTED' if i in self.results else 'needs review')
         txt = (f"frame {self.pos+1}/{len(self.frame_rows)}   step "
                f"{row.get('step')} [{row.get('tag')}]\n"
@@ -429,10 +440,11 @@ class EdgeReviewApp:
         self._show()
 
     def _accept_next(self):
-        i = self._current()
-        if i is not None and i not in self.results:
-            self._choose_current()      # accept the selected (default best)
-        self._next_unreviewed()
+        # ALWAYS (re)accept the selected candidate -- a frame that was
+        # rejected earlier must flip back to accepted (bench bug 2026-07-23:
+        # a "was it already decided?" guard swallowed the re-accept).
+        self._choose_current()
+        self._advance()
 
     def _reject(self):
         i = self._current()
@@ -441,7 +453,23 @@ class EdgeReviewApp:
         self.results[i] = None
         self.auto_idx.discard(i)
         self._recount()
-        self._next_unreviewed()
+        self._advance()
+
+    def _advance(self):
+        """After accept/reject: jump to the next unreviewed frame (first one
+        after the current position, wrapping), else just the next frame."""
+        q = self._queue_list()
+        if q:
+            i_cur = self._current()
+            later = [i for i in q if i > (i_cur if i_cur is not None else -1)]
+            self.pos = self.frame_rows.index(later[0] if later else q[0])
+            self._show()
+        elif self.pos < len(self.frame_rows) - 1:
+            self._step(+1)
+        else:
+            self._show()
+            self.status.config(text="review complete — Save to data.csv "
+                                    "when ready")
 
     def _step(self, d):
         if not self.frame_rows:
@@ -565,8 +593,14 @@ class EdgeReviewApp:
         tips = {'diam_mm': "DEA resting active-area diameter (mm) — sets the "
                            "px→mm scale via the baseline detection",
                 'blur_px': "Gaussian blur kernel (odd px)",
-                'diff_thresh': "fixed diff threshold; 0 = auto (Otsu)",
-                'min_circ': "drop candidates less circular than this (0–1)",
+                'diff_thresh': "fixed diff threshold; 0 = auto (Otsu tiers)",
+                'min_diff': "diff p99 below this = no change vs baseline "
+                            "(frame auto-rejected; lower it to dig for "
+                            "subtle changes)",
+                'min_solidity': "drop candidates below this solidity (0–1); "
+                                "oblong shapes still score 1.0",
+                'roi_frac': "central search window as a fraction of the "
+                            "frame (ignores electrode glare at the edges)",
                 'accept_conf': "auto-accept at/above this confidence (0–1)",
                 'spread_pct': "candidate area disagreement (%) forcing review",
                 'breakdown_ua': "flag breakdown above this Trek current (µA)",
