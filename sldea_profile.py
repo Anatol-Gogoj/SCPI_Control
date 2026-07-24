@@ -69,8 +69,10 @@ class SldeaProfile:
     CSV_COLUMNS = [
         'snapshot', 'step', 'tag', 'nominal_kV', 'control_V',
         'measured_kV', 'measured_uA', 't_planned_s', 'timestamp', 'frame_file',
-        # left empty at capture time; filled by the edge-detection pass later:
-        'active_area_px', 'active_area_mm2', 'active_diam_mm', 'notes',
+        # left empty at capture time; filled by the edge-detection pass later
+        # (wrinkle_idx = high-freq texture vs baseline; wrinkled = active):
+        'active_area_px', 'active_area_mm2', 'active_diam_mm', 'wrinkle_idx',
+        'notes',
     ]
 
     def __init__(self, start_kv=0.0, end_kv=10.0, step_kv=0.25, n_steps=None,

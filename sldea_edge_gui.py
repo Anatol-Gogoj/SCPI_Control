@@ -377,7 +377,8 @@ class EdgeReviewApp:
                 c = cands[k]
                 self.cand_radios[k].config(
                     text=f"{CAND_KEYS[k]}: {c['method']}  "
-                         f"{c['area_px']:.0f} px²  conf {c['conf']:.2f}",
+                         f"{c['area_px']:.0f} px²  conf {c['conf']:.2f}"
+                         f"  w{c.get('wrinkle', 1):.1f}",
                     state='normal')
             else:
                 self.cand_radios[k].config(text=f"{CAND_KEYS[k]}: —",
@@ -512,7 +513,17 @@ class EdgeReviewApp:
         if not messagebox.askyesno("Save results", msg):
             return
         scale = se.mm_per_px(self.results, self.run['rows'], self.settings)
-        se.apply_results(self.run['rows'], self.results, scale, self.flags)
+        onset, annos = se.wrinkle_onset(self.run['rows'], self.results,
+                                        self.settings)
+        if 'wrinkle_idx' not in self.run['columns']:
+            # older runs predate the column; slot it in before notes
+            cols = self.run['columns']
+            cols.insert(cols.index('notes') if 'notes' in cols else len(cols),
+                        'wrinkle_idx')
+        for row in self.run['rows']:
+            row.setdefault('wrinkle_idx', '')
+        se.apply_results(self.run['rows'], self.results, scale, self.flags,
+                         annos)
         renamed = se.mark_breakdown_files(self.run, self.flags)
         se.write_back(self.rundir, self.run)
         self._clock_on = False
@@ -605,7 +616,10 @@ class EdgeReviewApp:
                 'spread_pct': "candidate area disagreement (%) forcing review",
                 'breakdown_ua': "flag breakdown above this Trek current (µA)",
                 'area_jump_pct': "flag breakdown on area collapse (%) while "
-                                 "voltage rises"}
+                                 "voltage rises",
+                'wrinkle_ratio': "wrinkle index (texture vs baseline) at/"
+                                 "above this = wrinkle-mode; first such "
+                                 "frame is noted as the onset"}
         for r, key in enumerate(se.DEFAULT_SETTINGS):
             ttk.Label(win, text=f"{key}:").grid(row=r, column=0, sticky='e',
                                                 padx=6, pady=3)
