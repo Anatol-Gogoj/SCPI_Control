@@ -306,6 +306,110 @@ def bayer_format(device):
     return choose_bayer(device_formats(device))
 
 
+# ---- full camera-control lock (user knobs) --------------------------------
+# The DFK re-converges/persists whatever its auto algorithms last chose, and
+# nothing used to re-assert the user's values when a stream (re)opened -- so
+# hand-set exposure/WB kept "drifting back". The GUI's Apply & Lock stores
+# every control here, and EVERY capture path (preview stream open + each
+# one-shot grab) stamps them onto the device first. Locked once = locked
+# everywhere. Persisted per-bench in CAMERA_SETTINGS_PATH.
+
+LOCKED_CONTROLS = {}
+# autos must be written before their dependent values (manual exposure gates
+# exposure_time_absolute; WB-auto gates red/blue_balance)
+_CTRL_ORDER = ('auto_exposure', 'white_balance_automatic')
+CAMERA_SETTINGS_PATH = os.path.join(
+    os.path.expanduser('~'), '.local', 'share', 'scpi_control',
+    'camera_controls.json')
+
+
+def set_locked(controls):
+    """Replace the locked-control set ({} clears the lock)."""
+    LOCKED_CONTROLS.clear()
+    LOCKED_CONTROLS.update({k: int(v) for k, v in (controls or {}).items()})
+    return dict(LOCKED_CONTROLS)
+
+
+def apply_locked(device):
+    """Stamp the locked controls onto the device (autos first). Silent
+    no-op when nothing is locked; returns how many controls were set."""
+    if not LOCKED_CONTROLS:
+        return 0
+    n = 0
+    for name in list(_CTRL_ORDER) + [k for k in LOCKED_CONTROLS
+                                     if k not in _CTRL_ORDER]:
+        if name in LOCKED_CONTROLS:
+            try:
+                set_control(device, name, LOCKED_CONTROLS[name])
+                n += 1
+            except Exception:
+                pass
+    return n
+
+
+def save_camera_settings(controls, path=None):
+    """Persist the locked controls (JSON) so they survive restarts."""
+    import json
+    path = path or CAMERA_SETTINGS_PATH
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump({k: int(v) for k, v in controls.items()}, f, indent=2,
+                  sort_keys=True)
+    os.replace(tmp, path)
+    return path
+
+
+def load_camera_settings(path=None):
+    """Previously saved controls, or {}."""
+    import json
+    try:
+        with open(path or CAMERA_SETTINGS_PATH) as f:
+            data = json.load(f)
+        return {str(k): int(v) for k, v in data.items()} \
+            if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+_CTRL_LINE = re.compile(
+    r'^\s*([a-z0-9_]+)\s+0x[0-9a-f]+\s+\((int|bool|menu)\)\s*:\s*(.*)$')
+_MENU_LINE = re.compile(r'^\s*(\d+):\s*(.+?)\s*$')
+
+
+def parse_controls(text):
+    """Parse `v4l2-ctl --list-ctrls-menus` output into a list of dicts:
+    {'name','type','min','max','default','value','menu':{int:label}} --
+    ranges absent for bool/menu keep min/max None."""
+    out = []
+    for line in (text or '').splitlines():
+        m = _CTRL_LINE.match(line)
+        if m:
+            name, typ, rest = m.groups()
+            d = {'name': name, 'type': typ, 'min': None, 'max': None,
+                 'default': None, 'value': None, 'menu': {}}
+            for key in ('min', 'max', 'default', 'value'):
+                mm = re.search(rf'{key}=(-?\d+)', rest)
+                if mm:
+                    d[key] = int(mm.group(1))
+            out.append(d)
+        elif out:
+            mm = _MENU_LINE.match(line)
+            if mm and out[-1]['type'] == 'menu':
+                out[-1]['menu'][int(mm.group(1))] = mm.group(2)
+    return out
+
+
+def list_controls(device):
+    """All V4L2 controls of `device` (parsed), or [] when unavailable."""
+    if not v4l2_available() or not os.path.exists(device):
+        return []
+    try:
+        return parse_controls(_v4l2('--list-ctrls-menus', device=device))
+    except Exception:
+        return []
+
+
 def get_control(device, name):
     """Integer value of a V4L2 control, or None."""
     out = _v4l2(f'--get-ctrl={name}', device=device)
@@ -418,6 +522,7 @@ def oneshot_rgb(spec, count=2):
     import cv2
     import numpy as np
     if spec.get('kind') == 'bayer':
+        apply_locked(spec['device'])   # user-locked knobs win on every grab
         data = grab_raw(spec['device'], spec['fourcc'], spec['w'], spec['h'],
                         count=count)
         if not data:
@@ -473,6 +578,7 @@ class V4L2BayerCamera:
         # phase by one column -- the picture survives but comes out as a
         # magenta checkerboard. --silent does not suppress it.
         # (bench-diagnosed 2026-07-20)
+        apply_locked(self.device)      # user-locked knobs win on every open
         _v4l2(f'--set-parm={self.fps}', device=self.device)
         cmd = ['v4l2-ctl', '-d', self.device,
                f'--set-fmt-video=width={self.width},height={self.height},'

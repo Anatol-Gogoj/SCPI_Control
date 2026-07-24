@@ -23,6 +23,7 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
 import csv
 import os
 import queue
+import re
 import subprocess
 import sys
 import time
@@ -4427,34 +4428,45 @@ LOGGING:
                     "circle and is noise-robust: HIGHER = sharper. Turn the "
                     "lens to maximise it.").pack(side=tk.LEFT, padx=8)
 
-        # --- sensor controls (industrial cameras) ---
-        # The DFK 37BUX250's own auto-exposure never converges over UVC: at
-        # its defaults every frame is pure black, which reads as "the camera
-        # is broken". These make the exposure reachable.
-        sens = ttk.Frame(tab, padding=(8, 0))
-        sens.pack(fill='x')
-        ttk.Label(sens, text="Exposure:").pack(side=tk.LEFT)
-        self.cam_exposure = ttk.Entry(sens, width=8)
-        self.cam_exposure.pack(side=tk.LEFT, padx=4)
-        add_tooltip(self.cam_exposure,
-                    "Exposure time in 100 microsecond units (50 = 5 ms). "
-                    "Longer = brighter but slower and more motion blur.")
-        ttk.Label(sens, text="Gain:").pack(side=tk.LEFT, padx=(8, 0))
-        self.cam_gain = ttk.Entry(sens, width=6)
-        self.cam_gain.pack(side=tk.LEFT, padx=4)
-        add_tooltip(self.cam_gain,
-                    "Sensor gain. Raise it only after exposure runs out - "
-                    "gain amplifies noise as well as signal.")
-        add_tooltip(ttk.Button(sens, text="Apply",
-                               command=self.cam_apply_controls),
-                    "Send exposure/gain to the camera (switches it to "
-                    "manual exposure).").pack(side=tk.LEFT, padx=4)
-        add_tooltip(ttk.Button(sens, text="Auto-expose",
+        # --- camera controls: EVERY knob, hard-locked on Apply -------------
+        # The DFK kept "auto adjusting" because nothing re-asserted the
+        # user's values when a stream (re)opened; and stale auto-WB gains
+        # (red_balance 204 vs default 64) gave the heavy colour cast. Apply
+        # & Lock stores every control in webcam.LOCKED_CONTROLS, which every
+        # capture path stamps onto the device before each grab/stream.
+        sens = ttk.LabelFrame(
+            tab, text="Camera controls — Apply locks EVERY knob on all "
+                      "captures", padding=8)
+        sens.pack(fill='x', padx=8)
+        self.camctl_rows = {}
+        self.camctl_grid = ttk.Frame(sens)
+        self.camctl_grid.pack(fill='x')
+        btns = ttk.Frame(sens)
+        btns.pack(fill='x', pady=(6, 0))
+        add_tooltip(tk.Button(btns, text="🔒 Apply & Lock",
+                              command=self.cam_apply_controls,
+                              font=('TkDefaultFont', 9, 'bold')),
+                    "Write every value to the camera, LOCK them (re-stamped "
+                    "before every preview/one-shot/run capture), and save "
+                    "them for the next start.").pack(side=tk.LEFT)
+        add_tooltip(ttk.Button(btns, text="Read camera",
+                               command=self.cam_read_controls),
+                    "Refresh the fields from the camera's current state."
+                    ).pack(side=tk.LEFT, padx=6)
+        add_tooltip(ttk.Button(btns, text="Auto-expose",
                                command=self.cam_auto_expose),
-                    "Try a range of exposures and keep the one that gives a "
-                    "mid-grey image. Takes a few seconds.").pack(side=tk.LEFT)
-        self.cam_sensor_status = ttk.Label(sens, text="", foreground="gray")
+                    "Try a range of exposures, keep the one giving a "
+                    "mid-grey image, and fill it in above. Then Apply & "
+                    "Lock.").pack(side=tk.LEFT)
+        add_tooltip(ttk.Button(btns, text="Auto-WB once",
+                               command=self.cam_grey_world),
+                    "Grey-world calibrate red/blue balance on the CURRENT "
+                    "scene (a few seconds; stop the preview first), fill "
+                    "the fields in, and lock. Bench-tuned 2026-07-24: "
+                    "red 92 / blue 151.").pack(side=tk.LEFT, padx=6)
+        self.cam_sensor_status = ttk.Label(btns, text="", foreground="gray")
         self.cam_sensor_status.pack(side=tk.LEFT, padx=10)
+        self._cam_build_control_rows()
 
         # --- preview image ---
         self.cam_view = tk.Label(tab, bg='black', width=80, height=24,
@@ -4683,42 +4695,221 @@ LOGGING:
             return
         exp = webcam.get_control(device, 'exposure_time_absolute')
         gain = webcam.get_control(device, 'gain')
-        if exp is not None:
+        if exp is not None and hasattr(self, 'cam_exposure'):
             self._set_entry(self.cam_exposure, exp)
-        if gain is not None:
+        if gain is not None and hasattr(self, 'cam_gain'):
             self._set_entry(self.cam_gain, gain)
 
+    # Friendlier labels/hints for the DFK's knobs (anything unlisted still
+    # gets a row -- the panel is built from what the camera reports).
+    _CAM_CTRL_HINTS = {
+        'exposure_time_absolute': "Exposure time, 100 µs units (20 = 2 ms).",
+        'gain': "Sensor gain — amplifies noise too; prefer exposure/light.",
+        'brightness': "Black-level lift (offset, not gain).",
+        'red_balance': "Red channel gain (WB). Bench grey-world: 92.",
+        'blue_balance': "Blue channel gain (WB). Bench grey-world: 151.",
+        'white_balance_automatic': "Camera keeps re-balancing colours — "
+                                   "leave OFF for stable images.",
+        'auto_exposure': "Camera adjusts exposure itself — leave on Manual "
+                         "for stable images.",
+    }
+
+    def _cam_build_control_rows(self):
+        """(Re)build one row per V4L2 control the camera reports."""
+        for w in self.camctl_grid.winfo_children():
+            w.destroy()
+        self.camctl_rows = {}
+        device = self._cam_device() or '/dev/video0'
+        ctrls = webcam.list_controls(device)
+        if not ctrls:
+            ttk.Label(self.camctl_grid, foreground='#8a5a00',
+                      text="no camera controls detected — plug the camera "
+                           "in and press Read camera").grid(sticky='w')
+            return
+        saved = webcam.load_camera_settings()
+        col = row = 0
+        for c in ctrls:
+            name = c['name']
+            frame = ttk.Frame(self.camctl_grid)
+            frame.grid(row=row, column=col, sticky='w', padx=(0, 18), pady=2)
+            val = saved.get(name, c['value'])
+            if c['type'] == 'bool':
+                var = tk.BooleanVar(value=bool(val))
+                wdg = ttk.Checkbutton(frame, text=name, variable=var)
+                wdg.pack(side=tk.LEFT)
+                self.camctl_rows[name] = ('bool', var)
+            elif c['type'] == 'menu':
+                ttk.Label(frame, text=f"{name}:").pack(side=tk.LEFT)
+                labels = [f"{k}: {v}" for k, v in sorted(c['menu'].items())]
+                cb = ttk.Combobox(frame, width=22, state='readonly',
+                                  values=labels)
+                cur = [s for s in labels if s.startswith(f"{val}:")]
+                cb.set(cur[0] if cur else (labels[0] if labels else ''))
+                cb.pack(side=tk.LEFT, padx=4)
+                self.camctl_rows[name] = ('menu', cb)
+                wdg = cb
+            else:
+                ttk.Label(frame, text=f"{name}:").pack(side=tk.LEFT)
+                e = ttk.Entry(frame, width=7)
+                e.insert(0, str(val if val is not None else 0))
+                e.pack(side=tk.LEFT, padx=4)
+                ttk.Label(frame, text=f"({c['min']}–{c['max']})",
+                          foreground='#888').pack(side=tk.LEFT)
+                self.camctl_rows[name] = ('int', e)
+                wdg = e
+                # keep the attributes other code reads (SLDEA, auto-expose)
+                if name == 'exposure_time_absolute':
+                    self.cam_exposure = e
+                elif name == 'gain':
+                    self.cam_gain = e
+            hint = self._CAM_CTRL_HINTS.get(name)
+            if hint:
+                add_tooltip(wdg, hint)
+            col += 1
+            if col == 3:
+                col, row = 0, row + 1
+        # apply persisted lock from the previous session
+        if saved:
+            webcam.set_locked(saved)
+            self.cam_sensor_status.config(
+                text=f"restored + locked {len(saved)} saved controls",
+                foreground='gray')
+
+    def _cam_collect_controls(self):
+        """Panel -> {name: int}, with the autos forced sane unless the user
+        explicitly re-enabled them."""
+        out = {}
+        for name, (kind, w) in self.camctl_rows.items():
+            if kind == 'bool':
+                out[name] = 1 if w.get() else 0
+            elif kind == 'menu':
+                raw = (w.get() or '0').split(':')[0]
+                out[name] = int(raw)
+            else:
+                out[name] = int(float(w.get()))
+        return out
+
+    def cam_read_controls(self):
+        self._cam_build_control_rows()
+        device = self._cam_device() or '/dev/video0'
+        ctrls = webcam.list_controls(device)
+        for c in ctrls:
+            name, val = c['name'], c['value']
+            if name not in self.camctl_rows or val is None:
+                continue
+            kind, w = self.camctl_rows[name]
+            if kind == 'bool':
+                w.set(bool(val))
+            elif kind == 'menu':
+                for s in w['values']:
+                    if s.startswith(f"{val}:"):
+                        w.set(s)
+                        break
+            else:
+                self._set_entry(w, val)
+        self.cam_sensor_status.config(text="read from camera",
+                                      foreground='gray')
+
     def cam_apply_controls(self):
+        """Write EVERY panel value to the camera, lock them for all capture
+        paths, and persist them for the next start."""
         device = self._cam_device()
         if not device:
             messagebox.showerror("Camera", "Select a camera first.")
             return
         if not webcam.v4l2_available():
             messagebox.showerror(
-                "Camera", "v4l2-ctl is not installed, so sensor controls "
-                          "are unavailable.\n\nInstall with: "
+                "Camera", "v4l2-ctl is not installed.\n\n"
                           "sudo dnf install v4l-utils")
             return
         try:
-            exposure = int(float(self.cam_exposure.get()))
-            gain = int(float(self.cam_gain.get()))
+            controls = self._cam_collect_controls()
         except (TypeError, ValueError) as e:
-            messagebox.showerror("Camera", f"Exposure/gain must be numbers: {e}")
+            messagebox.showerror("Camera", f"Control values must be "
+                                           f"numbers: {e}")
             return
 
         def work():
-            webcam.set_manual_exposure(device, exposure=exposure, gain=gain)
-            return (webcam.get_control(device, 'exposure_time_absolute'),
-                    webcam.get_control(device, 'gain'))
+            webcam.set_locked(controls)
+            n = webcam.apply_locked(device)
+            webcam.save_camera_settings(controls)
+            return n
 
-        def done(values, error):
+        def done(n, error):
             if error:
                 messagebox.showerror("Camera", str(error))
                 return
-            exp, g = values
             self.cam_sensor_status.config(
-                text=f"applied: exposure {exp}, gain {g}")
-            self.status_bar.config(text=f"Camera: exposure {exp}, gain {g}")
+                text=f"🔒 locked {n} controls (re-stamped on every capture; "
+                     "saved for next start)", foreground='#2e7d32')
+            self.status_bar.config(text=f"Camera: {n} controls locked")
+
+        self._run_bg(work, done, busy='camera-ctrl')
+
+    def cam_grey_world(self):
+        """One-shot grey-world WB: tune red/blue_balance on the CURRENT
+        scene until the channel means match, then fill + lock."""
+        device = self._cam_device()
+        if not device or not webcam.v4l2_available():
+            messagebox.showerror("Camera", "No camera / v4l2-ctl available.")
+            return
+        was_previewing = self.cam_previewing
+        self.cam_stop_preview()
+        if self.cam is not None:
+            try:
+                self.cam.close()
+            except Exception:
+                pass
+            self.cam = None
+        self.cam_sensor_status.config(text="grey-world balancing…",
+                                      foreground='#b36b00')
+
+        def work():
+            m = re.search(r'(\d+)$', device)
+            spec = webcam.resolve_camera(int(m.group(1)) if m else 0)
+            webcam.set_control(device, 'white_balance_automatic', 0)
+            rb = webcam.get_control(device, 'red_balance') or 64
+            bb = webcam.get_control(device, 'blue_balance') or 64
+            best = None
+            for _ in range(5):
+                webcam.set_control(device, 'red_balance', int(rb))
+                webcam.set_control(device, 'blue_balance', int(bb))
+                f = webcam.oneshot_rgb(spec, count=3)
+                if f is None:
+                    raise RuntimeError("no frame (camera busy?)")
+                r, g, b = [float(f[..., i].mean()) for i in range(3)]
+                err = abs(r / g - 1) + abs(b / g - 1)
+                if best is None or err < best[0]:
+                    best = (err, int(rb), int(bb))
+                if err < 0.04:
+                    break
+                rb = min(255, max(1, rb * (g / r) ** 0.9))
+                bb = min(255, max(1, bb * (g / b) ** 0.9))
+            return best
+
+        def done(best, error):
+            try:
+                if error:
+                    self.cam_sensor_status.config(text="grey-world failed",
+                                                  foreground='red')
+                    messagebox.showerror("Auto-WB", str(error))
+                    return
+                err, rb, bb = best
+                for name, val in (('red_balance', rb), ('blue_balance', bb),
+                                  ('white_balance_automatic', 0)):
+                    if name in self.camctl_rows:
+                        kind, w = self.camctl_rows[name]
+                        if kind == 'bool':
+                            w.set(bool(val))
+                        else:
+                            self._set_entry(w, val)
+                self.cam_sensor_status.config(
+                    text=f"grey-world: red {rb} / blue {bb} "
+                         f"(err {err:.2f}) — now Apply & Lock",
+                    foreground='#2e7d32')
+            finally:
+                if was_previewing:
+                    self.cam_start_preview()
 
         self._run_bg(work, done, busy='camera-ctrl')
 
