@@ -51,6 +51,49 @@ def test_candidates_find_synthetic_disc():
     assert not se.needs_review(cands, se.DEFAULT_SETTINGS)
 
 
+def test_candidates_downscaled_frame_rescales_to_full_res():
+    # A 1280-wide frame is detected at DETECT_MAX_W but must report
+    # full-resolution px quantities.
+    base = _disc_frame(0, level=0, size=1280)
+    img = _disc_frame(200, size=1280)
+    cands = se.candidates(base, img, dict(se.DEFAULT_SETTINGS))
+    assert cands, "no candidates on the large synthetic disc"
+    best = cands[0]
+    true_area = np.pi * 200 * 200
+    assert abs(best['area_px'] - true_area) / true_area < 0.10, best['area_px']
+    assert abs(best['diam_px'] - 400) / 400 < 0.06, best['diam_px']
+    # contour points are in full-res coordinates too
+    xs = [p[0] for p in best['contour']]
+    assert max(xs) > se.DETECT_MAX_W, "contour still in downscaled coords"
+
+
+def test_mark_breakdown_files_renames_from_first_flag():
+    d = tempfile.mkdtemp(prefix='edge_bd_')
+    try:
+        names = ['b.png', 'f1.png', 'f2.png', 'f3.png']
+        _fake_run(d, [{'snapshot': i + 1, 'step': i,
+                       'tag': 'baseline' if i == 0 else 'post',
+                       'nominal_kV': str(float(i)), 'frame_file': n}
+                      for i, n in enumerate(names)])
+        for n in names:
+            open(os.path.join(d, 'frames', n), 'wb').write(b'x')
+        run = se.load_run(d)
+        renamed = se.mark_breakdown_files(run, {2: 'breakdown? I=90uA'})
+        assert renamed == 2                       # f2 + f3, not b/f1
+        frames = sorted(os.listdir(os.path.join(d, 'frames')))
+        assert 'f2_BREAKDOWN.png' in frames and 'f3_BREAKDOWN.png' in frames
+        assert 'f1.png' in frames                 # pre-breakdown untouched
+        assert run['rows'][2]['frame_file'] == 'f2_BREAKDOWN.png'
+        assert 'post-breakdown' in run['rows'][3]['notes']
+        assert 'post-breakdown' not in (run['rows'][1].get('notes') or '')
+        # idempotent: nothing further to rename
+        assert se.mark_breakdown_files(run, {2: 'x'}) == 0
+        # nothing at all without flags
+        assert se.mark_breakdown_files(run, {}) == 0
+    finally:
+        shutil.rmtree(d)
+
+
 def test_needs_review_on_weak_or_empty():
     assert se.needs_review([], se.DEFAULT_SETTINGS)
     weak = [{'conf': 0.4, 'spread_pct': 5.0}]

@@ -20,6 +20,7 @@ Left/Right navigate, Enter accept + next.
 import os
 import sys
 import threading
+import time
 import queue as _queue
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -73,6 +74,14 @@ class EdgeReviewApp:
         self.save_btn = ttk.Button(top, text="💾 Save to data.csv…",
                                    command=self.save, state='disabled')
         self.save_btn.pack(side=tk.RIGHT)
+        # progress + session clock (from Detect until Save)
+        self.clock_lbl = tk.Label(top, text="", fg='#1f3a5f',
+                                  font=('TkDefaultFont', 10, 'bold'))
+        self.clock_lbl.pack(side=tk.RIGHT, padx=10)
+        self.prog = ttk.Progressbar(top, length=180, mode='determinate')
+        self.prog.pack(side=tk.RIGHT, padx=6)
+        self._t0 = None
+        self._clock_on = False
 
         mid = ttk.Frame(self.root)
         mid.pack(fill='both', expand=True)
@@ -207,6 +216,30 @@ class EdgeReviewApp:
         self.info.config(text=f"{name}\n{n} frames ready")
 
     # ---------------- detection ----------------
+    @staticmethod
+    def _fmt_t(sec):
+        sec = int(sec)
+        return f"{sec // 60}:{sec % 60:02d}"
+
+    def _tick_clock(self):
+        if not self._clock_on or self._t0 is None:
+            return
+        self.clock_lbl.config(text=f"elapsed {self._fmt_t(time.time() - self._t0)}")
+        self.root.after(1000, self._tick_clock)
+
+    def _banner(self, text):
+        """Big unmissable state banner drawn over the image area."""
+        self.canvas.delete('banner')
+        if text:
+            w = int(self.canvas['width'] or VIEW_W)
+            h = int(self.canvas['height'] or 560)
+            self.canvas.create_rectangle(0, h // 2 - 42, w, h // 2 + 42,
+                                         fill='#b36b00', outline='',
+                                         tags='banner')
+            self.canvas.create_text(w // 2, h // 2, text=text, fill='white',
+                                    font=('TkDefaultFont', 20, 'bold'),
+                                    tags='banner')
+
     def detect(self):
         if not self.run:
             messagebox.showinfo("Detect", "Pick a run first")
@@ -217,6 +250,12 @@ class EdgeReviewApp:
                 "busy or dry-run frames were skipped).")
             return
         self.detect_btn.config(state='disabled')
+        self._t0 = time.time()
+        self._clock_on = True
+        self._tick_clock()
+        self.prog.config(maximum=len(self.frame_rows), value=0)
+        self.canvas.delete('all')
+        self._banner(f"DETECTING…  0/{len(self.frame_rows)}")
         self.status.config(text="detecting…")
         threading.Thread(target=self._detect_worker, daemon=True).start()
         self.root.after(100, self._poll_detect)
@@ -249,8 +288,14 @@ class EdgeReviewApp:
                 break
             i, cands = item
             self.cands_all[i] = cands
-            self.status.config(
-                text=f"detecting… {len(self.cands_all)}/{len(self.frame_rows)}")
+        n, total = len(self.cands_all), len(self.frame_rows)
+        self.prog.config(value=n)
+        el = time.time() - self._t0
+        eta = (el / n * (total - n)) if n else 0
+        self.status.config(
+            text=f"detecting… {n}/{total}  —  elapsed {self._fmt_t(el)}"
+                 + (f", ~{self._fmt_t(eta)} left" if n else ""))
+        self._banner(f"DETECTING…  {n}/{total}")
         if done:
             self._finish_detect()
         else:
@@ -258,6 +303,7 @@ class EdgeReviewApp:
 
     def detect_all_sync(self):
         """Synchronous detection (used by --auto tests and headless runs)."""
+        self._t0 = self._t0 or time.time()
         base = self._base_gray()
         for i in self.frame_rows:
             img = se.load_gray(se.frame_path(self.run, self.run['rows'][i]))
@@ -274,9 +320,12 @@ class EdgeReviewApp:
         self._recount()
         self.detect_btn.config(state='normal')
         self.save_btn.config(state='normal')
+        self.prog.config(value=len(self.frame_rows))
+        self._banner(None)
         q = self._queue_list()
+        took = self._fmt_t(time.time() - self._t0) if self._t0 else '?'
         self.status.config(
-            text=f"detected {len(self.frame_rows)} frames: "
+            text=f"detected {len(self.frame_rows)} frames in {took}: "
                  f"{len(self.auto_idx)} auto-accepted, {len(q)} need review")
         self.pos = self.frame_rows.index(q[0]) if q else 0
         self._show()
@@ -417,28 +466,41 @@ class EdgeReviewApp:
         q = self._queue_list()
         accepted = sum(1 for r in self.results.values() if r)
         rejected = sum(1 for r in self.results.values() if r is None)
+        n_bd = 0
+        if self.flags:
+            start = min(self.flags)
+            n_bd = sum(1 for i in self.frame_rows if i >= start)
         msg = (f"Write results into this run's data.csv?\n\n"
                f"accepted: {accepted}  (auto {len(self.auto_idx)})\n"
                f"rejected: {rejected}\n"
                f"unreviewed (left blank): {len(q)}\n"
-               f"breakdown-flagged: {len(self.flags)}\n\n"
-               f"A backup is kept as data.csv.bak; an area-vs-voltage plot "
-               f"and outline overlays are saved beside it.")
+               f"breakdown-flagged: {len(self.flags)}\n"
+               + (f"\n⚠ {n_bd} frame file(s) from the first breakdown onward "
+                  f"will be RENAMED with a _BREAKDOWN suffix (kept, never "
+                  f"deleted — usable later as ML training data).\n"
+                  if n_bd else "\n")
+               + "A backup is kept as data.csv.bak; an area-vs-voltage plot "
+                 "and outline overlays are saved beside it.")
         if not messagebox.askyesno("Save results", msg):
             return
         scale = se.mm_per_px(self.results, self.run['rows'], self.settings)
         se.apply_results(self.run['rows'], self.results, scale, self.flags)
+        renamed = se.mark_breakdown_files(self.run, self.flags)
         se.write_back(self.rundir, self.run)
+        self._clock_on = False
+        took = self._fmt_t(time.time() - self._t0) if self._t0 else '?'
+        self.clock_lbl.config(text=f"done in {took}")
         try:
             self._save_plot(scale)
             self._save_overlays()
         except Exception as e:
             self.status.config(text=f"saved CSV; plot/overlays failed: {e}")
             return
+        scale_txt = (f"scale {scale:.5f} mm/px" if scale
+                     else "no mm scale (no baseline accept)")
+        bd_txt = f", {renamed} frame(s) renamed _BREAKDOWN" if renamed else ""
         self.status.config(
-            text=f"saved — data.csv updated (scale "
-                 f"{scale:.5f} mm/px)" if scale else
-                 "saved — data.csv updated (no mm scale: no baseline accept)")
+            text=f"saved in {took} — data.csv updated ({scale_txt}){bd_txt}")
 
     def _save_plot(self, scale):
         import matplotlib
